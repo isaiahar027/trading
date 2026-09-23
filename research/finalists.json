@@ -1,0 +1,61 @@
+{
+  "as_of": "2026-09-23",
+  "source_snapshot": "research/snapshots/2026-09-23.json",
+  "detail": "docs/RESEARCH.md",
+  "finalists": [
+    {
+      "symbol": "PUMP",
+      "bias": "long",
+      "status": "finalist",
+      "thesis_short": "Cheapest holder cash flow in the screen: 50% of revenue locked into buy-and-burn until ~Apr 2027; buybacks run ~2-3x monthly unlock supply.",
+      "invalidation_short": "daily buybacks fall well below $1M for 2+ weeks, a large insider unlock hits exchanges, or an adverse RICO ruling (injunction/asset freeze)."
+    },
+    {
+      "symbol": "ENA",
+      "bias": "short",
+      "status": "finalist",
+      "thesis_short": "~1.41B ENA investor unlock on 2026-10-05 (~14% of circulating, derived estimate) with zero live holder accrual; buyback dormant until USDe >= $7.5B.",
+      "invalidation_short": "little unlocked supply reaches exchanges after Oct 5, or USDe supply climbs quickly toward $6B+ while ENA holds."
+    },
+    {
+      "symbol": "HYPE",
+      "bias": "neutral",
+      "status": "finalist",
+      "thesis_short": "Best fundamentals (97% of fees to buybacks) but at an all-time high on record $18B OI after a short squeeze; trade only clean setups, prefer longs after a funding flush.",
+      "invalidation_short": "30d fees drop >30% with OI below $12B, or the Oct 6 unlock sees heavy claims moving to exchanges."
+    },
+    {
+      "symbol": "UNI",
+      "bias": "neutral",
+      "status": "finalist",
+      "thesis_short": "Real catalysts (fee switch live on v2/v3, SEC tokenized-stock exemption, CME futures Oct 19) but +49% in a week at ~29x holders revenue; sell-the-news risk.",
+      "invalidation_short": "price falls back below ~$6.7 after the CME launch, or a v4 fee-switch vote fails."
+    },
+    {
+      "symbol": "AERO",
+      "bias": "neutral",
+      "status": "finalist",
+      "thesis_short": "Cheap on fees (P/F ~3) with ~81% to veAERO, but fee spike is tokenized-stock driven and the Aero merger has no date; ~11%/yr emissions.",
+      "invalidation_short": "fees revert to the prior-30d level, emissions exceed fees again, or the Aero launch slips further."
+    },
+    {
+      "symbol": "AAVE",
+      "bias": "neutral",
+      "status": "finalist",
+      "thesis_short": "Buybacks (~$30M/yr) live since 2026-06-27 despite DefiLlama showing zero; exploit hangover from Apr 2026 and no dated catalyst.",
+      "invalidation_short": "another collateral/bridge exploit creating bad debt, a buyback pause vote, or deposits below post-exploit lows."
+    }
+  ],
+  "watchlist": [
+    {
+      "symbol": "JUP",
+      "status": "watchlist",
+      "reason": "Value accrual unclear: buybacks halted 2026-01-03; Litterbox adds only ~1M JUP/month, so DefiLlama holders revenue looks overstated. Revisit if buybacks resume on-chain."
+    },
+    {
+      "symbol": "ASTER",
+      "status": "watchlist",
+      "reason": "Fee base is low-trust (DefiLlama delisted Aster volume Oct 2025 over suspected wash trading); circ_ratio in the screen conflicts with reported ~7.9B circulating. Not underwritable."
+    }
+  ]
+}

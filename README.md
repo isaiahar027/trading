@@ -65,4 +65,68 @@ trader review                                       # nightly review (scripts/ni
 | `src/trader/research/` | regime + screener from DefiLlama, Hyperliquid, CoinPaprika, alternative.me |
 | `scripts/` | systemd units, nightly job, heartbeat watchdog |
 
-RESULTS_PLACEHOLDER
+## Current research (2026-09-23), detail in [`docs/RESEARCH.md`](docs/RESEARCH.md)
+**Regime:** rule-based `risk_on`: BTC and ETH are above their 200d EMA and stablecoin supply is +1.1% over 30d.
+The macro backdrop is hostile: a Fed hike on Sep 16, the next FOMC on Oct 27–28, and a rally driven by a short squeeze.
+Limits stay at the defaults.
+
+| Finalist | Bias | Core reason | Invalidation |
+|---|---|---|---|
+| PUMP | long | 50% of revenue to buy-and-burn; buybacks ≈ 2–3× monthly unlocks | buybacks ≪ $1M/day for 2+ weeks; adverse RICO ruling |
+| ENA | short | ~14% of circulating unlocks Oct 5 (derived); no live accrual | little unlocked supply reaches exchanges; USDe → $6B+ |
+| HYPE | neutral | best accrual, but at an all-time high on record OI | fees −30% with OI < $12B |
+| UNI | neutral | real catalysts (CME Oct 19), +49% in a week | back below ~$6.7 after the CME launch |
+| AERO | neutral | cheap on fees, but tokenized-stock-driven spike; 11% emissions | fees revert; merger slips |
+| AAVE | neutral | buybacks live (DefiLlama shows 0); exploit hangover | new exploit; buyback pause |
+
+Watchlist, not traded: JUP (unclear accrual) and ASTER (untrustworthy fee data). "Neutral" means the thesis is not
+a tie-breaker; the reflex can still trade the symbol both ways under the same gates.
+
+## Evidence so far
+- `pytest`: 72 passed. Tests cover causality, gates, Kelly cap, every risk limit, fail-closed paths, and an
+  always-long 0.95-confident reflex through a crash (max DD stays under 17%, against the 15% limit plus one bar of gap).
+- Backtest with the **offline heuristic, not Jev**, on BTC, ETH, SOL, HYPE, AERO and UNI: ~208 days of 1h data
+  (Hyperliquid serves only the last 5,000 candles). Return −2.10%, max DD 5.45%, 34 trades, fees and funding included.
+  The heuristic has no edge, and the nightly review says so (direction Brier 0.91 vs naive 0.667).
+- Live paper smoke test on mainnet data: fetch → snapshot (123–142 tokens) → decide → journal, end to end.
+- Six bugs were found and fixed during the build, including a live-loop causality bug and a risk-layer `reduce_only`
+  bypass. See [`docs/agenkit/05-review.md`](docs/agenkit/05-review.md).
+
+## Final check
+| Question | Honest answer |
+|---|---|
+| Is the edge organic or incentive-driven? | Mixed. PUMP and HYPE fees are organic but cyclical (memecoin and leverage). AERO's fee spike is event-driven, and ASTER's fees are suspect, so it was excluded. |
+| Is the catalyst priced in? | HYPE and UNI: largely. AERO: partly. ENA's unlock has been public for a month. PUMP: not obviously, but past buybacks didn't lift the price either. |
+| Does value accrue to the token? | PUMP, HYPE and AERO: yes, verified in secondary sources. AAVE: yes, understated by DefiLlama. UNI: partially. ENA: no. JUP: doubtful. |
+| Will it survive costs and slippage? | Unknown for Jev. The offline stand-in does **not**: it lost 2.1% after $76 of fees and funding on $10k. Kelly is computed net of round-trip costs, so marginal setups size to zero. |
+| Is any hard limit delegated to a model? | **No.** Jev returns judgments only (no size fields, tested). The brain can only say `no_change`, `pause` or `flatten`. `risk.py` cannot import either model (AST test). Config refuses looser limits. |
+
+## WHAT COULD I BE WRONG ABOUT?
+1. **Jev may have no edge here at all.** Nothing in this repo shows that it does. The one reflex I could actually test
+   (the heuristic) was worse than a coin flip on direction. Treat Jev as a hypothesis until 14+ days of paper
+   trading beat the naive Brier score *and* make money after costs.
+2. **"Every block, 81ms" was the wrong target, and I didn't build it.** The spec asked for a snapshot on every block;
+   I built per-candle (1h) decisions. At block cadence, a model call per decision loses to co-located market makers,
+   and fees would dominate. If the edge exists, it is more likely in multi-hour judgment than microstructure. I could
+   be wrong about that, but the shorter the horizon, the more a cost model I haven't validated decides the P&L.
+3. **Calibration drift.** Jev's probabilities are calibrated on *its* training distribution, not on crypto bracket
+   outcomes. The gates (>0.80 confidence) may almost never fire, or may fire on exactly the wrong regimes. The
+   calibration map starts by shrinking p halfway to 0.5 for this reason. That means it may trade too little for weeks.
+4. **Snapshot bucket edges are my choices** (trend z-scores, funding bands, vol percentiles), not fitted values.
+   Jev judges the words I give it. If the buckets are badly placed, the model reasons correctly about the wrong inputs.
+5. **The research leans on secondary sources.** Several numbers (ENA's 1.41B unlock, AERO emissions, JUP accrual) come
+   from news and AI-summary sites and are labeled as such. ENA's short thesis rests on a derived number. An OTC
+   buyout I can't see could mean far less supply hits the market.
+6. **Backtests understate reality.** They have no historical order book and only ~208 days of history (one regime,
+   mostly up). Stops fill at the stop price plus 3bps. A real liquidation cascade gaps through that, which is why
+   the crash test allows 17%.
+7. **Correlation.** Six alts plus BTC and ETH are one trade in a crash. The 1× gross cap bounds it, but per-position
+   limits don't diversify anything when correlations go to 1.
+8. **Operational risk dominates early.** The live broker has never touched a real account. The first real losses
+   are more likely to come from API or key mistakes, a precision rejection, or a stop order that didn't rest than from
+   a bad thesis. Run testnet first and do the kill drill (`06-ship.md`).
+9. **The nightly loop can overfit.** A daily calibration refit on a small sample can chase noise. That's why it needs
+   ≥20 samples per bin, blends toward the prior, enforces monotonicity, and sends wording changes to a human.
+
+**Priority, restated: a system that survives beats one that looks profitable.** Every ambiguous path in this
+code resolves toward less exposure.

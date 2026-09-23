@@ -1,0 +1,89 @@
+{
+  "symbol": "PUMP",
+  "version": 1,
+  "thesis": {
+    "bias": "long",
+    "thesis": "Cheapest holder cash flow in the screen: 50% of revenue locked into buy-and-burn until ~Apr 2027; buybacks run ~2-3x monthly unlock supply.",
+    "invalidation": "daily buybacks fall well below $1M for 2+ weeks, a large insider unlock hits exchanges, or an adverse RICO ruling (injunction/asset freeze)."
+  },
+  "questions": {
+    "regime": {
+      "type": "choice",
+      "instructions": "Which market regime does this snapshot show for `sym`? Use `trend`, `vol`, `ret%`, `range24`, `perp` and `btc` if present.",
+      "criteria": {
+        "trending": "`trend` is up/strong_up or down/strong_down and returns in `ret%` point the same way; volatility is not extreme.",
+        "mean_reverting": "`trend` is flat or returns in `ret%` disagree in sign; price is oscillating inside its range.",
+        "high_vol": "`vol` is high or extreme, or `volume` is climactic, but there is no sign of disorderly liquidation.",
+        "crisis": "Disorderly market: `vol` is extreme AND large negative returns, or `btc` trend is strong_down with extreme vol, or funding/premium are at extremes consistent with forced liquidations."
+      }
+    },
+    "direction": {
+      "type": "choice",
+      "instructions": {
+        "question": "Over the next several bars, which position in `sym` is most likely to be profitable? Weigh the snapshot most; use `context` only as a tie-breaker, and pick neutral if the snapshot contradicts `context.invalidated_if`.",
+        "context": {
+          "thesis_bias": "long",
+          "thesis": "Cheapest holder cash flow in the screen: 50% of revenue locked into buy-and-burn until ~Apr 2027; buybacks run ~2-3x monthly unlock supply.",
+          "invalidated_if": "daily buybacks fall well below $1M for 2+ weeks, a large insider unlock hits exchanges, or an adverse RICO ruling (injunction/asset freeze)."
+        }
+      },
+      "criteria": {
+        "long": "Trend, momentum and flow favor higher prices, and `perp.funding` is not longs_crowded.",
+        "short": "Trend, momentum and flow favor lower prices, and `perp.funding` is not shorts_crowded.",
+        "neutral": "No clear edge, signals conflict, or the move is already exhausted."
+      }
+    },
+    "toxic_flow": {
+      "type": "noul",
+      "instructions": "Is the order flow for `sym` toxic right now, meaning a new position would likely be run over by informed or forced flow (liquidation cascade, one-sided heavy book against the move, climactic volume at a range extreme)?",
+      "criteria": {
+        "true": "Flow is toxic; entering now is dangerous.",
+        "false": "Flow looks orderly."
+      }
+    },
+    "setup_quality": {
+      "type": "score",
+      "instructions": "How good is the trade setup in `sym` right now, in whichever direction is best?",
+      "criteria": [
+        "0: no setup. Signals conflict or there is nothing to trade.",
+        "1: weak setup. One supporting signal, others neutral or opposed.",
+        "2: good setup. Trend, positioning and flow mostly agree on one direction and nothing in `perp` or `book` contradicts it.",
+        "3: excellent setup. Trend, momentum, positioning and flow all agree, volatility is not `extreme`, and the move is not already at the end of its range in the trade direction."
+      ]
+    },
+    "risk_state": {
+      "type": "choice",
+      "instructions": "Given the account state in `acct` and position in `pos`, how should risk be treated right now?",
+      "criteria": {
+        "safe": "`acct.dd%` is below 5 and `acct.day%` is above -1.5, and any open position in `pos` is not deeply losing.",
+        "near_limit": "`acct.dd%` is between 5 and 10, or `acct.day%` is between -1.5 and -2.5.",
+        "reduce": "`acct.dd%` is above 10, or `acct.day%` is below -2.5, or `pos.upnl_R` is below -0.8."
+      }
+    }
+  },
+  "calibration": {
+    "edges": [
+      0.0,
+      0.8,
+      0.85,
+      0.9,
+      0.95
+    ],
+    "win_rate": [
+      null,
+      null,
+      null,
+      null,
+      null
+    ],
+    "samples": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "prior_shrink": 0.5
+  },
+  "notes": ""
+}

@@ -45,4 +45,4 @@ effort = "high"
 [universe]
 # Filled from research/finalists.json by `trader compile`. BTC/ETH are always traded as
 # regime anchors; finalists are added only once compiled and approved.
-symbols = ["BTC", "ETH"]
+symbols = ["BTC", "ETH", "PUMP", "ENA", "HYPE", "UNI", "AERO", "AAVE"]
