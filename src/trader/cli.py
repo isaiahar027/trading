@@ -86,6 +86,9 @@ def cmd_backtest(args, cfg):
             funding[s] = hl.funding_history(s, start, end)
             fcache.write_text(json.dumps(funding[s]))
         print(f"{s}: {len(candles[s])} candles, {len(funding[s])} funding prints")
+        if candles[s] and candles[s][0].t_open > start + 86_400_000:
+            got = (end - candles[s][0].t_open) / 86_400_000
+            print(f"  note: venue served only {got:.0f} of {args.days} days (candleSnapshot keeps the last 5000 bars)")
     schemas = {s: compile_schema(s, ANCHOR_THESIS.get(s, {"bias": "neutral"})) for s in symbols}
     if args.reflex == "jev":
         from .jev.client import JevClient, JevReflex
