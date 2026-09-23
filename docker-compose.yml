@@ -1,0 +1,75 @@
+# Odds Decision Hub: read-only odds analytics dashboard (you place every bet yourself).
+#
+#   cp .env.example .env        # then edit .env (ODDS_API_KEY, DASHBOARD_PASSWORD, BANKROLL, ...)
+#   sudo chown -R 1000:1000 data # the container runs as uid 1000 and must be able to write ./data
+#   docker compose up -d --build
+#   docker compose logs -f
+#
+# See README.md for the full VPS walkthrough and how to reach the dashboard safely.
+
+services:
+  odds-hub:
+    build: .
+    image: odds-hub:latest
+    container_name: odds-hub
+    # Comes back after crashes and after a reboot (as long as the Docker service itself is enabled:
+    # `sudo systemctl enable docker`).
+    restart: always
+    # Tiny init process as PID 1: forwards SIGTERM for a clean shutdown and reaps zombies.
+    init: true
+    stop_grace_period: 10s
+
+    env_file:
+      - .env
+    environment:
+      # These override .env on purpose. Inside the container the app must listen on all interfaces so Docker
+      # can forward the port; who can actually reach it is decided by the `ports` mapping below.
+      HOST: 0.0.0.0
+      PORT: "8080"
+      DATA_DIR: /app/data
+      # Time zone that defines "today" for the daily exposure limit (log timestamps are always UTC).
+      # Set TZ in .env (or your shell); defaults to US Eastern.
+      TZ: ${TZ:-America/New_York}
+      # Keep the V8 heap well inside mem_limit so memory pressure means garbage collection, not an OOM kill.
+      NODE_OPTIONS: --max-old-space-size=384
+
+    ports:
+      # Published on the server's loopback interface ONLY. The dashboard is then reachable from the server itself,
+      # through an SSH tunnel (ssh -N -L 8080:127.0.0.1:8080 you@server), Tailscale (`tailscale serve`), or a
+      # reverse proxy with HTTPS on the same host (Caddy) plus DASHBOARD_PASSWORD. See README "Reach the dashboard
+      # safely".
+      # Do NOT change this to "8080:8080" or "0.0.0.0:8080:8080": ports published by Docker bypass ufw/iptables
+      # host firewall rules, so that would put the dashboard on the public internet.
+      - "127.0.0.1:8080:8080"
+
+    volumes:
+      # settings.json and the bet journal live here. Back this folder up.
+      - ./data:/app/data
+
+    mem_limit: 512m
+
+    # Hardening: the app only needs to write to /app/data.
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:8080/healthz', { signal: AbortSignal.timeout(4000) }).then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s

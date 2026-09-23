@@ -271,4 +271,6 @@ export interface DashboardState {
   betSummary: BetSummary;
   /** Remaining stake allowed today under maxDailyExposurePct. */
   remainingDailyExposure: number;
+  /** Every configured league (for the dashboard's league pickers), in configuration order. */
+  leagues?: { key: LeagueKey; name: string }[];
 }

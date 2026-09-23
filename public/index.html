@@ -1,0 +1,360 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark light">
+  <meta name="theme-color" content="#0a0e13">
+  <meta name="referrer" content="no-referrer">
+  <meta name="description" content="Read-only odds analytics: DraftKings prices compared with no-vig sharp fair prices.">
+  <title>Odds Hub</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="styles.css">
+  <script src="app.js"></script>
+</head>
+<body>
+  <svg class="sprite" aria-hidden="true" focusable="false">
+    <symbol id="i-bell" viewBox="0 0 24 24"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></symbol>
+    <symbol id="i-bell-off" viewBox="0 0 24 24"><path d="M8.7 3A6 6 0 0 1 18 8a21.3 21.3 0 0 0 .6 5"/><path d="M17 17H3s3-2 3-9a4.67 4.67 0 0 1 .3-1.7"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/><path d="m2 2 20 20"/></symbol>
+    <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/></symbol>
+    <symbol id="i-activity" viewBox="0 0 24 24"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></symbol>
+    <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></symbol>
+    <symbol id="i-moon" viewBox="0 0 24 24"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></symbol>
+    <symbol id="i-external" viewBox="0 0 24 24"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></symbol>
+    <symbol id="i-check-square" viewBox="0 0 24 24"><path d="m9 11 3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></symbol>
+    <symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></symbol>
+    <symbol id="i-zap" viewBox="0 0 24 24"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-2.64-6.36L21 8"/><path d="M21 3v5h-5"/></symbol>
+    <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
+    <symbol id="i-alert" viewBox="0 0 24 24"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><path d="M12 9v4M12 17h.01"/></symbol>
+    <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></symbol>
+    <symbol id="i-split" viewBox="0 0 24 24"><path d="M16 3h5v5"/><path d="M8 3H3v5"/><path d="M12 22v-8.3a4 4 0 0 0-1.17-2.87L3 3"/><path d="m15 9 6-6"/></symbol>
+    <symbol id="i-logo" viewBox="0 0 24 24"><path d="M3 17l6-6 4 4 8-8"/><path d="M15 7h6v6"/></symbol>
+  </svg>
+
+  <a class="skip-link" href="#main">Skip to opportunities</a>
+
+  <header class="topbar" id="topbar">
+    <div class="topbar-row">
+      <div class="brand">
+        <span class="brand-mark"><svg class="icon" aria-hidden="true"><use href="#i-logo"/></svg></span>
+        <span class="brand-name">Odds Hub</span>
+        <span class="demo-badge" id="demo-badge" hidden>Demo data</span>
+      </div>
+
+      <div class="conn" id="conn" data-state="connecting" role="status" aria-live="polite">
+        <span class="conn-dot" aria-hidden="true"></span>
+        <span class="conn-text" id="conn-text">Connecting…</span>
+      </div>
+
+      <dl class="stats" id="stats">
+        <div class="stat stat-feed">
+          <dt>Feed</dt>
+          <dd>
+            <button type="button" class="feed-btn" id="feed-btn" aria-label="Data source status — open health">
+              <span class="status-dot" id="feed-dot" data-status="unknown" aria-hidden="true"></span>
+              <span id="feed-text">—</span>
+            </button>
+          </dd>
+        </div>
+        <div class="stat">
+          <dt>Updated</dt>
+          <dd id="stat-updated">—</dd>
+        </div>
+        <div class="stat">
+          <dt>Live events</dt>
+          <dd id="stat-live">—</dd>
+        </div>
+        <div class="stat">
+          <dt>Bankroll</dt>
+          <dd id="stat-bankroll">—</dd>
+        </div>
+        <div class="stat">
+          <dt>Left today</dt>
+          <dd><span id="stat-left">—</span><span class="stat-sub" id="stat-left-of"></span></dd>
+        </div>
+      </dl>
+
+      <div class="actions">
+        <button type="button" class="tool-btn" id="btn-alerts" aria-pressed="false">
+          <svg class="icon" aria-hidden="true"><use href="#i-bell-off" id="alerts-icon"/></svg>
+          <span class="tool-label" id="alerts-label">Enable alerts</span>
+        </button>
+        <button type="button" class="tool-btn" id="btn-settings" title="Settings">
+          <svg class="icon" aria-hidden="true"><use href="#i-sliders"/></svg>
+          <span class="tool-label">Settings</span>
+        </button>
+        <button type="button" class="tool-btn icon-only" id="btn-health" aria-label="System health" title="System health">
+          <svg class="icon" aria-hidden="true"><use href="#i-activity"/></svg>
+        </button>
+        <button type="button" class="tool-btn icon-only" id="btn-theme" aria-label="Switch to light theme">
+          <svg class="icon" aria-hidden="true"><use href="#i-sun" id="theme-icon"/></svg>
+        </button>
+      </div>
+    </div>
+
+    <nav class="tabs" role="tablist" aria-label="Views">
+      <button type="button" role="tab" class="tab" id="tab-opps" data-tab="opps" aria-controls="panel-opps" aria-selected="true">
+        Opportunities <span class="tab-count" id="count-opps">0</span>
+      </button>
+      <button type="button" role="tab" class="tab" id="tab-arbs" data-tab="arbs" aria-controls="panel-arbs" aria-selected="false" tabindex="-1">
+        Arbs <span class="tab-count" id="count-arbs">0</span>
+      </button>
+      <button type="button" role="tab" class="tab" id="tab-bets" data-tab="bets" aria-controls="panel-bets" aria-selected="false" tabindex="-1">
+        My bets <span class="tab-count" id="count-bets">0</span>
+      </button>
+    </nav>
+  </header>
+
+  <div class="banners" id="banners" aria-live="polite"></div>
+
+  <section class="filters" id="filters" aria-label="Filters">
+    <div class="chips" id="league-chips" role="group" aria-label="Leagues"></div>
+    <div class="filter-controls">
+      <label class="switch">
+        <input type="checkbox" id="f-live">
+        <span class="switch-track" aria-hidden="true"></span>
+        <span class="switch-label">Live only</span>
+      </label>
+      <label class="range">
+        <span class="range-label">Min EV <output id="f-minev-out" for="f-minev">0%</output></span>
+        <input type="range" id="f-minev" min="0" max="10" step="0.5" value="0">
+      </label>
+      <label class="switch">
+        <input type="checkbox" id="f-watch">
+        <span class="switch-track" aria-hidden="true"></span>
+        <span class="switch-label">Watch list</span>
+      </label>
+    </div>
+  </section>
+
+  <main id="main" tabindex="-1">
+    <div class="panel" id="panel-opps" role="tabpanel" aria-labelledby="tab-opps">
+      <div class="empty-state" id="empty-opps" hidden></div>
+
+      <section class="section section-live" id="sec-live" aria-labelledby="h-live">
+        <header class="section-head">
+          <h2 id="h-live"><span class="live-dot" aria-hidden="true"></span>Live — act now</h2>
+          <span class="section-count" id="n-live"></span>
+        </header>
+        <div class="grid grid-live" id="grid-live"></div>
+        <p class="section-empty" id="empty-live" hidden>No live edges right now. Live picks appear here first.</p>
+      </section>
+
+      <div class="arb-notice" id="arb-notice" hidden>
+        <svg class="icon" aria-hidden="true"><use href="#i-split"/></svg>
+        <span id="arb-notice-text"></span>
+        <button type="button" class="btn btn-small btn-secondary" id="arb-notice-btn">View arbs</button>
+      </div>
+
+      <section class="section" id="sec-pre" aria-labelledby="h-pre">
+        <header class="section-head">
+          <h2 id="h-pre">Pre-game</h2>
+          <span class="section-count" id="n-pre"></span>
+        </header>
+        <div class="grid" id="grid-pre"></div>
+        <p class="section-empty" id="empty-pre" hidden>No pre-game edges right now.</p>
+      </section>
+
+      <section class="section section-watch" id="sec-watch" aria-labelledby="h-watch">
+        <header class="section-head">
+          <h2 id="h-watch">Watch list</h2>
+          <span class="section-count" id="n-watch"></span>
+          <button type="button" class="btn btn-small btn-ghost watch-toggle" id="watch-toggle" aria-expanded="false" aria-controls="grid-watch">
+            <span id="watch-toggle-text">Show</span>
+            <svg class="icon chevron" aria-hidden="true"><use href="#i-chevron"/></svg>
+          </button>
+        </header>
+        <p class="section-hint">Close calls: positive EV but below your betting threshold. Wait for a better price.</p>
+        <div class="grid grid-compact" id="grid-watch" hidden></div>
+      </section>
+    </div>
+
+    <div class="panel" id="panel-arbs" role="tabpanel" aria-labelledby="tab-arbs" hidden>
+      <p class="panel-intro">
+        <svg class="icon" aria-hidden="true"><use href="#i-info"/></svg>
+        <span>An arb pairs a DraftKings price with the opposite side at <strong>another sportsbook</strong>. You must place both legs yourself, quickly, at the stakes shown.</span>
+      </p>
+      <div class="empty-state" id="empty-arbs" hidden></div>
+      <div class="grid" id="grid-arbs"></div>
+    </div>
+
+    <div class="panel" id="panel-bets" role="tabpanel" aria-labelledby="tab-bets" hidden>
+      <dl class="summary" id="bet-summary"></dl>
+      <div class="bets-toolbar">
+        <div class="segmented" role="group" aria-label="Show bets">
+          <button type="button" class="seg" data-betfilter="all" aria-pressed="true">All</button>
+          <button type="button" class="seg" data-betfilter="pending" aria-pressed="false">Pending</button>
+          <button type="button" class="seg" data-betfilter="settled" aria-pressed="false">Settled</button>
+        </div>
+        <button type="button" class="btn btn-small btn-ghost" id="bets-refresh">
+          <svg class="icon" aria-hidden="true"><use href="#i-refresh"/></svg>
+          <span>Refresh</span>
+        </button>
+      </div>
+      <div id="bet-list" class="bet-list"></div>
+    </div>
+  </main>
+
+  <footer class="footer">
+    <p>Read-only analytics. You place every bet yourself. Gamble responsibly — 1-800-GAMBLER.</p>
+  </footer>
+
+  <dialog class="modal" id="dlg-place" aria-labelledby="place-title">
+    <form class="modal-inner" id="place-form" novalidate>
+      <header class="modal-head">
+        <div class="modal-head-text">
+          <p class="modal-kicker" id="place-kicker"></p>
+          <h2 class="modal-title" id="place-title">Log your bet</h2>
+        </div>
+        <button type="button" class="tool-btn icon-only" data-close aria-label="Close">
+          <svg class="icon" aria-hidden="true"><use href="#i-x"/></svg>
+        </button>
+      </header>
+      <div class="modal-body">
+        <p class="place-pick" id="place-pick"></p>
+        <p class="place-live" id="place-live" role="status"></p>
+        <p class="place-note" id="place-note" hidden></p>
+        <div class="form-grid">
+          <div class="field">
+            <label class="field-label" for="place-odds">Odds you got (American)</label>
+            <div class="input-group">
+              <button type="button" class="input-addon addon-btn" id="place-sign" aria-label="Flip plus or minus">±</button>
+              <input id="place-odds" name="americanTaken" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" required>
+            </div>
+          </div>
+          <div class="field">
+            <label class="field-label" for="place-stake">Stake</label>
+            <div class="input-group">
+              <span class="input-addon" aria-hidden="true">$</span>
+              <input id="place-stake" name="stake" type="number" inputmode="decimal" min="0.01" step="0.01" autocomplete="off" required>
+            </div>
+          </div>
+        </div>
+        <p class="place-calc" id="place-calc" aria-live="polite"></p>
+        <div class="field">
+          <label class="field-label" for="place-notes">Notes <span class="optional">(optional)</span></label>
+          <input id="place-notes" name="notes" type="text" maxlength="500" autocomplete="off">
+        </div>
+      </div>
+      <p class="form-error" id="place-error" role="alert" hidden></p>
+      <footer class="modal-foot">
+        <button type="button" class="btn btn-ghost" data-close>Cancel</button>
+        <button type="submit" class="btn btn-primary" id="place-submit">
+          <svg class="icon" aria-hidden="true"><use href="#i-check"/></svg>
+          <span>Log bet</span>
+        </button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog class="modal modal-wide" id="dlg-settings" aria-labelledby="settings-title">
+    <form class="modal-inner" id="settings-form" novalidate>
+      <header class="modal-head">
+        <div class="modal-head-text">
+          <h2 class="modal-title" id="settings-title">Settings</h2>
+          <p class="modal-sub">Saved on the server and applied on the next engine tick.</p>
+        </div>
+        <button type="button" class="tool-btn icon-only" data-close aria-label="Close">
+          <svg class="icon" aria-hidden="true"><use href="#i-x"/></svg>
+        </button>
+      </header>
+      <div class="modal-body">
+        <fieldset class="fieldset">
+          <legend>Bankroll &amp; staking</legend>
+          <div class="form-grid form-grid-3">
+            <div class="field">
+              <label class="field-label" for="s-bankroll">Bankroll</label>
+              <div class="input-group"><span class="input-addon" aria-hidden="true">$</span><input id="s-bankroll" type="number" inputmode="decimal" min="1" step="any" required></div>
+            </div>
+            <div class="field">
+              <label class="field-label" for="s-kelly">Kelly multiplier</label>
+              <div class="input-group"><input id="s-kelly" type="number" inputmode="decimal" min="0.01" max="1" step="0.01" required><span class="input-addon" aria-hidden="true">×</span></div>
+              <span class="field-hint">0.25 = quarter Kelly</span>
+            </div>
+            <div class="field">
+              <label class="field-label" for="s-maxpct">Max stake %</label>
+              <div class="input-group"><input id="s-maxpct" type="number" inputmode="decimal" min="0.1" max="100" step="0.1" required><span class="input-addon" aria-hidden="true">%</span></div>
+              <span class="field-hint">of bankroll, per bet</span>
+            </div>
+            <div class="field">
+              <label class="field-label" for="s-maxabs">Max stake $</label>
+              <div class="input-group"><span class="input-addon" aria-hidden="true">$</span><input id="s-maxabs" type="number" inputmode="decimal" min="1" step="any" required></div>
+              <span class="field-hint">hard cap per bet</span>
+            </div>
+            <div class="field">
+              <label class="field-label" for="s-daily">Daily exposure limit</label>
+              <div class="input-group"><input id="s-daily" type="number" inputmode="decimal" min="0.1" max="100" step="0.1" required><span class="input-addon" aria-hidden="true">%</span></div>
+              <span class="field-hint">of bankroll per day</span>
+            </div>
+          </div>
+        </fieldset>
+
+        <fieldset class="fieldset">
+          <legend>EV thresholds</legend>
+          <div class="form-grid form-grid-3">
+            <div class="field">
+              <label class="field-label" for="s-minpre">Min EV pre-game</label>
+              <div class="input-group"><input id="s-minpre" type="number" inputmode="decimal" min="0" max="50" step="0.1" required><span class="input-addon" aria-hidden="true">%</span></div>
+            </div>
+            <div class="field">
+              <label class="field-label" for="s-minlive">Min EV live</label>
+              <div class="input-group"><input id="s-minlive" type="number" inputmode="decimal" min="0" max="50" step="0.1" required><span class="input-addon" aria-hidden="true">%</span></div>
+            </div>
+            <div class="field">
+              <label class="field-label" for="s-watch">Watch list from</label>
+              <div class="input-group"><input id="s-watch" type="number" inputmode="decimal" min="0" max="50" step="0.1" required><span class="input-addon" aria-hidden="true">%</span></div>
+              <span class="field-hint">must be ≤ both minimums</span>
+            </div>
+          </div>
+        </fieldset>
+
+        <fieldset class="fieldset">
+          <legend>Leagues</legend>
+          <div class="check-grid" id="s-leagues"></div>
+          <div class="inline-actions">
+            <button type="button" class="btn btn-small btn-ghost" id="s-leagues-all">Select all</button>
+            <button type="button" class="btn btn-small btn-ghost" id="s-leagues-none">Clear</button>
+          </div>
+        </fieldset>
+
+        <fieldset class="fieldset">
+          <legend>Arbitrage</legend>
+          <label class="switch">
+            <input type="checkbox" id="s-arbs">
+            <span class="switch-track" aria-hidden="true"></span>
+            <span class="switch-label">Show arbs (DraftKings vs another sportsbook)</span>
+          </label>
+        </fieldset>
+      </div>
+      <p class="form-error" id="settings-error" role="alert" hidden></p>
+      <footer class="modal-foot">
+        <button type="button" class="btn btn-ghost" data-close>Cancel</button>
+        <button type="submit" class="btn btn-primary" id="settings-submit">
+          <svg class="icon" aria-hidden="true"><use href="#i-check"/></svg>
+          <span>Save settings</span>
+        </button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog class="drawer" id="dlg-health" aria-labelledby="health-title">
+    <div class="drawer-inner">
+      <header class="modal-head">
+        <div class="modal-head-text">
+          <h2 class="modal-title" id="health-title">System health</h2>
+          <p class="modal-sub" id="health-sub"></p>
+        </div>
+        <button type="button" class="tool-btn icon-only" data-close aria-label="Close">
+          <svg class="icon" aria-hidden="true"><use href="#i-x"/></svg>
+        </button>
+      </header>
+      <div class="drawer-body" id="health-body"></div>
+    </div>
+  </dialog>
+
+  <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
+</body>
+</html>

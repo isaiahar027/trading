@@ -1,0 +1,177 @@
+[
+  {
+    "id": "5a1e3c9b7d2f4e6a8c0b1d3f5e7a9c2b",
+    "sport_key": "soccer_epl",
+    "sport_title": "EPL",
+    "commence_time": "2026-10-31T15:00:00Z",
+    "home_team": "Arsenal",
+    "away_team": "Chelsea",
+    "bookmakers": [
+      {
+        "key": "pinnacle",
+        "title": "Pinnacle",
+        "last_update": "2026-10-31T11:58:40Z",
+        "markets": [
+          {
+            "key": "h2h",
+            "last_update": "2026-10-31T11:58:40Z",
+            "outcomes": [
+              { "name": "Arsenal", "price": 1.83 },
+              { "name": "Chelsea", "price": 4.35 },
+              { "name": "Draw", "price": 3.9 }
+            ]
+          },
+          {
+            "key": "spreads",
+            "last_update": "2026-10-31T11:58:40Z",
+            "outcomes": [
+              { "name": "Arsenal", "price": 1.83, "point": -0.5 },
+              { "name": "Chelsea", "price": 2.08, "point": 0.5 }
+            ]
+          },
+          {
+            "key": "totals",
+            "last_update": "2026-10-31T11:57:12Z",
+            "outcomes": [
+              { "name": "Over", "price": 1.8, "point": 2.5 },
+              { "name": "Under", "price": 2.07, "point": 2.5 }
+            ]
+          },
+          {
+            "key": "h2h_lay",
+            "last_update": "2026-10-31T11:58:40Z",
+            "outcomes": [
+              { "name": "Arsenal", "price": 1.86 },
+              { "name": "Chelsea", "price": 4.5 },
+              { "name": "Draw", "price": 4.0 }
+            ]
+          }
+        ]
+      },
+      {
+        "key": "draftkings",
+        "title": "DraftKings",
+        "last_update": "2026-10-31T11:55:03Z",
+        "markets": [
+          {
+            "key": "h2h",
+            "last_update": "2026-10-31T11:55:03Z",
+            "link": "https://sportsbook.draftkings.com/event/31998877",
+            "outcomes": [
+              { "name": "Arsenal", "price": 1.8, "link": "https://sportsbook.draftkings.com/event/31998877?outcomes=0ML7771_1" },
+              { "name": "Chelsea", "price": 4.5, "link": "https://sportsbook.draftkings.com/event/31998877?outcomes=0ML7771_3" },
+              { "name": "Draw", "price": 3.8, "link": "https://sportsbook.draftkings.com/event/31998877?outcomes=0ML7771_2" }
+            ]
+          },
+          {
+            "key": "spreads",
+            "last_update": "2026-10-31T11:55:03Z",
+            "outcomes": [
+              { "name": "Arsenal", "price": 1.8, "point": -0.5 },
+              { "name": "Chelsea", "price": 2.0, "point": 0.5 }
+            ]
+          },
+          {
+            "key": "totals",
+            "last_update": "2026-10-31T11:55:03Z",
+            "outcomes": [
+              { "name": "Over", "price": 1.77, "point": 2.5 },
+              { "name": "Under", "price": 2.05, "point": 2.5 }
+            ]
+          }
+        ]
+      },
+      {
+        "key": "fanduel",
+        "title": "FanDuel",
+        "last_update": "2026-10-31T11:56:18Z",
+        "link": "https://{state}.sportsbook.fanduel.com/soccer/english-premier-league",
+        "markets": [
+          {
+            "key": "h2h",
+            "last_update": "2026-10-31T11:56:18Z",
+            "outcomes": [
+              { "name": "Arsenal", "price": 1.85 },
+              { "name": "Chelsea", "price": 4.2 },
+              { "name": "draw", "price": 3.75 }
+            ]
+          }
+        ]
+      },
+      {
+        "key": "betmgm",
+        "title": "BetMGM",
+        "last_update": "2026-10-31T11:50:00Z",
+        "markets": [
+          {
+            "key": "h2h",
+            "last_update": "2026-10-31T11:50:00Z",
+            "outcomes": [
+              { "name": "Arsenal", "price": 1.8 },
+              { "name": "Chelsea", "price": 4.33 },
+              { "name": "Tie", "price": 3.8 }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "7b9d1f3a5c7e9b1d3f5a7c9e1b3d5f7a",
+    "sport_key": "soccer_epl",
+    "sport_title": "EPL",
+    "commence_time": "2026-10-31T17:30:00Z",
+    "home_team": "Liverpool",
+    "away_team": "Manchester City",
+    "bookmakers": [
+      {
+        "key": "pinnacle",
+        "title": "Pinnacle",
+        "last_update": "2026-10-31T11:59:30Z",
+        "markets": [
+          {
+            "key": "h2h",
+            "last_update": "2026-10-31T11:59:30Z",
+            "outcomes": [
+              { "name": "Liverpool", "price": 2.38 },
+              { "name": "Manchester City", "price": 2.9 },
+              { "name": "Draw", "price": 3.7 }
+            ]
+          },
+          {
+            "key": "totals",
+            "last_update": "2026-10-31T11:59:30Z",
+            "outcomes": [
+              { "name": "Over", "price": 1.66, "point": 2.75 },
+              { "name": "Under", "price": 2.28, "point": 2.75 }
+            ]
+          }
+        ]
+      },
+      {
+        "key": "draftkings",
+        "title": "DraftKings",
+        "last_update": "2026-10-31T11:52:45Z",
+        "markets": [
+          {
+            "key": "h2h",
+            "last_update": "2026-10-31T11:52:45Z",
+            "outcomes": [
+              { "name": "Liverpool", "price": 2.4 },
+              { "name": "Manchester City", "price": 2.85 },
+              { "name": "Draw", "price": 3.6 }
+            ]
+          },
+          {
+            "key": "totals",
+            "last_update": "2026-10-31T11:52:45Z",
+            "outcomes": [
+              { "name": "Over", "price": 1.62 },
+              { "name": "Under", "price": 2.3, "point": 2.5 }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+]

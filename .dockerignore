@@ -1,0 +1,28 @@
+# Keep the build context small and never bake secrets or local state into the image.
+
+# Dependencies and build output are recreated inside the image.
+node_modules
+dist
+
+# Runtime state and secrets: mounted or passed at run time, never copied.
+data
+.env
+.env.*
+!.env.example
+
+# VCS, editor and tooling folders.
+.git
+.github
+.vscode
+.idea
+.claude
+coverage
+probe-output
+*.log
+
+# Not needed to build or run the service.
+test
+vitest.config.ts
+tsconfig.check.json
+docker-compose.yml
+README.md

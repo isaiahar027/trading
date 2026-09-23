@@ -1,0 +1,301 @@
+[
+  {
+    "id": "8c1f0e4a2b7d4c6e9f1a3b5c7d9e0f12",
+    "sport_key": "basketball_nba",
+    "sport_title": "NBA",
+    "commence_time": "2026-10-28T00:00:00Z",
+    "home_team": "Boston Celtics",
+    "away_team": "New York Knicks",
+    "bookmakers": [
+      {
+        "key": "pinnacle",
+        "title": "Pinnacle",
+        "last_update": "2026-10-27T23:29:41Z",
+        "link": null,
+        "markets": [
+          {
+            "key": "h2h",
+            "last_update": "2026-10-27T23:29:41Z",
+            "outcomes": [
+              { "name": "Boston Celtics", "price": 1.408 },
+              { "name": "New York Knicks", "price": 3.05 }
+            ]
+          },
+          {
+            "key": "spreads",
+            "last_update": "2026-10-27T23:29:20Z",
+            "outcomes": [
+              { "name": "Boston Celtics", "price": 1.943, "point": -7.5 },
+              { "name": "New York Knicks", "price": 1.952, "point": 7.5 }
+            ]
+          },
+          {
+            "key": "totals",
+            "last_update": "2026-10-27T23:28:02Z",
+            "outcomes": [
+              { "name": "Over", "price": 1.925, "point": 224.5 },
+              { "name": "Under", "price": 1.97, "point": 224.5 }
+            ]
+          }
+        ]
+      },
+      {
+        "key": "draftkings",
+        "title": "DraftKings",
+        "last_update": "2026-10-27T23:29:12Z",
+        "link": "https://sportsbook.draftkings.com/leagues/basketball/nba",
+        "markets": [
+          {
+            "key": "h2h",
+            "last_update": "2026-10-27T23:29:12Z",
+            "link": "https://sportsbook.draftkings.com/event/32145678",
+            "outcomes": [
+              { "name": "Boston Celtics", "price": 1.38, "link": "https://sportsbook.draftkings.com/event/32145678?outcomes=0ML86545123_1" },
+              { "name": "New York Knicks", "price": 3.15, "link": "https://sportsbook.draftkings.com/event/32145678?outcomes=0ML86545123_3" }
+            ]
+          },
+          {
+            "key": "spreads",
+            "last_update": "2026-10-27T23:26:40Z",
+            "link": "https://sportsbook.draftkings.com/event/32145678?category=game-lines",
+            "outcomes": [
+              { "name": "Boston Celtics", "price": 1.91, "point": -7.5 },
+              { "name": "New York Knicks", "price": 1.91, "point": 7.5 }
+            ]
+          },
+          {
+            "key": "totals",
+            "outcomes": [
+              { "name": "Over", "price": 1.91, "point": 225.5, "link": "https://sportsbook.draftkings.com/event/32145678?outcomes=0OU86545130O22550_1" },
+              { "name": "Under", "price": 1.91, "point": 225.5, "link": "https://sportsbook.draftkings.com/event/32145678?outcomes=0OU86545130U22550_3" }
+            ]
+          },
+          {
+            "key": "alternate_spreads",
+            "last_update": "2026-10-27T23:26:40Z",
+            "outcomes": [
+              { "name": "Boston Celtics", "price": 2.55, "point": -11.5 },
+              { "name": "New York Knicks", "price": 1.5, "point": 11.5 }
+            ]
+          }
+        ]
+      },
+      {
+        "key": "fanduel",
+        "title": "FanDuel",
+        "last_update": "2026-10-27T23:28:55Z",
+        "link": "https://{state}.sportsbook.fanduel.com/navigation/nba",
+        "markets": [
+          {
+            "key": "h2h",
+            "last_update": "2026-10-27T23:28:55Z",
+            "outcomes": [
+              { "name": "Boston Celtics", "price": 1.4, "link": "https://{state}.sportsbook.fanduel.com/addToBetslip?marketId=734.12345678&selectionId=1001" },
+              { "name": "New York Knicks", "price": 3.1, "link": "https://{state}.sportsbook.fanduel.com/addToBetslip?marketId=734.12345678&selectionId=1002" }
+            ]
+          },
+          {
+            "key": "spreads",
+            "last_update": "2026-10-27T23:28:55Z",
+            "outcomes": [
+              { "name": "Boston Celtics", "price": 1.92, "point": -7.5 },
+              { "name": "New York Knicks", "price": 1.9 }
+            ]
+          },
+          {
+            "key": "totals",
+            "last_update": "2026-10-27T23:28:55Z",
+            "outcomes": [
+              { "name": "Over", "price": 1.9, "point": 224.5 },
+              { "name": "Under", "price": 1.92, "point": 224.5 }
+            ]
+          }
+        ]
+      },
+      {
+        "key": "betmgm",
+        "title": "BetMGM",
+        "last_update": "2026-10-27T23:27:30Z",
+        "link": "https://sports.{state}.betmgm.com/en/sports/events/new-york-knicks-at-boston-celtics-16543210",
+        "markets": [
+          {
+            "key": "h2h",
+            "last_update": "2026-10-27T23:27:30Z",
+            "outcomes": [
+              { "name": "Boston Celtic", "price": 1.4 },
+              { "name": "New York Knicks", "price": 3.0 }
+            ]
+          },
+          {
+            "key": "spreads",
+            "last_update": "2026-10-27T23:27:30Z",
+            "outcomes": [
+              { "name": "Boston Celtics", "price": 1.87, "point": -7.0 },
+              { "name": "New York Knicks", "price": 1.95, "point": 7.0 }
+            ]
+          },
+          {
+            "key": "totals",
+            "last_update": "2026-10-27T23:27:30Z",
+            "outcomes": [
+              { "name": "Over", "price": 0.9, "point": 224.5 },
+              { "name": "Under", "price": 1.91, "point": 224.5 }
+            ]
+          },
+          {
+            "key": "player_points",
+            "last_update": "2026-10-27T23:27:30Z",
+            "outcomes": [
+              { "name": "Over", "description": "Jayson Tatum", "price": 1.87, "point": 27.5 },
+              { "name": "Under", "description": "Jayson Tatum", "price": 1.95, "point": 27.5 }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "3d5b7f9a1c2e4a6b8d0f2a4c6e8b0d21",
+    "sport_key": "basketball_nba",
+    "sport_title": "NBA",
+    "commence_time": "2026-10-27T23:10:00Z",
+    "home_team": "Orlando Magic",
+    "away_team": "Miami Heat",
+    "bookmakers": [
+      {
+        "key": "pinnacle",
+        "title": "Pinnacle",
+        "last_update": "2026-10-27T23:29:58Z",
+        "markets": [
+          {
+            "key": "h2h",
+            "last_update": "2026-10-27T23:29:58Z",
+            "outcomes": [
+              { "name": "Miami Heat", "price": 2.42 },
+              { "name": "Orlando Magic", "price": 1.62 }
+            ]
+          },
+          {
+            "key": "spreads",
+            "last_update": "2026-10-27T23:29:58Z",
+            "outcomes": [
+              { "name": "Miami Heat", "price": 1.87, "point": 3.5 },
+              { "name": "Orlando Magic", "price": 2.0, "point": -3.5 }
+            ]
+          },
+          {
+            "key": "totals",
+            "last_update": "2026-10-27T23:29:51Z",
+            "outcomes": [
+              { "name": "Over", "price": 1.93, "point": 208.5 },
+              { "name": "Under", "price": 1.96, "point": 208.5 }
+            ]
+          }
+        ]
+      },
+      {
+        "key": "draftkings",
+        "title": "DraftKings",
+        "last_update": "2026-10-27T23:29:50Z",
+        "markets": [
+          {
+            "key": "h2h",
+            "last_update": "2026-10-27T23:29:50Z",
+            "outcomes": [
+              { "name": "Miami Heat", "price": 2.5, "link": "https://sportsbook.draftkings.com/event/32145990?outcomes=0ML86546001_3" },
+              { "name": "Orlando Magic", "price": 1.57, "link": "https://sportsbook.draftkings.com/event/32145990?outcomes=0ML86546001_1" }
+            ]
+          },
+          {
+            "key": "spreads",
+            "last_update": "2026-10-27T23:29:44Z",
+            "outcomes": [
+              { "name": "Miami Heat", "price": 2.0, "point": 2.5 },
+              { "name": "Orlando Magic", "price": 1.83, "point": -2.5 }
+            ]
+          },
+          {
+            "key": "totals",
+            "last_update": "2026-10-27T23:29:44Z",
+            "outcomes": [
+              { "name": "Over", "price": 1.91, "point": 209.5 },
+              { "name": "Under", "price": 1.91, "point": 209.5 }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "f0e1d2c3b4a5968778695a4b3c2d1e0f",
+    "sport_key": "basketball_nba",
+    "sport_title": "NBA",
+    "commence_time": "2026-10-28T02:30:00Z",
+    "home_team": "Los Angeles Lakers",
+    "away_team": "Golden State Warriors",
+    "bookmakers": [
+      {
+        "key": "pinnacle",
+        "title": "Pinnacle",
+        "last_update": "2026-10-27T23:25:10Z",
+        "markets": [
+          {
+            "key": "h2h",
+            "last_update": "2026-10-27T23:25:10Z",
+            "outcomes": [
+              { "name": "Golden State Warriors", "price": 1.87 },
+              { "name": "Los Angeles Lakers", "price": 2.02 }
+            ]
+          }
+        ]
+      },
+      {
+        "key": "draftkings",
+        "title": "DraftKings",
+        "last_update": "2026-10-27T23:24:00Z",
+        "markets": [
+          {
+            "key": "h2h",
+            "last_update": "2026-10-27T23:24:00Z",
+            "outcomes": [
+              { "name": "Golden State Warriors", "price": 1.83 },
+              { "name": "Los Angeles Lakers", "price": 2.05 }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "0a0b0c0d0e0f1a1b1c1d1e1f2a2b2c2d",
+    "sport_key": "basketball_nba",
+    "sport_title": "NBA",
+    "commence_time": "2026-10-28T00:30:00Z",
+    "away_team": "Chicago Bulls",
+    "bookmakers": [
+      {
+        "key": "draftkings",
+        "title": "DraftKings",
+        "last_update": "2026-10-27T23:20:00Z",
+        "markets": [
+          {
+            "key": "h2h",
+            "outcomes": [
+              { "name": "Chicago Bulls", "price": 2.9 },
+              { "name": "Milwaukee Bucks", "price": 1.45 }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b",
+    "sport_key": "basketball_nba",
+    "sport_title": "NBA",
+    "commence_time": "TBD",
+    "home_team": "Denver Nuggets",
+    "away_team": "Utah Jazz",
+    "bookmakers": []
+  }
+]

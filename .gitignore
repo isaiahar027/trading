@@ -3,6 +3,8 @@ dist/
 data/*
 !data/.gitkeep
 .env
+.env.*
+!.env.example
 *.log
 coverage/
 probe-output/

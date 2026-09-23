@@ -16,14 +16,23 @@ export class HttpError extends Error {
   readonly url: string;
   readonly bodySnippet: string;
   readonly retryAfterMs: number | null;
+  /** Response headers of the failed request, when there was a response (e.g. quota headers on a 429). */
+  readonly headers: Headers | null;
 
-  constructor(status: number, url: string, bodySnippet: string, retryAfterMs: number | null) {
+  constructor(
+    status: number,
+    url: string,
+    bodySnippet: string,
+    retryAfterMs: number | null,
+    headers: Headers | null = null,
+  ) {
     super(`HTTP ${status} for ${redactUrl(url)}${bodySnippet ? `: ${bodySnippet.slice(0, 160)}` : ''}`);
     this.name = 'HttpError';
     this.status = status;
     this.url = redactUrl(url);
     this.bodySnippet = bodySnippet;
     this.retryAfterMs = retryAfterMs;
+    this.headers = headers;
   }
 
   /** Auth/permission failures are final; retrying cannot fix them. */
@@ -112,7 +121,7 @@ async function fetchOnce<T>(url: string, opts: FetchJsonOptions): Promise<FetchJ
     const declared = Number(res.headers.get('content-length'));
     if (Number.isFinite(declared) && declared > maxBytes) {
       await res.body?.cancel().catch(() => undefined);
-      throw new HttpError(res.status, url, `response too large (${declared} bytes)`, null);
+      throw new HttpError(res.status, url, `response too large (${declared} bytes)`, null, res.headers);
     }
 
     let text: string;
@@ -123,10 +132,18 @@ async function fetchOnce<T>(url: string, opts: FetchJsonOptions): Promise<FetchJ
       if (controller.signal.aborted) throw new TimeoutError(url, timeoutMs);
       throw err;
     }
-    if (text.length > maxBytes) throw new HttpError(res.status, url, `response too large (${text.length} chars)`, null);
+    if (text.length > maxBytes) {
+      throw new HttpError(res.status, url, `response too large (${text.length} chars)`, null, res.headers);
+    }
 
     if (!res.ok) {
-      throw new HttpError(res.status, url, text.replace(/\s+/g, ' ').trim().slice(0, 300), parseRetryAfter(res.headers.get('retry-after')));
+      throw new HttpError(
+        res.status,
+        url,
+        text.replace(/\s+/g, ' ').trim().slice(0, 300),
+        parseRetryAfter(res.headers.get('retry-after')),
+        res.headers,
+      );
     }
     let data: T;
     try {
