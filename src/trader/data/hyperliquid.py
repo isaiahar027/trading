@@ -20,7 +20,7 @@ class HyperliquidData:
         self.timeout = timeout
 
     def _post(self, body: dict):
-        for attempt in range(4):
+        for attempt in range(6):
             try:
                 r = self.http.post(self.url, json=body, timeout=self.timeout)
                 if r.status_code == 200:
@@ -28,7 +28,7 @@ class HyperliquidData:
                 if r.status_code not in (429, 500, 502, 503, 504):
                     r.raise_for_status()
             except requests.RequestException:
-                if attempt == 3:
+                if attempt == 5:
                     raise
             time.sleep(2 ** attempt)
         raise RuntimeError(f"hyperliquid info failed: {body.get('type')}")
@@ -49,7 +49,10 @@ class HyperliquidData:
     def l2_book(self, coin: str) -> OrderBook:
         raw = self._post({"type": "l2Book", "coin": coin})
         bids, asks = raw["levels"]
-        return OrderBook(int(raw["time"]),
+        # Stamp with local receipt time: that is when we could first know it. The venue's own
+        # timestamp can be ahead of our clock (skew) and would falsely trip the lookahead guard.
+        received = int(time.time() * 1000)
+        return OrderBook(min(int(raw["time"]), received),
                          tuple(Level(float(l["px"]), float(l["sz"])) for l in bids),
                          tuple(Level(float(l["px"]), float(l["sz"])) for l in asks))
 
@@ -76,6 +79,7 @@ class HyperliquidData:
             if nt <= t:
                 break
             t = nt
+            time.sleep(0.3)  # the info endpoint rate-limits long paginations
         return out
 
 

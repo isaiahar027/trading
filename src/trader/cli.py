@@ -79,7 +79,12 @@ def cmd_backtest(args, cfg):
         else:
             candles[s] = hl.candles(s, cfg.run.interval, start, end)
             cache_candles(cache, candles[s])
-        funding[s] = hl.funding_history(s, start, end)
+        fcache = cache.with_name(cache.stem + "-funding.json")
+        if fcache.exists():
+            funding[s] = [tuple(x) for x in json.loads(fcache.read_text())]
+        else:
+            funding[s] = hl.funding_history(s, start, end)
+            fcache.write_text(json.dumps(funding[s]))
         print(f"{s}: {len(candles[s])} candles, {len(funding[s])} funding prints")
     schemas = {s: compile_schema(s, ANCHOR_THESIS.get(s, {"bias": "neutral"})) for s in symbols}
     if args.reflex == "jev":

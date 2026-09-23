@@ -100,6 +100,7 @@ class LiveRunner:
                 if now_ms >= next_bar + SETTLE_S * 1000:
                     self.reconcile(now_ms)
                     market = self.fetch(now_ms)
+                    now_ms = int(time.time() * 1000)  # decide at the instant the data is in hand
                     rep = eng.step(now_ms, market)
                     if self.live_broker is None:
                         self.accrue_funding(market, now_ms)

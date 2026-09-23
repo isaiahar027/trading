@@ -1,0 +1,16 @@
+# ~/.config/systemd/user/trader.service   (systemctl --user enable --now trader.service)
+[Unit]
+Description=Autonomous trading agent (24/7 loop)
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/trading
+EnvironmentFile=%h/trading/.env
+ExecStart=%h/trading/.venv/bin/trader run
+# On any crash the loop has already tripped state/KILL. Restarting brings it up flatten-only;
+# the operator must investigate, `trader reset-kill`, then `trader arm`.
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target

@@ -98,8 +98,9 @@ def vol_label(pctile: float) -> str:
 
 
 def funding_label(apr: float) -> str:
-    # apr as a fraction. Neutral band ~ +-10%/yr; beyond 50% the trade is crowded.
-    return bucket(apr, [-0.5, -0.1, 0.1, 0.5],
+    # apr as a fraction. Hyperliquid's baseline (interest component) is ~11%/yr, so the neutral
+    # band is asymmetric around it; beyond +50% / -30% the trade is crowded.
+    return bucket(apr, [-0.3, -0.05, 0.2, 0.5],
                   ["shorts_crowded", "shorts_paying", "neutral", "longs_paying", "longs_crowded"])
 
 

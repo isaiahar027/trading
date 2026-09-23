@@ -1,0 +1,9 @@
+[Unit]
+Description=Trader nightly review
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/trading
+EnvironmentFile=%h/trading/.env
+Environment=PATH=%h/trading/.venv/bin:/usr/bin:/bin
+ExecStart=%h/trading/scripts/nightly.sh

@@ -1,0 +1,9 @@
+[Unit]
+Description=Run trader nightly review at 23:30 UTC
+
+[Timer]
+OnCalendar=*-*-* 23:30:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target
