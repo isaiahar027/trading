@@ -80,6 +80,8 @@ export interface AppConfig {
     prematchHorizonHours: number;
     /** Ask the feed for bookmaker deep links (used for the "Open in DraftKings" button). */
     includeLinks: boolean;
+    /** Two-letter state used to fill `{state}` placeholders in bookmaker links, e.g. "nj". */
+    linkState: string;
   };
 
   model: {
@@ -228,6 +230,7 @@ export function loadConfig(env: Env = process.env, argv: string[] = process.argv
       requestTimeoutMs: num(env, 'ODDS_API_TIMEOUT_MS', 15000, { min: 1000 }),
       prematchHorizonHours: num(env, 'ODDS_API_PREMATCH_HORIZON_HOURS', 24, { min: 1 }),
       includeLinks: bool(env, 'ODDS_API_INCLUDE_LINKS', true),
+      linkState: str(env, 'BOOK_STATE', '').toLowerCase(),
     },
 
     model: {
