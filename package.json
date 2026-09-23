@@ -1,0 +1,27 @@
+{
+  "name": "dk-edge-hub",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Decision dashboard that compares DraftKings prices (via The Odds API) against sharp-book fair prices. Read-only: it never logs in or places bets.",
+  "main": "dist/index.js",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "demo": "tsx src/index.ts --demo",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc -p tsconfig.check.json",
+    "check": "npm run typecheck && npm test"
+  },
+  "license": "UNLICENSED",
+  "devDependencies": {
+    "@types/node": "^22.20.4",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3",
+    "vitest": "^5.0.1"
+  }
+}
