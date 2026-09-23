@@ -1,0 +1,48 @@
+# Every threshold, size and limit lives here and is enforced in code.
+# Jev only judges. Nothing in this file is ever read or written by a model.
+
+[run]
+mode = "paper"              # "paper" | "live"  (live also needs every approval gate + env confirm)
+interval = "1h"             # candle the reflex fires on
+state_dir = "state"
+starting_equity = 10000.0   # paper only
+
+[risk]
+max_drawdown = 0.15         # from equity peak -> kill switch trips, flatten everything
+max_daily_loss = 0.03       # of start-of-UTC-day equity -> no new risk until next UTC day
+max_position_frac = 0.20    # per-instrument notional / equity
+max_gross_leverage = 1.0    # sum |notional| / equity
+max_orders_per_hour = 12
+max_price_deviation = 0.02  # reject orders priced >2% away from current mid (fat finger)
+max_snapshot_age_s = 120    # reject if market data older than this
+min_order_notional = 11.0   # venue minimum is $10
+
+[policy]
+min_setup_quality = 2.0
+min_direction_confidence = 0.80
+max_toxic_flow = 0.50       # noul probability flow is toxic; above this, no entry
+kelly_fraction = 0.25       # fractional Kelly multiplier; hard-capped at 0.25 in code
+stop_atr = 2.0              # bracket stop distance in ATRs
+target_atr = 3.0            # bracket target distance in ATRs
+max_hold_bars = 48
+escalate_below_confidence = 0.60
+escalation_cooldown_s = 3600
+
+[costs]
+taker_fee_bps = 4.5         # Hyperliquid base-tier taker fee; verify for your tier
+slippage_bps = 3.0
+
+[jev]
+url = "https://api.typesafe.ai/v1/systemone"
+model = "jev-1.13.0"        # pinned: thresholds are tuned against a version, not an alias
+timeout_s = 2.0
+max_retries = 2
+
+[brain]
+model = "claude-opus-5-5"
+effort = "high"
+
+[universe]
+# Filled from research/finalists.json by `trader compile`. BTC/ETH are always traded as
+# regime anchors; finalists are added only once compiled and approved.
+symbols = ["BTC", "ETH"]
