@@ -1,16 +1,21 @@
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as http from 'node:http';
+import * as net from 'node:net';
 import * as path from 'node:path';
 import type { BetJournal, PlaceBetInput } from './betJournal';
 import type { SettingsStore } from './settingsStore';
-import type { BetResult, DashboardState, Opportunity, RuntimeSettings } from '../types';
+import type { BetResult, DashboardState, MarketKind, Opportunity, RuntimeSettings, Side } from '../types';
 import { createLogger } from '../util/logger';
 
 /**
  * Dashboard HTTP server (node:http only).
  *
  *  - `GET /healthz` is the only unauthenticated route. Everything else requires HTTP Basic auth when a password is set.
+ *  - Every other request must be addressed (Host header) to a name the dashboard answers to: an IP address,
+ *    `localhost`, the configured host, or an `allowedHosts` entry. This defeats DNS rebinding, where a web page on
+ *    an attacker's domain re-resolves that domain to 127.0.0.1 and then reads and writes the dashboard as a
+ *    same-origin page (its Origin then matches the Host, so the Origin check alone cannot tell).
  *  - Static files come from a fixed whitelist; request paths are matched verbatim (never decoded or joined), so
  *    traversal attempts such as `/../x` or `/%2e%2e/x` simply do not match and get a 404.
  *  - `GET /api/stream` is a Server-Sent Events feed of `event: state` frames. Slow clients are conflated (they get the
@@ -35,6 +40,11 @@ export interface ServerDeps {
   findOpportunity: (id: string) => Opportunity | undefined;
   onSettingsChanged?: (s: RuntimeSettings) => void;
   now?: () => number;
+  /**
+   * Extra host names the dashboard answers to besides IP addresses, `localhost` and `host` (e.g. a reverse-proxy
+   * domain or a Tailscale name). `*.example.com` also matches every subdomain. Case-insensitive, no port.
+   */
+  allowedHosts?: string[];
   /** SSE heartbeat period in ms (default 15 000). */
   heartbeatMs?: number;
   /** Max concurrent SSE clients (default 25); further stream requests get 503. */
@@ -91,6 +101,40 @@ const STATIC_ASSETS: ReadonlyMap<string, StaticAsset> = new Map([
 ]);
 
 const SETTLE_RESULTS: ReadonlyArray<Exclude<BetResult, 'pending'>> = ['won', 'lost', 'push', 'void'];
+const SNAPSHOT_KINDS: ReadonlyArray<MarketKind> = ['moneyline', 'spread', 'total'];
+const SNAPSHOT_SIDES: ReadonlyArray<Side> = ['home', 'away', 'draw', 'over', 'under'];
+const MAX_SNAPSHOT_TEXT = 300;
+
+/** The pick fields "I placed it" needs, as the dashboard last showed them. */
+type PickSnapshot = Pick<Opportunity, 'eventId' | 'league' | 'eventName' | 'startTime' | 'pick' | 'kind' | 'side' | 'line' | 'isLive' | 'fairProb'>;
+
+function snapText(v: unknown): string | null {
+  return typeof v === 'string' && v.trim() !== '' && v.length <= MAX_SNAPSHOT_TEXT ? v.trim() : null;
+}
+
+/**
+ * Validates the dashboard's copy of a pick that has expired on the server (it is dropped ~90 s after it vanishes, and
+ * on restart). The copy must describe exactly the market the opportunity id names, so it cannot be attached to a
+ * different pick. Returns null when anything is missing or inconsistent.
+ */
+function parseSnapshot(raw: unknown, opportunityId: string): PickSnapshot | null {
+  if (!isPlainObject(raw)) return null;
+  const eventId = snapText(raw.eventId);
+  const league = snapText(raw.league);
+  const eventName = snapText(raw.eventName);
+  const pick = snapText(raw.pick);
+  const kind = SNAPSHOT_KINDS.find((k) => k === raw.kind);
+  const side = SNAPSHOT_SIDES.find((x) => x === raw.side);
+  const line = raw.line === null ? null : toFiniteNumber(raw.line);
+  const startTime = toFiniteNumber(raw.startTime);
+  const fairProb = toFiniteNumber(raw.fairProb);
+  if (eventId === null || league === null || eventName === null || pick === null || kind === undefined || side === undefined) return null;
+  if ((kind === 'moneyline') !== (line === null) || startTime === null || typeof raw.isLive !== 'boolean') return null;
+  if (fairProb === null || !(fairProb > 0 && fairProb < 1)) return null;
+  const tail = `|${kind}|${side}|${line ?? ''}`;
+  if (opportunityId !== `${eventId}|ev${tail}` && opportunityId !== `${eventId}|arb${tail}`) return null;
+  return { eventId, league, eventName, startTime, pick, kind, side, line, isLive: raw.isLive, fairProb };
+}
 const SETTLE_PATH = /^\/api\/bets\/([^/]+)\/settle$/;
 const BET_ID_PATTERN = /^[A-Za-z0-9._:-]+$/;
 
@@ -192,6 +236,55 @@ function originAllowed(req: http.IncomingMessage): boolean {
   } catch {
     return false;
   }
+}
+
+/** Host name (lower-case, no port, no brackets, no trailing dot) from a Host header, or null when malformed. */
+export function hostnameOf(hostHeader: string | undefined): string | null {
+  if (typeof hostHeader !== 'string') return null;
+  const raw = hostHeader.trim().toLowerCase();
+  if (raw === '' || raw.length > 255) return null;
+  let name: string;
+  if (raw.startsWith('[')) {
+    const end = raw.indexOf(']');
+    if (end < 0) return null;
+    const rest = raw.slice(end + 1);
+    if (rest !== '' && !/^:\d{1,5}$/.test(rest)) return null;
+    name = raw.slice(1, end);
+    return net.isIPv6(name) ? name : null;
+  }
+  const colon = raw.lastIndexOf(':');
+  if (colon >= 0) {
+    if (!/^\d{1,5}$/.test(raw.slice(colon + 1))) return null;
+    name = raw.slice(0, colon);
+  } else {
+    name = raw;
+  }
+  if (name.endsWith('.')) name = name.slice(0, -1);
+  return /^[a-z0-9.-]+$/.test(name) && name !== '' ? name : null;
+}
+
+/**
+ * True when a request addressed to `name` cannot come from a DNS-rebinding page: IP literals (a page cannot rebind
+ * an address), `localhost` and `*.localhost` (browsers resolve these to loopback themselves), the configured bind
+ * host, and the allow-list (`*.example.com` / `.example.com` match subdomains too).
+ */
+export function hostAllowed(name: string | null, bindHost: string, allowed: readonly string[]): boolean {
+  if (name === null) return false;
+  if (net.isIP(name) !== 0) return true;
+  if (name === 'localhost' || name.endsWith('.localhost')) return true;
+  const bind = bindHost.trim().toLowerCase().replace(/^\[|\]$/g, '');
+  if (bind !== '' && name === bind) return true;
+  for (const entry of allowed) {
+    const a = entry.trim().toLowerCase();
+    if (a === '') continue;
+    if (a.startsWith('*.') || a.startsWith('.')) {
+      const suffix = a.startsWith('*.') ? a.slice(1) : a;
+      if (name.endsWith(suffix) || name === suffix.slice(1)) return true;
+    } else if (name === a) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function contentTypeOf(req: http.IncomingMessage): string {
@@ -425,6 +518,18 @@ export class DashboardServer {
       return sendJson(res, 200, { ok: true, uptimeSec });
     }
 
+    const hostname = hostnameOf(req.headers.host);
+    if (!hostAllowed(hostname, this.deps.host, this.deps.allowedHosts ?? [])) {
+      return sendError(
+        res,
+        403,
+        hostname === null
+          ? 'Missing or malformed Host header'
+          : `This dashboard does not answer to "${hostname}". If that is your own address (a reverse proxy or ` +
+              'Tailscale name), add it to ALLOWED_HOSTS in .env and restart.',
+      );
+    }
+
     if (!this.isAuthorized(req)) {
       return sendError(res, 401, 'unauthorized', { 'WWW-Authenticate': 'Basic realm="Odds Hub", charset="UTF-8"' });
     }
@@ -652,11 +757,14 @@ export class DashboardServer {
       return sendError(res, 400, 'Notes must be text');
     }
 
-    const opp = this.deps.findOpportunity(opportunityId);
+    // A pick the server no longer tracks (it expired, or the server restarted) can still be logged from the dashboard's
+    // copy: the bet was placed, and leaving it out would under-count today's exposure.
+    const tracked = this.deps.findOpportunity(opportunityId);
+    const opp: PickSnapshot | null = tracked ?? parseSnapshot(body.snapshot, opportunityId);
     if (!opp) return sendError(res, 404, 'Opportunity not found (it may have expired)');
 
     const input: PlaceBetInput = {
-      opportunityId: opp.id,
+      opportunityId,
       eventId: opp.eventId,
       league: opp.league,
       eventName: opp.eventName,
@@ -671,12 +779,14 @@ export class DashboardServer {
       fairProbAtPlace: opp.fairProb,
     };
     if (typeof notes === 'string' && notes.trim() !== '') input.notes = notes.trim();
+    if (!tracked) input.fromSnapshot = true;
 
     try {
       const record = this.deps.journal.place(input);
       return sendJson(res, 201, record);
     } catch (err) {
       if (isNamedError(err, 'ValidationError')) return sendError(res, 400, errorMessage(err));
+      if (isNamedError(err, 'JournalWriteError')) return sendError(res, 503, errorMessage(err));
       throw err;
     }
   }
@@ -705,6 +815,7 @@ export class DashboardServer {
     } catch (err) {
       if (isNamedError(err, 'UnknownBetError')) return sendError(res, 404, errorMessage(err));
       if (isNamedError(err, 'ValidationError')) return sendError(res, 400, errorMessage(err));
+      if (isNamedError(err, 'JournalWriteError')) return sendError(res, 503, errorMessage(err));
       throw err;
     }
   }

@@ -165,6 +165,11 @@ export interface Opportunity {
   staleLine: boolean;
   firstSeen: number;
   lastSeen: number;
+  /**
+   * When the pick last became actionable (BET / BET_NOW) — after being new, WATCH or gone — or last changed verdict or
+   * stale-line state while actionable. `expiresInSec` counts from here. Absent while the pick is WATCH.
+   */
+  actionableSince?: number;
   status: 'active' | 'gone';
   /** Rough estimate of how long the price is likely to survive. */
   expiresInSec: number;
@@ -242,6 +247,16 @@ export interface BetRecord {
   evPctAtPlace: number;
   /** Closing fair probability when captured (for CLV). */
   closingFairProb: number | null;
+  /**
+   * True when the reference closed on a different number than the bet's line and the closing probability was
+   * converted to the bet's line (approximate CLV).
+   */
+  closingApprox?: boolean;
+  /**
+   * True when the pick had already expired on the server and the bet was logged from the dashboard's copy of it
+   * (the pick details and fair probability are what the dashboard last showed).
+   */
+  fromSnapshot?: boolean;
   result: BetResult;
   settledAt: number | null;
   /** Profit in dollars once settled (negative for losses). */
@@ -259,6 +274,10 @@ export interface BetSummary {
   avgEvPct: number | null;
   /** Average closing line value where available. */
   avgClvPct: number | null;
+  /** Bets included in avgClvPct. */
+  clvBets?: number;
+  /** Started pre-game bets (not void) with no closing line: avgClvPct does not cover them. */
+  clvMissing?: number;
   stakedToday: number;
 }
 

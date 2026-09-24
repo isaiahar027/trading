@@ -31,6 +31,7 @@ interface Opp {
   evPct: number;
   isLive: boolean;
   firstSeen: number;
+  actionableSince?: number;
   expiresInSec: number;
 }
 
@@ -71,11 +72,22 @@ interface FrontendLib {
   isDashboardState(st: unknown): boolean;
   sanitizeFilters(raw: unknown): Filters;
   passesFilters(o: Opp, f: Filters): boolean;
-  partitionOpportunities(list: unknown, f: Filters): Parts;
+  partitionOpportunities(list: unknown, f: Filters, keep?: Set<string> | Map<string, number>): Parts;
   actionableCount(parts: Parts): number;
   selectAlerts(opps: Opp[], seen: Map<string, number>, primed: boolean, cap?: number): Opp[];
   countdownInfo(o: Opp, now: number): { remaining: number; elapsed: number; frac: number };
   countdownLabel(info: { remaining: number; elapsed: number; frac: number }): string;
+  reasonShape(r: string): string;
+  chipOrder(keys: string[], configured: string[]): string[];
+  placeLiveStatus(cur: Record<string, unknown> | null, snap: Record<string, unknown> | null): { kind: string; text: string };
+  pickSnapshot(o: Record<string, unknown>): Record<string, unknown>;
+  rememberPicks(
+    recent: Map<string, { o: Opp; seenAt: number }>,
+    opps: Opp[],
+    now: number,
+    maxAgeMs: number,
+    cap: number,
+  ): Map<string, { o: Opp; seenAt: number }>;
   evAtAmerican(prob: number, american: number): number | null;
   pctToFraction(p: number): number;
   fractionToPct(f: number): number;
@@ -158,6 +170,13 @@ describe('public/ static safety (CSP: self only)', () => {
     expect(css).not.toMatch(/url\(\s*['"]?(https?:)?\/\//i);
     expect(svg).not.toMatch(/<script|href=|xlink:href|<style/i);
     expect(svg).toMatch(/^<svg xmlns="http:\/\/www\.w3\.org\/2000\/svg"/);
+  });
+
+  it('never gives arb stakes a fixed-width column (cents would be clipped on phones)', () => {
+    const legRules = [...css.matchAll(/\.leg \{[^}]*grid-template-columns:\s*([^;]+);/g)].map((m) => m[1].trim());
+    expect(legRules.length).toBeGreaterThanOrEqual(2);
+    for (const cols of legRules) expect(cols.endsWith('auto auto'), cols).toBe(true);
+    expect(css).toMatch(/\.leg \.num \{[^}]*white-space: nowrap/);
   });
 
   it('every element id used by app.js exists in index.html', () => {
@@ -360,6 +379,104 @@ describe('app.js pure helpers', () => {
     const late = lib.countdownInfo(o, 1_000_000 + 200_000);
     expect(late.frac).toBe(0);
     expect(lib.countdownLabel(late)).toBe('Open 3m · verify price');
+  });
+
+  it('starts the countdown when the pick became actionable, not when it was first seen', () => {
+    // On the watch list for a minute, then BET NOW with a 20 s window: it must arrive with ~20 s left.
+    const o = opp({ id: 'w2b', firstSeen: 1_000_000, actionableSince: 1_060_000, expiresInSec: 20 });
+    const info = lib.countdownInfo(o, 1_062_000);
+    expect(info.remaining).toBe(18_000);
+    expect(lib.countdownLabel(info)).toBe('Act within ~18s');
+  });
+
+  it('keeps a pick that just dropped to WATCH in its section instead of making it vanish', () => {
+    const list = [
+      opp({ id: 'live-dropped', isLive: true, verdict: 'WATCH', evPct: 0.008 }),
+      opp({ id: 'pre-dropped', verdict: 'WATCH', evPct: 0.008 }),
+      opp({ id: 'plain-watch', verdict: 'WATCH', evPct: 0.008 }),
+    ];
+    const keep = new Set(['live-dropped', 'pre-dropped']);
+    const parts = lib.partitionOpportunities(list, noFilters(), keep);
+    expect(parts.live.map((o) => o.id)).toEqual(['live-dropped']);
+    expect(parts.pre.map((o) => o.id)).toEqual(['pre-dropped']);
+    expect(parts.watch.map((o) => o.id)).toEqual(['plain-watch']);
+    expect(lib.actionableCount(parts)).toBe(0); // shown, but never counted as something to bet
+    expect(lib.partitionOpportunities(list, noFilters()).watch).toHaveLength(3);
+  });
+
+  it('warns in the place dialog when the price fell below the minimum or the pick expired', () => {
+    const cur = { status: 'active', type: 'ev', verdict: 'BET_NOW', dkAmerican: 150, minAcceptableAmerican: 145 };
+    expect(lib.placeLiveStatus(cur, cur).kind).toBe('ok');
+    const watch = lib.placeLiveStatus({ ...cur, verdict: 'WATCH', dkAmerican: 140 }, cur);
+    expect(watch.kind).toBe('warn');
+    expect(watch.text).toContain('below your minimum');
+    expect(watch.text).toContain('+140');
+    expect(watch.text).toContain('(was +150 when you opened this)');
+    expect(lib.placeLiveStatus({ ...cur, dkAmerican: 140 }, cur).kind).toBe('warn'); // worse than take-at, any verdict
+    expect(lib.placeLiveStatus({ ...cur, status: 'gone' }, cur).kind).toBe('warn');
+    const expired = lib.placeLiveStatus(null, cur);
+    expect(expired.kind).toBe('warn');
+    expect(expired.text).toMatch(/log it anyway/);
+  });
+
+  it('sends the server a snapshot that describes the pick it logs', () => {
+    const snap = lib.pickSnapshot({
+      id: 'odds-api:e1|ev|spread|home|-3.5',
+      eventId: 'odds-api:e1',
+      league: 'NBA',
+      eventName: 'Knicks @ Celtics',
+      startTime: 5,
+      pick: 'Celtics -3.5',
+      kind: 'spread',
+      side: 'home',
+      line: -3.5,
+      isLive: true,
+      fairProb: 0.52,
+      reasons: ['x'],
+    });
+    expect(snap).toEqual({
+      eventId: 'odds-api:e1',
+      league: 'NBA',
+      eventName: 'Knicks @ Celtics',
+      startTime: 5,
+      pick: 'Celtics -3.5',
+      kind: 'spread',
+      side: 'home',
+      line: -3.5,
+      isLive: true,
+      fairProb: 0.52,
+    });
+  });
+
+  it('remembers recent actionable picks for late logging, bounded in age and number', () => {
+    const recent = new Map<string, { o: Opp; seenAt: number }>();
+    lib.rememberPicks(recent, [opp({ id: 'a' }), opp({ id: 'w', verdict: 'WATCH' }), opp({ id: 'g', status: 'gone' })], 1_000, 10_000, 3);
+    expect([...recent.keys()]).toEqual(['a']);
+    lib.rememberPicks(recent, [opp({ id: 'b' }), opp({ id: 'c' }), opp({ id: 'd' })], 2_000, 10_000, 3);
+    expect([...recent.keys()]).toEqual(['b', 'c', 'd']);
+    lib.rememberPicks(recent, [], 11_500, 10_000, 3);
+    expect(recent.size).toBe(3);
+    lib.rememberPicks(recent, [], 12_500, 10_000, 3);
+    expect(recent.size).toBe(0);
+  });
+
+  it('masks the per-second ages in reasons so cards are not rebuilt every tick', () => {
+    const a = ['Reference: Pinnacle no-vig (data 2s old)', 'Pinnacle moved +105 → -125 in the last 1s; DraftKings still +110'];
+    const b = ['Reference: Pinnacle no-vig (data 3s old)', 'Pinnacle moved +105 → -125 in the last 2s; DraftKings still +110'];
+    expect(a.map(lib.reasonShape)).toEqual(b.map(lib.reasonShape));
+    expect(lib.reasonShape('DraftKings +110 vs fair +100 (50.0% to win) — EV +5.0%')).toBe('DraftKings +110 vs fair +100 (50.0% to win) — EV +5.0%');
+    expect(lib.reasonShape('Pinnacle moved +105 → -125 in the last 2s; DraftKings still +115')).not.toBe(lib.reasonShape(b[1]));
+  });
+
+  it('keeps league chips in configuration order whatever the counts', () => {
+    const configured = ['NFL', 'NCAAF', 'NBA', 'MLB', 'EPL'];
+    expect(lib.chipOrder(['NBA', 'NFL', 'NBA', 'XFL', 'EPL'], configured)).toEqual(['NFL', 'NBA', 'EPL', 'XFL']);
+    expect(lib.chipOrder(['EPL', 'NFL', 'NBA'], configured)).toEqual(['NFL', 'NBA', 'EPL']);
+  });
+
+  it('tells Docker users how to apply a new ODDS_API_KEY', () => {
+    expect(js).toContain("'docker compose up -d'");
+    expect(js).toContain("'DEMO_MODE=true'");
   });
 
   it('builds a validated settings patch in server units with only changed fields', () => {

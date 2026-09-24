@@ -341,9 +341,11 @@
   /**
    * Splits opportunities into dashboard sections after filtering.
    * live/pre: actionable EV picks (BET_NOW/BET); watch: WATCH verdicts; arbs: type 'arb'.
+   * `keep` (optional Set/Map of ids): WATCH picks that were actionable a moment ago stay in live/pre (shown greyed as
+   * "price moved") instead of silently jumping to the hidden watch list.
    * hidden: active actionable picks (EV or arb) removed by the filters.
    */
-  function partitionOpportunities(list, f) {
+  function partitionOpportunities(list, f, keep) {
     var out = { live: [], pre: [], watch: [], arbs: [], hidden: 0, hiddenWatch: 0 };
     if (!Array.isArray(list)) return out;
     for (var i = 0; i < list.length; i++) {
@@ -357,7 +359,7 @@
         continue;
       }
       if (o.type === 'arb') out.arbs.push(o);
-      else if (o.verdict === 'WATCH') out.watch.push(o);
+      else if (o.verdict === 'WATCH' && !(keep && o.status === 'active' && keep.has(o.id))) out.watch.push(o);
       else if (o.isLive) out.live.push(o);
       else out.pre.push(o);
     }
@@ -410,10 +412,13 @@
     return out;
   }
 
-  /** Countdown for a card: time left of the expected price window measured from firstSeen. */
+  /**
+   * Countdown for a card: time left of the expected price window, measured from when the pick became actionable
+   * (actionableSince), falling back to firstSeen for older servers.
+   */
   function countdownInfo(o, now) {
     var total = Math.max(1000, (isNum(o.expiresInSec) ? o.expiresInSec : 0) * 1000);
-    var first = isNum(o.firstSeen) ? o.firstSeen : now;
+    var first = isNum(o.actionableSince) ? o.actionableSince : isNum(o.firstSeen) ? o.firstSeen : now;
     var elapsed = Math.max(0, now - first);
     var remaining = total - elapsed;
     return { remaining: remaining, elapsed: elapsed, frac: clamp(remaining / total, 0, 1) };
@@ -422,6 +427,97 @@
   function countdownLabel(info) {
     if (info.remaining >= 1000) return 'Act within ~' + fmtAge(info.remaining, true);
     return 'Open ' + fmtAge(info.elapsed, true) + ' · verify price';
+  }
+
+  /**
+   * The part of a reason that only changes when the pick does: the ages the engine writes into reasons every second
+   * ("data 12s old", "in the last 40s") are masked, so a card is not rebuilt (and its buttons replaced) every tick.
+   */
+  function reasonShape(r) {
+    return String(r)
+      .replace(/\(data \d+s old\)/g, '(data #s old)')
+      .replace(/in the last \d+s/g, 'in the last #s');
+  }
+
+  /**
+   * League chips in a stable order: the configured league order first, then anything else alphabetically.
+   * Counts never reorder chips (a chip moving under the finger selects the wrong league).
+   */
+  function chipOrder(keys, configured) {
+    var rank = new Map();
+    (Array.isArray(configured) ? configured : []).forEach(function (k, i) {
+      if (!rank.has(k)) rank.set(k, i);
+    });
+    var uniq = [];
+    (Array.isArray(keys) ? keys : []).forEach(function (k) {
+      if (typeof k === 'string' && uniq.indexOf(k) < 0) uniq.push(k);
+    });
+    return uniq.sort(function (a, b) {
+      var ra = rank.has(a) ? rank.get(a) : Infinity;
+      var rb = rank.has(b) ? rank.get(b) : Infinity;
+      if (ra !== rb) return ra - rb;
+      return a < b ? -1 : a > b ? 1 : 0;
+    });
+  }
+
+  /**
+   * Status line of the "I placed it" dialog for the pick as the server has it now (`cur`, null when it expired) and
+   * as it was when the dialog opened (`snap`). kind: ok | warn.
+   */
+  function placeLiveStatus(cur, snap) {
+    if (!cur) {
+      return {
+        kind: 'warn',
+        text: 'This pick has expired on the server. If you already placed the bet, log it anyway: the details shown here are saved with it.',
+      };
+    }
+    if (cur.status === 'gone') return { kind: 'warn', text: 'Price moved — this pick is gone. Log it only if you already placed the bet.' };
+    var take = fmtAmerican(cur.minAcceptableAmerican);
+    var dkDec = americanToDecimal(cur.dkAmerican);
+    var minDec = americanToDecimal(cur.minAcceptableAmerican);
+    var below = cur.type !== 'arb' && dkDec !== null && minDec !== null && dkDec < minDec - 1e-9;
+    var was = snap && cur.dkAmerican !== snap.dkAmerican ? ' (was ' + fmtAmerican(snap.dkAmerican) + ' when you opened this)' : '';
+    if (cur.verdict === 'WATCH' || below) {
+      return {
+        kind: 'warn',
+        text: 'Price moved below your minimum — DraftKings now ' + fmtAmerican(cur.dkAmerican) + ', needs ' + take + ' or better' + was + '. Log it only if you already placed the bet.',
+      };
+    }
+    return { kind: 'ok', text: 'DraftKings now ' + fmtAmerican(cur.dkAmerican) + ' · take at ' + take + ' or better' + was };
+  }
+
+  /** The pick fields the server needs to log a bet on a pick it no longer tracks. */
+  function pickSnapshot(o) {
+    return {
+      eventId: o.eventId,
+      league: o.league,
+      eventName: o.eventName,
+      startTime: o.startTime,
+      pick: o.pick,
+      kind: o.kind,
+      side: o.side,
+      line: o.line === undefined ? null : o.line,
+      isLive: o.isLive === true,
+      fairProb: o.fairProb,
+    };
+  }
+
+  /**
+   * Remembers actionable picks (id -> {o, seenAt}) so a bet placed on a pick that has since left the board can still be
+   * logged. Newest first when listed; entries older than maxAgeMs or beyond `cap` are dropped. Mutates and returns `recent`.
+   */
+  function rememberPicks(recent, opps, now, maxAgeMs, cap) {
+    for (var i = 0; i < opps.length; i++) {
+      var o = opps[i];
+      if (!isOpportunity(o) || o.status !== 'active' || o.verdict === 'WATCH') continue;
+      recent.delete(o.id);
+      recent.set(o.id, { o: o, seenAt: now });
+    }
+    recent.forEach(function (v, id) {
+      if (!v || !isNum(v.seenAt) || now - v.seenAt > maxAgeMs) recent.delete(id);
+    });
+    while (recent.size > cap) recent.delete(recent.keys().next().value);
+    return recent;
   }
 
   /** EV per $1 at the given American odds for a fair win probability. */
@@ -540,6 +636,11 @@
     selectAlerts: selectAlerts,
     countdownInfo: countdownInfo,
     countdownLabel: countdownLabel,
+    reasonShape: reasonShape,
+    chipOrder: chipOrder,
+    placeLiveStatus: placeLiveStatus,
+    pickSnapshot: pickSnapshot,
+    rememberPicks: rememberPicks,
     evAtAmerican: evAtAmerican,
     pctToFraction: pctToFraction,
     fractionToPct: fractionToPct,
@@ -563,6 +664,11 @@
   var NEW_FLASH_MS = 4000;
   var MAX_TOASTS = 4;
   var GONE_FADE_SEC = 90;
+  /** A pick that drops from BET/BET NOW to WATCH stays in its section, greyed, this long (or until it recovers). */
+  var DEMOTED_KEEP_MS = 90000;
+  /** Picks offered for "log a bet on a pick that has disappeared" (kept in this browser only). */
+  var RECENT_KEEP_MS = 6 * 3600 * 1000;
+  var RECENT_CAP = 30;
 
   function lsGet(key, def) {
     try {
@@ -580,6 +686,23 @@
     } catch (e) {
       /* storage unavailable (private mode / quota): preferences just won't persist */
     }
+  }
+
+  function loadRecent() {
+    var map = new Map();
+    var raw = lsGet('recent', []);
+    if (!Array.isArray(raw)) return map;
+    raw.slice(-RECENT_CAP).forEach(function (e) {
+      if (e && isOpportunity(e.o) && isNum(e.seenAt) && Math.abs(Date.now() - e.seenAt) < RECENT_KEEP_MS) map.set(e.o.id, { o: e.o, seenAt: e.seenAt });
+    });
+    return map;
+  }
+
+  function saveRecent(force) {
+    var sig = Array.from(S.recent.keys()).join('\n');
+    if (!force && sig === S.recentSavedSig) return;
+    S.recentSavedSig = sig;
+    lsSet('recent', Array.from(S.recent.values()));
   }
 
   function applyTheme(theme) {
@@ -603,7 +726,13 @@
     firstStateTimer: null,
     lastForcedReconnect: 0,
     cards: new Map(),
-    knownIds: new Set(),
+    /** Ids that were actionable (BET / BET NOW) in the previous render: new flash + "price moved" detection. */
+    actionableIds: new Set(),
+    /** id -> when it dropped from actionable to WATCH (kept in its section greyed for DEMOTED_KEEP_MS). */
+    demoted: new Map(),
+    recent: loadRecent(),
+    recentSavedSig: '',
+    recentSig: '',
     alerted: new Map(),
     primed: false,
     parts: null,
@@ -770,6 +899,8 @@
     S.lastStateAt = Date.now();
     S.state = st;
     if (st.betSummary && typeof st.betSummary === 'object') S.summary = st.betSummary;
+    rememberPicks(S.recent, st.opportunities, st.generatedAt, RECENT_KEEP_MS, RECENT_CAP);
+    saveRecent(false);
     renderAll();
   }
 
@@ -821,6 +952,7 @@
     if (S.place && el.dlgPlace.open) updatePlaceLive();
     if (el.dlgHealth.open) renderHealth();
     renderBetSummary();
+    renderRecent();
   }
 
   // ------------------------------------------------------------------------------------------- top bar
@@ -924,31 +1056,49 @@
   function renderChips() {
     var st = S.state;
     var counts = new Map();
+    var keys = [];
     if (st) {
+      (st.settings.enabledLeagues || []).forEach(function (k) {
+        if (typeof k === 'string') keys.push(k);
+      });
       st.opportunities.forEach(function (o) {
         if (!isOpportunity(o) || o.status !== 'active') return;
-        var c = counts.get(o.league) || 0;
-        counts.set(o.league, o.verdict === 'WATCH' ? c : c + 1);
+        keys.push(o.league);
+        if (o.verdict !== 'WATCH') counts.set(o.league, (counts.get(o.league) || 0) + 1);
       });
     }
     S.filters.leagues.forEach(function (k) {
-      if (!counts.has(k)) counts.set(k, 0);
+      keys.push(k);
     });
-    var leagues = Array.from(counts.entries()).sort(function (a, b) {
-      return b[1] - a[1] || (a[0] < b[0] ? -1 : 1);
-    });
-    var sig = JSON.stringify([leagues, S.filters.leagues]);
-    if (sig === S.chipsSig) return;
-    S.chipsSig = sig;
-    el.chips.replaceChildren();
-    var all = button('chip-btn', 'All leagues', 'league-all');
-    all.setAttribute('aria-pressed', String(S.filters.leagues.length === 0));
-    el.chips.appendChild(all);
-    leagues.forEach(function (entry) {
-      var b = button('chip-btn', [h('span', null, entry[0]), entry[1] > 0 ? h('span', 'chip-count', String(entry[1])) : null], 'league');
-      b.setAttribute('data-league', entry[0]);
-      b.setAttribute('aria-pressed', String(S.filters.leagues.indexOf(entry[0]) >= 0));
-      el.chips.appendChild(b);
+    // Stable order (configuration order); only the count badges change as picks come and go.
+    var order = chipOrder(
+      keys,
+      knownLeagues().map(function (e) {
+        return e[0];
+      })
+    );
+    var sig = JSON.stringify([order, S.filters.leagues]);
+    if (sig !== S.chipsSig) {
+      S.chipsSig = sig;
+      el.chips.replaceChildren();
+      var all = button('chip-btn', 'All leagues', 'league-all');
+      all.setAttribute('aria-pressed', String(S.filters.leagues.length === 0));
+      el.chips.appendChild(all);
+      order.forEach(function (key) {
+        var b = button('chip-btn', [h('span', null, key), h('span', 'chip-count')], 'league');
+        b.setAttribute('data-league', key);
+        b.setAttribute('aria-pressed', String(S.filters.leagues.indexOf(key) >= 0));
+        el.chips.appendChild(b);
+      });
+    }
+    Array.prototype.forEach.call(el.chips.querySelectorAll('[data-league]'), function (b) {
+      var n = counts.get(b.getAttribute('data-league')) || 0;
+      var badge = b.querySelector('.chip-count');
+      if (badge) {
+        setText(badge, n > 0 ? String(n) : '');
+        badge.hidden = n === 0;
+      }
+      b.classList.toggle('is-empty', n === 0);
     });
   }
 
@@ -975,10 +1125,24 @@
 
   // ------------------------------------------------------------------------------------------- opportunities
 
+  /** Ids that just dropped from BET / BET NOW to WATCH keep their place (greyed) for DEMOTED_KEEP_MS. */
+  function updateDemoted(list, now) {
+    var next = new Map();
+    list.forEach(function (o) {
+      if (!isOpportunity(o) || o.type === 'arb' || o.status !== 'active' || o.verdict !== 'WATCH') return;
+      var since = S.demoted.get(o.id);
+      if (since === undefined && S.actionableIds.has(o.id)) since = now;
+      if (since !== undefined && now - since < DEMOTED_KEEP_MS) next.set(o.id, since);
+    });
+    S.demoted = next;
+  }
+
   function renderOpportunities() {
     renderChips();
     var st = S.state;
-    var parts = partitionOpportunities(st ? st.opportunities : [], S.filters);
+    var list = st ? st.opportunities : [];
+    updateDemoted(list, Date.now());
+    var parts = partitionOpportunities(list, S.filters, S.demoted);
     S.parts = parts;
     var keep = new Set();
     var now = serverNow();
@@ -1007,9 +1171,11 @@
       }
     });
     if (st) {
-      S.knownIds = new Set(
+      S.actionableIds = new Set(
         st.opportunities
-          .filter(isOpportunity)
+          .filter(function (o) {
+            return isOpportunity(o) && isActionable(o);
+          })
           .map(function (o) {
             return o.id;
           })
@@ -1086,6 +1252,20 @@
     return frac === null ? '' : fmtPct(frac, 1, false) + ' of bankroll';
   }
 
+  function reasonsOf(o) {
+    return Array.isArray(o.reasons)
+      ? o.reasons
+          .filter(function (r) {
+            return typeof r === 'string';
+          })
+          .slice(0, 6)
+      : [];
+  }
+
+  function confOf(o) {
+    return isNum(o.confidence) ? Math.round(clamp(o.confidence, 0, 1) * 100) : null;
+  }
+
   function cardModel(o, variant) {
     var st = S.state;
     var bankroll = st ? st.settings.bankroll : null;
@@ -1107,11 +1287,9 @@
       ev: fmtPct(o.evPct),
       stake: fmtMoney(o.stake),
       stakeSub: stakeSub(o, bankroll),
-      conf: isNum(o.confidence) ? Math.round(clamp(o.confidence, 0, 1) * 100) : null,
       src: sharpLabel(o.sharpSource),
-      reasons: Array.isArray(o.reasons) ? o.reasons.filter(function (r) {
-        return typeof r === 'string';
-      }) : [],
+      // Shapes only: the ages inside reasons change every second and are updated in place (updateCardLive).
+      reasons: reasonsOf(o).map(reasonShape),
       url: safeDkUrl(o.dkUrl),
       logged: loggedText(o.id),
     };
@@ -1140,6 +1318,7 @@
     if (o.isLive) cls.push('is-live');
     if (o.staleLine) cls.push('is-stale');
     if (o.status === 'gone') cls.push('is-gone');
+    else if (o.verdict === 'WATCH' && variant === 'full') cls.push('is-demoted');
     else if (o.urgency === 'critical' && o.verdict !== 'WATCH') cls.push('is-critical');
     if (c.isNew) cls.push('is-new');
     return cls.join(' ');
@@ -1150,15 +1329,16 @@
     if (!c) {
       var node = h('article', 'card');
       node.setAttribute('data-id', o.id);
-      c = { el: node, sig: '', refs: {}, opp: o, isNew: false, goneFrom: null };
+      c = { el: node, sig: '', refs: {}, opp: o, isNew: false, goneFrom: null, actions: null, actionsKey: '' };
       S.cards.set(o.id, c);
-      if (S.primed && !S.knownIds.has(o.id) && o.status === 'active') {
-        c.isNew = true;
-        window.setTimeout(function () {
-          c.isNew = false;
-          c.el.classList.remove('is-new');
-        }, NEW_FLASH_MS);
-      }
+    }
+    // Flash whenever a pick becomes actionable (new, or back from WATCH / gone), not only when its id is new.
+    if (S.primed && isActionable(o) && !S.actionableIds.has(o.id) && !c.isNew) {
+      c.isNew = true;
+      window.setTimeout(function () {
+        c.isNew = false;
+        c.el.classList.remove('is-new');
+      }, NEW_FLASH_MS);
     }
     var vm = cardModel(o, variant);
     var sig = JSON.stringify(vm);
@@ -1221,15 +1401,57 @@
     return a;
   }
 
-  function confMeter(conf) {
+  /** Confidence meter; its value is set (and kept current) by setConf, never by rebuilding the card. */
+  function confMeter(c) {
     var meter = h('span', 'meter');
     var fill = h('span', 'meter-fill');
-    fill.style.width = (conf === null ? 0 : conf) + '%';
-    if (conf !== null) fill.classList.add(conf >= 75 ? 'lvl-hi' : conf >= 55 ? 'lvl-mid' : 'lvl-lo');
     meter.appendChild(fill);
-    var wrap = h('span', 'conf', [meter, h('span', 'conf-text', conf === null ? '—' : conf + '% conf')]);
+    var text = h('span', 'conf-text');
+    var wrap = h('span', 'conf', [meter, text]);
     wrap.setAttribute('title', 'Model confidence in the fair price');
+    c.refs.confFill = fill;
+    c.refs.confText = text;
+    c.refs.conf = undefined;
     return wrap;
+  }
+
+  function setConf(c, conf) {
+    if (!c.refs.confFill || c.refs.conf === conf) return;
+    c.refs.conf = conf;
+    c.refs.confFill.style.width = (conf === null ? 0 : conf) + '%';
+    c.refs.confFill.className = 'meter-fill' + (conf === null ? '' : conf >= 75 ? ' lvl-hi' : conf >= 55 ? ' lvl-mid' : ' lvl-lo');
+    setText(c.refs.confText, conf === null ? '—' : conf + '% conf');
+  }
+
+  function reasonList(c, o) {
+    var items = reasonsOf(o).map(function (r) {
+      return h('li', null, r);
+    });
+    c.refs.reasons = items;
+    return items.length ? h('ul', 'reasons', items) : null;
+  }
+
+  /** Action buttons survive card rebuilds (same nodes), so a tap that spans a rebuild still clicks and keeps focus. */
+  function cardActions(c, key, build) {
+    if (!c.actions || c.actionsKey !== key) {
+      c.actions = build();
+      c.actionsKey = key;
+    }
+    return c.actions;
+  }
+
+  /** Replaces a card's content except its actions node, which stays in place. */
+  function mountCard(node, before, actions, after) {
+    Array.prototype.slice.call(node.childNodes).forEach(function (ch) {
+      if (ch !== actions) node.removeChild(ch);
+    });
+    if (actions.parentNode !== node) node.appendChild(actions);
+    before.forEach(function (n) {
+      if (n) node.insertBefore(n, actions);
+    });
+    after.forEach(function (n) {
+      if (n) node.appendChild(n);
+    });
   }
 
   function pickHeading(c, text, cls) {
@@ -1250,9 +1472,14 @@
     return h('div', 'gone-banner', 'Price moved — gone');
   }
 
+  function statusBanner(o, variant) {
+    if (o.status === 'gone') return goneBanner();
+    if (variant === 'full' && o.verdict === 'WATCH') return h('div', 'gone-banner demoted-banner', 'Price moved — below your minimum');
+    return null;
+  }
+
   function buildFullCard(c, o, vm) {
     var node = c.el;
-    node.replaceChildren();
     c.refs = {};
 
     var bar = h('div', 'cd-bar');
@@ -1286,34 +1513,25 @@
     c.refs.dkAge = dkAge;
     var meta = h('div', 'card-meta', [
       h('span', 'fair', ['Fair ', h('strong', null, vm.fair)]),
-      confMeter(vm.conf),
+      confMeter(c),
       h('span', 'src', [vm.src, ' · sharp ', sharpAge, ' · DK ', dkAge]),
     ]);
 
-    var reasons = null;
-    if (vm.reasons.length) {
-      reasons = h(
-        'ul',
-        'reasons',
-        vm.reasons.slice(0, 6).map(function (r) {
-          return h('li', null, r);
-        })
-      );
-    }
+    var reasons = reasonList(c, o);
 
-    var actions = h('div', 'card-actions', [
-      dkLink(vm, false),
-      button('btn btn-secondary', [icon('check-square'), h('span', null, 'I placed it')], 'place'),
-      copyButton('Copy pick'),
-    ]);
+    var actions = cardActions(c, 'full|' + vm.url, function () {
+      return h('div', 'card-actions', [
+        dkLink(vm, false),
+        button('btn btn-secondary', [icon('check-square'), h('span', null, 'I placed it')], 'place'),
+        copyButton('Copy pick'),
+      ]);
+    });
 
-    append(node, [track, top, head, ticket, meta, reasons, actions]);
-    if (o.status === 'gone') node.appendChild(goneBanner());
+    mountCard(node, [track, top, head, ticket, meta, reasons], actions, [statusBanner(o, 'full')]);
   }
 
   function buildWatchCard(c, o, vm) {
     var node = c.el;
-    node.replaceChildren();
     c.refs = {};
     var sharpAge = h('span', 'age');
     c.refs.sharpAge = sharpAge;
@@ -1327,20 +1545,20 @@
       h('span', null, ['EV ', h('strong', null, vm.ev)]),
     ]);
     var src = h('p', 'card-meta', h('span', 'src', [vm.src, ' · sharp ', sharpAge]));
-    var copy = copyButton('Copy pick');
-    copy.className = 'btn btn-ghost btn-small btn-copy btn-icon';
-    var actions = h('div', 'card-actions card-actions-sm', [
-      dkLink(vm, true),
-      button('btn btn-ghost btn-small', [icon('check-square'), h('span', null, 'I placed it')], 'place'),
-      copy,
-    ]);
-    append(node, [top, head, line, src, actions]);
-    if (o.status === 'gone') node.appendChild(goneBanner());
+    var actions = cardActions(c, 'watch|' + vm.url, function () {
+      var copy = copyButton('Copy pick');
+      copy.className = 'btn btn-ghost btn-small btn-copy btn-icon';
+      return h('div', 'card-actions card-actions-sm', [
+        dkLink(vm, true),
+        button('btn btn-ghost btn-small', [icon('check-square'), h('span', null, 'I placed it')], 'place'),
+        copy,
+      ]);
+    });
+    mountCard(node, [top, head, line, src], actions, [statusBanner(o, 'watch')]);
   }
 
   function buildArbCard(c, o, vm) {
     var node = c.el;
-    node.replaceChildren();
     c.refs = {};
     var bar = h('div', 'cd-bar');
     var track = h('div', 'cd-track', bar);
@@ -1389,30 +1607,30 @@
         : null,
     ]);
 
-    var reasons = vm.reasons.length
-      ? h(
-          'ul',
-          'reasons',
-          vm.reasons.slice(0, 6).map(function (r) {
-            return h('li', null, r);
-          })
-        )
-      : null;
-    var actions = h('div', 'card-actions', [
-      dkLink(vm, false),
-      button('btn btn-secondary', [icon('check-square'), h('span', null, 'I placed the DK leg')], 'place'),
-      copyButton('Copy legs'),
-    ]);
-    append(node, [track, top, head, legs, summary, reasons, actions]);
-    if (o.status === 'gone') node.appendChild(goneBanner());
+    var reasons = reasonList(c, o);
+    var actions = cardActions(c, 'arb|' + vm.url, function () {
+      return h('div', 'card-actions', [
+        dkLink(vm, false),
+        button('btn btn-secondary', [icon('check-square'), h('span', null, 'I placed the DK leg')], 'place'),
+        copyButton('Copy legs'),
+      ]);
+    });
+    mountCard(node, [track, top, head, legs, summary, reasons], actions, [statusBanner(o, 'arb')]);
   }
 
-  /** Per-state updates that must not rebuild the card: ages, countdown and the gone fade. */
+  /** Per-state updates that must not rebuild the card: ages, reason texts, confidence, countdown and the gone fade. */
   function updateCardLive(c, o, now) {
     var st = S.state;
     var gen = st ? st.generatedAt : now;
     if (c.refs.sharpAge) rel(c.refs.sharpAge, isNum(o.sharpAgeSec) ? gen - o.sharpAgeSec * 1000 : null, 'age');
     if (c.refs.dkAge) rel(c.refs.dkAge, isNum(o.dkAgeSec) ? gen - o.dkAgeSec * 1000 : null, 'age');
+    if (c.refs.reasons) {
+      var texts = reasonsOf(o);
+      c.refs.reasons.forEach(function (li, i) {
+        if (i < texts.length) setText(li, texts[i]);
+      });
+    }
+    setConf(c, confOf(o));
     if (o.status === 'gone') {
       if (c.goneFrom === null) {
         c.goneFrom = isNum(o.lastSeen) ? o.lastSeen : now;
@@ -1431,7 +1649,7 @@
     var timer = c.refs.timer;
     if (!bar || !timer) return;
     var o = c.opp;
-    if (o.status !== 'active') {
+    if (o.status !== 'active' || o.verdict === 'WATCH') {
       bar.style.transform = 'scaleX(0)';
       setText(timer, '');
       return;
@@ -1466,8 +1684,9 @@
       if (!hl.demoMode && feed && feed.status === 'disabled') {
         kind = 'setup';
         title = 'No odds feed configured';
-        body.push(['Add ', h('code', null, 'ODDS_API_KEY'), ' to your ', h('code', null, '.env'), ' (get a key at the-odds-api.com) and restart the server.']);
-        body.push(['Or run ', h('code', null, 'npm run demo'), ' to try the dashboard with simulated odds.']);
+        body.push(['Add ', h('code', null, 'ODDS_API_KEY'), ' to your ', h('code', null, '.env'), ' (get a key at the-odds-api.com), then apply it:']);
+        body.push(['Docker: ', h('code', null, 'docker compose up -d'), ' (', h('code', null, 'docker compose restart'), ' does not re-read ', h('code', null, '.env'), '). Otherwise restart ', h('code', null, 'npm start'), '.']);
+        body.push(['To try simulated odds first: set ', h('code', null, 'DEMO_MODE=true'), ' (Docker) or run ', h('code', null, 'npm run demo'), '.']);
       } else if (!hl.demoMode && feed && feed.status === 'down') {
         kind = 'error';
         title = 'The odds feed is down';
@@ -1672,23 +1891,9 @@
 
   function updatePlaceLive() {
     if (!S.place) return;
-    var cur = currentPlaceOpp();
-    var snap = S.place.snap;
-    var text;
-    var kind;
-    if (!cur) {
-      kind = 'bad';
-      text = 'This pick has expired on the server, so it can no longer be logged from here.';
-    } else if (cur.status === 'gone') {
-      kind = 'warn';
-      text = 'Price moved — this pick is gone. Log it only if you already placed the bet.';
-    } else {
-      kind = 'ok';
-      text = 'DraftKings now ' + fmtAmerican(cur.dkAmerican) + ' · take at ' + fmtAmerican(cur.minAcceptableAmerican) + ' or better';
-      if (cur.dkAmerican !== snap.dkAmerican) text += ' (was ' + fmtAmerican(snap.dkAmerican) + ' when you opened this)';
-    }
-    el.placeLive.setAttribute('data-kind', kind);
-    setText(el.placeLive, text);
+    var status = placeLiveStatus(currentPlaceOpp(), S.place.snap);
+    el.placeLive.setAttribute('data-kind', status.kind);
+    setText(el.placeLive, status.text);
     updatePlaceCalc();
   }
 
@@ -1742,7 +1947,13 @@
     var id = S.place.id;
     var pick = S.place.snap.pick;
     var notes = el.placeNotes.value.trim();
-    var body = { opportunityId: id, stake: Math.round(stake * 100) / 100, americanTaken: am };
+    var body = {
+      opportunityId: id,
+      stake: Math.round(stake * 100) / 100,
+      americanTaken: am,
+      // Used by the server only if the pick has expired there, so a bet already placed can still be logged.
+      snapshot: pickSnapshot(currentPlaceOpp() || S.place.snap),
+    };
     if (notes) body.notes = notes;
     api('POST', 'api/bets', body)
       .then(function (rec) {
@@ -1755,7 +1966,7 @@
         renderOpportunities();
       })
       .catch(function (err) {
-        showErr(err.status === 404 ? 'This pick expired on the server before it could be logged.' : err.message);
+        showErr(err.status === 404 ? 'This pick expired on the server and could not be logged: ' + err.message : err.message);
       })
       .then(function () {
         el.placeSubmit.disabled = false;
@@ -1984,9 +2195,69 @@
         S.betsLoading = false;
         renderBets();
         renderBetSummary();
+        renderRecent();
         renderCounts();
         if (S.state) renderOpportunities();
       });
+  }
+
+  /**
+   * "Placed a bet on a pick that has left the board?": recent actionable picks that are no longer active, so a bet
+   * placed on one can still be logged (the server accepts the dashboard's copy of an expired pick).
+   */
+  function renderRecent() {
+    if (!el.recent) return;
+    var st = S.state;
+    var onBoard = new Set();
+    if (st) {
+      st.opportunities.forEach(function (o) {
+        if (isOpportunity(o) && o.status === 'active') onBoard.add(o.id);
+      });
+    }
+    var items = Array.from(S.recent.values())
+      .filter(function (e) {
+        return !onBoard.has(e.o.id);
+      })
+      .reverse();
+    var sig = JSON.stringify(
+      items.map(function (e) {
+        return [e.o.id, e.seenAt, loggedText(e.o.id)];
+      })
+    );
+    if (sig === S.recentSig) return;
+    S.recentSig = sig;
+    el.recent.hidden = items.length === 0;
+    setText(el.recentCount, items.length ? String(items.length) : '');
+    el.recentList.replaceChildren();
+    items.forEach(function (e) {
+      var o = e.o;
+      var logged = loggedText(o.id);
+      var log = button('btn btn-small btn-secondary', [icon('check-square'), h('span', null, logged ? 'Log again' : 'Log it')], 'recent-log');
+      log.setAttribute('data-id', o.id);
+      log.setAttribute('aria-label', 'Log a bet on ' + o.pick + ', ' + o.eventName);
+      el.recentList.appendChild(
+        h('li', 'recent-item', [
+          h('div', 'recent-main', [
+            h('strong', 'recent-pick', o.pick),
+            h('span', 'recent-ctx', [h('span', 'league-tag', o.league), o.isLive ? h('span', 'live-tag', 'LIVE') : null, h('span', null, o.eventName)]),
+          ]),
+          h('span', 'recent-meta', [
+            (o.type === 'arb' ? 'Arb · DK ' : 'DK ') + fmtAmerican(o.dkAmerican),
+            ' · last seen ',
+            rel(h('span'), e.seenAt, 'ago'),
+            logged ? ' · logged ' + logged : '',
+          ]),
+          log,
+        ])
+      );
+    });
+  }
+
+  function onRecentAction(e) {
+    var target = e.target.closest('[data-action="recent-log"]');
+    if (!target) return;
+    var entry = S.recent.get(target.getAttribute('data-id'));
+    if (entry) openPlace(findOpp(entry.o.id) || entry.o);
   }
 
   function renderBetSummary() {
@@ -1999,7 +2270,7 @@
       ['Profit', s ? fmtMoney(s.profit, { signed: true }) : '—', s && s.profit > 0 ? 'pos' : s && s.profit < 0 ? 'neg' : ''],
       ['ROI', s && isNum(s.roiPct) ? fmtPct(s.roiPct) : '—', s && s.roiPct > 0 ? 'pos' : s && s.roiPct < 0 ? 'neg' : ''],
       ['Avg EV', s && isNum(s.avgEvPct) ? fmtPct(s.avgEvPct) : '—', ''],
-      ['Avg CLV', s && isNum(s.avgClvPct) ? fmtPct(s.avgClvPct) : '—', s && s.avgClvPct > 0 ? 'pos' : s && s.avgClvPct < 0 ? 'neg' : ''],
+      ['Avg CLV', s && isNum(s.avgClvPct) ? fmtPct(s.avgClvPct) : '—', s && s.avgClvPct > 0 ? 'pos' : s && s.avgClvPct < 0 ? 'neg' : '', clvCoverage(s)],
       ['Staked today', s ? fmtMoney(s.stakedToday) : '—', ''],
     ];
     var sig = JSON.stringify(tiles);
@@ -2007,8 +2278,17 @@
     box.setAttribute('data-sig', sig);
     box.replaceChildren();
     tiles.forEach(function (t) {
-      box.appendChild(h('div', 'tile', [h('dt', null, t[0]), h('dd', t[2] || null, t[1])]));
+      box.appendChild(h('div', 'tile', [h('dt', null, t[0]), h('dd', t[2] || null, t[1]), t[3] ? h('p', 'tile-sub', t[3]) : null]));
     });
+  }
+
+  /** "on 12 bets · 3 without a closing line": avg CLV only covers bets whose closing line was captured. */
+  function clvCoverage(s) {
+    if (!s || !isNum(s.clvBets)) return '';
+    var parts = [];
+    if (s.clvBets > 0) parts.push('on ' + fmtCount(s.clvBets) + (s.clvBets === 1 ? ' bet' : ' bets'));
+    if (isNum(s.clvMissing) && s.clvMissing > 0) parts.push(fmtCount(s.clvMissing) + ' without a closing line');
+    return parts.join(' · ');
   }
 
   function resultPill(b) {
@@ -2109,7 +2389,7 @@
         td('Odds', fmtAmerican(b.americanTaken), 'num c-odds'),
         td('Stake', fmtMoney(b.stake), 'num c-stake'),
         td('EV', fmtPct(b.evPctAtPlace), 'num c-ev'),
-        td('CLV', clv === null ? '—' : fmtPct(clv), 'num c-clv' + (clv === null ? '' : clv >= 0 ? ' pos' : ' neg')),
+        clvCell(b, clv),
         td('Result', resultPill(b), 'c-result'),
         td('', actions, 'bet-actions'),
       ]);
@@ -2117,6 +2397,15 @@
     });
     table.appendChild(tbody);
     box.appendChild(h('div', 'table-wrap', table));
+  }
+
+  function clvCell(b, clv) {
+    var cell = td('CLV', clv === null ? '—' : (b.closingApprox ? '≈' : '') + fmtPct(clv), 'num c-clv' + (clv === null ? '' : clv >= 0 ? ' pos' : ' neg'));
+    if (b.closingApprox) cell.title = 'Approximate: the sharp line closed on a different number and was converted to yours';
+    else if (clv === null && !b.wasLive && b.result !== 'void' && isNum(b.startTime) && b.startTime <= serverNow()) {
+      cell.title = 'No closing line was captured for this bet';
+    }
+    return cell;
   }
 
   function onBetAction(e) {
@@ -2524,6 +2813,9 @@
       ['emptyArbs', 'empty-arbs'],
       ['betSummary', 'bet-summary'],
       ['betList', 'bet-list'],
+      ['recent', 'recent-picks'],
+      ['recentCount', 'recent-count'],
+      ['recentList', 'recent-list'],
       ['betsRefresh', 'bets-refresh'],
       ['dlgPlace', 'dlg-place'],
       ['placeForm', 'place-form'],
@@ -2607,6 +2899,7 @@
 
     // Bets tab
     el.betList.addEventListener('click', onBetAction);
+    el.recentList.addEventListener('click', onRecentAction);
     el.betsRefresh.addEventListener('click', function () {
       loadBets(false);
     });

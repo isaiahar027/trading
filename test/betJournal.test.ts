@@ -2,8 +2,8 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { BetJournal, UnknownBetError } from '../src/server/betJournal';
-import type { PlaceBetInput } from '../src/server/betJournal';
+import { BetJournal, JournalReadError, UnknownBetError } from '../src/server/betJournal';
+import type { JournalFs, PlaceBetInput } from '../src/server/betJournal';
 import { ValidationError } from '../src/server/settingsStore';
 import type { BetRecord } from '../src/types';
 
@@ -287,7 +287,8 @@ describe('BetJournal.load', () => {
     expect(lines.map((l) => (JSON.parse(l) as BetRecord).id)).toEqual([a.id, b.id]);
     expect(r.get(a.id)).toMatchObject({ result: 'won', profit: 20 });
     expect(r.get(b.id)?.closingFairProb).toBeCloseTo(0.65, 12);
-    expect(fs.existsSync(`${file}.bak`)).toBe(false);
+    // The original is always kept next to the compacted file.
+    expect(fs.readFileSync(`${file}.bak`, 'utf8').trim().split('\n')).toHaveLength(55);
     expect(fs.readdirSync(dir).filter((f) => f.endsWith('.tmp'))).toEqual([]);
 
     // Appends keep working after compaction.
@@ -303,6 +304,119 @@ describe('BetJournal.load', () => {
     expect(r.get(a.id)).toBeDefined();
     expect(fileLines()).toHaveLength(1);
     expect(fs.readFileSync(`${file}.bak`, 'utf8')).toContain('garbage 59');
+  });
+});
+
+function errno(code: string, message: string): NodeJS.ErrnoException {
+  const err = new Error(`${code}: ${message}`) as NodeJS.ErrnoException;
+  err.code = code;
+  return err;
+}
+
+describe('BetJournal disk errors', () => {
+  it('rolls back a partial append so the next acknowledged bet survives a restart', () => {
+    let failNextWrite = false;
+    const faulty: JournalFs = {
+      ...fs,
+      writeSync: ((fd: number, buf: Buffer, offset?: number, length?: number) => {
+        if (!failNextWrite) return fs.writeSync(fd, buf, offset, length);
+        failNextWrite = false;
+        // The kernel writes part of the record, then the disk is full.
+        fs.writeSync(fd, buf, offset ?? 0, Math.min(10, length ?? buf.length));
+        throw errno('ENOSPC', 'no space left on device');
+      }) as JournalFs['writeSync'],
+    };
+    const j = new BetJournal(file, { now, fs: faulty }).load();
+    const a = j.place(input({ stake: 10 }));
+    const sizeAfterA = fs.statSync(file).size;
+
+    failNextWrite = true;
+    expectThrows(() => j.place(input({ stake: 20 })), Error, /Could not save bet: ENOSPC/);
+    expect(fs.statSync(file).size).toBe(sizeAfterA); // no partial record left behind
+    expect(j.list()).toHaveLength(1);
+
+    const c = j.place(input({ stake: 30 })); // acknowledged after space was freed
+    const s = j.settle(a.id, 'won');
+    const reloaded = journal();
+    expect(reloaded.list().map((b) => b.id).sort()).toEqual([a.id, c.id].sort());
+    expect(reloaded.get(c.id)?.stake).toBe(30);
+    expect(reloaded.get(a.id)?.result).toBe(s.result);
+    expect(reloaded.summary(clock).stakedToday).toBe(40);
+  });
+
+  it('starts the next record on a fresh line even when the rollback itself fails', () => {
+    let fail = false;
+    const faulty: JournalFs = {
+      ...fs,
+      writeSync: ((fd: number, buf: Buffer, offset?: number, length?: number) => {
+        if (!fail) return fs.writeSync(fd, buf, offset, length);
+        fail = false;
+        fs.writeSync(fd, buf, offset ?? 0, Math.min(10, length ?? buf.length));
+        throw errno('EIO', 'i/o error');
+      }) as JournalFs['writeSync'],
+      ftruncateSync: (() => {
+        throw errno('EIO', 'i/o error');
+      }) as JournalFs['ftruncateSync'],
+    };
+    const j = new BetJournal(file, { now, fs: faulty }).load();
+    const a = j.place(input({ stake: 10 }));
+    fail = true;
+    expectThrows(() => j.place(input({ stake: 20 })), Error, /Could not save bet/);
+    const c = j.place(input({ stake: 30 }));
+    const reloaded = journal();
+    expect(reloaded.get(a.id)).toBeDefined();
+    expect(reloaded.get(c.id)?.stake).toBe(30);
+    expect(reloaded.list()).toHaveLength(2);
+  });
+
+  it('refuses to load (and changes nothing on disk) when the journal cannot be read to the end', () => {
+    const j = journal();
+    // 300 bets with 3 lines each: an uncompacted journal large enough to cross the compaction threshold.
+    for (let i = 0; i < 300; i++) {
+      const b = j.place(input({ stake: 10 + (i % 5), notes: 'x'.repeat(200) }));
+      j.updateClosing(b.id, 0.5);
+      j.settle(b.id, 'lost');
+    }
+    const before = fs.readFileSync(file);
+    let reads = 0;
+    const faulty: JournalFs = {
+      ...fs,
+      readSync: ((...args: Parameters<typeof fs.readSync>) => {
+        if (++reads % 4 === 0) throw errno('EIO', 'i/o error, read');
+        return (fs.readSync as (...a: unknown[]) => number)(...args);
+      }) as JournalFs['readSync'],
+    };
+    expectThrows(() => new BetJournal(file, { now, fs: faulty }).load(), JournalReadError, /EIO/);
+    expect(fs.readFileSync(file).equals(before)).toBe(true);
+    expect(fs.existsSync(`${file}.bak`)).toBe(false);
+    expect(journal().list(1000)).toHaveLength(300);
+  });
+
+  it('retries a transient read error at startup', () => {
+    const j = journal();
+    const a = j.place(input());
+    let failures = 1;
+    const faulty: JournalFs = {
+      ...fs,
+      readSync: ((...args: Parameters<typeof fs.readSync>) => {
+        if (failures-- > 0) throw errno('EIO', 'i/o error, read');
+        return (fs.readSync as (...a: unknown[]) => number)(...args);
+      }) as JournalFs['readSync'],
+    };
+    const r = new BetJournal(file, { now, fs: faulty }).load();
+    expect(r.get(a.id)).toBeDefined();
+  });
+
+  it('refuses to start from a journal it cannot open (other than a missing file)', () => {
+    journal().place(input());
+    const faulty: JournalFs = {
+      ...fs,
+      openSync: ((p: fs.PathLike, flags?: fs.OpenMode, mode?: fs.Mode) => {
+        if (flags === 'r') throw errno('EACCES', 'permission denied');
+        return fs.openSync(p, flags ?? 'r', mode);
+      }) as JournalFs['openSync'],
+    };
+    expectThrows(() => new BetJournal(file, { now, fs: faulty }).load(), JournalReadError, /EACCES/);
   });
 });
 
@@ -414,8 +528,28 @@ describe('BetJournal.summary', () => {
       roiPct: null,
       avgEvPct: null,
       avgClvPct: null,
+      clvBets: 0,
+      clvMissing: 0,
       stakedToday: 0,
     });
+  });
+
+  it('counts started pre-game bets without a closing line so avg CLV is not read as covering them', () => {
+    const j = journal();
+    const start = clock - 60_000; // the input() game has started by `clock`
+    const withClv = j.place(input({ startTime: start }));
+    j.updateClosing(withClv.id, 0.55, { approx: true });
+    j.place(input({ startTime: start })); // started, no closing line
+    j.place(input({ startTime: start, wasLive: true })); // live bets never get one
+    j.place(input({ startTime: clock + 3_600_000 })); // not started yet
+    const voided = j.place(input({ startTime: start }));
+    j.settle(voided.id, 'void');
+    const s = j.summary(clock);
+    expect(s.clvBets).toBe(1);
+    expect(s.clvMissing).toBe(1);
+    expect(journal().get(withClv.id)).toMatchObject({ closingFairProb: 0.55, closingApprox: true });
+    j.updateClosing(withClv.id, 0.56);
+    expect(journal().get(withClv.id)?.closingApprox).toBeUndefined();
   });
 
   it('computes ROI, average EV and average CLV', () => {

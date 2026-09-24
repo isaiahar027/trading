@@ -56,6 +56,11 @@ export interface AppConfig {
     user: string;
     /** Empty string = no auth (only acceptable when bound to localhost / behind a tunnel). */
     password: string;
+    /**
+     * Host names (besides IP addresses and localhost) the dashboard answers to, e.g. a reverse-proxy domain or a
+     * Tailscale name; `*.ts.net` matches subdomains. Requests addressed to any other name are refused (DNS rebinding).
+     */
+    allowedHosts: string[];
   };
 
   leagues: LeagueDef[];
@@ -68,7 +73,7 @@ export interface AppConfig {
     sharpBooks: string[];
     markets: string[];
     monthlyCredits: number;
-    /** Day of month the Odds API quota resets (1-28). */
+    /** Day of month the Odds API quota resets (1-28). The Odds API resets every account's credits on the 1st. */
     resetDayOfMonth: number;
     /** Keep this many credits in reserve and never spend them. */
     reserveCredits: number;
@@ -82,6 +87,12 @@ export interface AppConfig {
     includeLinks: boolean;
     /** Two-letter state used to fill `{state}` placeholders in bookmaker links, e.g. "nj". */
     linkState: string;
+    /**
+     * A market whose Odds API `last_update` lags the newest one in the same response by more than this is treated as
+     * suspended (the feed keeps echoing a pulled market's last price for ~15 min). Live / pre-match.
+     */
+    maxMarketLagLiveSec: number;
+    maxMarketLagPrematchSec: number;
   };
 
   model: {
@@ -103,6 +114,10 @@ export interface AppConfig {
     goneRetentionSec: number;
     /** Ignore DK prices longer than this (e.g. +2000 longshots are too noisy). */
     maxDecimalOdds: number;
+    /**
+     * Also evaluate alternate lines. Only the demo feed produces them: The Odds API `/odds` endpoint returns main
+     * lines only, so this has no effect with real data.
+     */
     includeAltLines: boolean;
   };
 
@@ -154,6 +169,40 @@ function list(env: Env, key: string, def: string[]): string[] {
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean);
+}
+
+/**
+ * The markets The Odds API `/odds` endpoint accepts (its "featured" markets) and that the parser models. Anything
+ * else (alternate_spreads, player props, h2h_lay, ...) makes every odds request fail with INVALID_MARKET.
+ */
+export const SUPPORTED_ODDS_API_MARKETS: readonly string[] = ['h2h', 'spreads', 'totals'];
+
+function marketList(env: Env, key: string): string[] {
+  const markets = list(env, key, [...SUPPORTED_ODDS_API_MARKETS]).map((m) => m.toLowerCase());
+  const bad = markets.filter((m) => !SUPPORTED_ODDS_API_MARKETS.includes(m));
+  if (bad.length > 0) {
+    throw new Error(
+      `Config ${key} may only contain ${SUPPORTED_ODDS_API_MARKETS.join(', ')} (got ${bad.join(', ')}). ` +
+        'Alternate lines and props are not available from the odds endpoint this app uses.',
+    );
+  }
+  return [...new Set(markets)];
+}
+
+const HOST_PATTERN = /^(\*\.)?[a-z0-9-]+(\.[a-z0-9-]+)*$/;
+
+function hostList(env: Env, key: string): string[] {
+  const out: string[] = [];
+  for (const raw of list(env, key, [])) {
+    const h = raw.toLowerCase().replace(/\.$/, '');
+    if (!HOST_PATTERN.test(h)) {
+      throw new Error(
+        `Config ${key} entries must be host names like odds.example.com or *.ts.net (no http://, no port, no path), got "${raw}"`,
+      );
+    }
+    out.push(h);
+  }
+  return out;
 }
 
 function oneOf<T extends string>(env: Env, key: string, def: T, allowed: readonly T[]): T {
@@ -211,6 +260,7 @@ export function loadConfig(env: Env = process.env, argv: string[] = process.argv
       port: num(env, 'PORT', 8080, { min: 1, max: 65535, int: true }),
       user: str(env, 'DASHBOARD_USER', 'admin'),
       password: env.DASHBOARD_PASSWORD ?? '',
+      allowedHosts: hostList(env, 'ALLOWED_HOSTS'),
     },
 
     leagues,
@@ -220,7 +270,7 @@ export function loadConfig(env: Env = process.env, argv: string[] = process.argv
       baseUrl: str(env, 'ODDS_API_BASE_URL', 'https://api.the-odds-api.com').replace(/\/+$/, ''),
       books,
       sharpBooks: list(env, 'SHARP_BOOKS', ['pinnacle', 'betonlineag', 'lowvig']).map((b) => b.toLowerCase()),
-      markets: list(env, 'ODDS_API_MARKETS', ['h2h', 'spreads', 'totals']),
+      markets: marketList(env, 'ODDS_API_MARKETS'),
       monthlyCredits: num(env, 'ODDS_API_MONTHLY_CREDITS', 20000, { min: 1 }),
       resetDayOfMonth: num(env, 'ODDS_API_RESET_DAY', 1, { min: 1, max: 28, int: true }),
       reserveCredits: num(env, 'ODDS_API_RESERVE_CREDITS', 200, { min: 0 }),
@@ -231,6 +281,8 @@ export function loadConfig(env: Env = process.env, argv: string[] = process.argv
       prematchHorizonHours: num(env, 'ODDS_API_PREMATCH_HORIZON_HOURS', 24, { min: 1 }),
       includeLinks: bool(env, 'ODDS_API_INCLUDE_LINKS', true),
       linkState: str(env, 'BOOK_STATE', '').toLowerCase(),
+      maxMarketLagLiveSec: num(env, 'ODDS_API_MAX_MARKET_LAG_LIVE_SEC', 90, { min: 20 }),
+      maxMarketLagPrematchSec: num(env, 'ODDS_API_MAX_MARKET_LAG_PREMATCH_SEC', 300, { min: 60 }),
     },
 
     model: {

@@ -323,6 +323,16 @@ describe('computeOpportunities — EV picks', () => {
     expect(computeOpportunities(live, ctx())).toEqual([]);
   });
 
+  it('treats prices observed "in the future" (the clock stepped back) as stale, not 0 s old', () => {
+    const future = { observedAt: NOW + 30 * MIN };
+    expect(computeOpportunities(build(baseQuotes(2.1, future, future)), ctx())).toEqual([]);
+    expect(computeOpportunities(build(baseQuotes(2.1, future, future), LIVE), ctx())).toEqual([]);
+    expect(computeOpportunities(build(baseQuotes(2.1, {}, future)), ctx())).toEqual([]); // sharp side only
+    // A couple of seconds of clock jitter is fine.
+    const jitter = { observedAt: NOW + 2 * SEC };
+    expect(only(computeOpportunities(build(baseQuotes(2.1, jitter, jitter)), ctx())).verdict).toBe('BET');
+  });
+
   it('ignores suspended DraftKings quotes', () => {
     const store = build([...ml('pinnacle', 1.9, 2.0), quote('draftkings', 'moneyline', 'home', null, 2.1, { suspended: true })]);
     expect(computeOpportunities(store, ctx())).toEqual([]);
@@ -462,6 +472,104 @@ describe('computeOpportunities — stale lines', () => {
   });
 });
 
+describe('computeOpportunities — stale lines measured on no-vig prices from the start of the move', () => {
+  it('does not count a wider sharp margin (or a move against the pick) as steam', () => {
+    // Live. Pinnacle 1.40 / 3.25 (2.2% margin) -> 1.36 / 3.10 (5.8% margin) 20 s ago. The favourite's raw implied
+    // probability rises by 0.021, but its no-vig probability falls (0.6989 -> 0.6951). DraftKings is still 1.49.
+    const store = new MarketStore();
+    const ev = rawEvent(LIVE);
+    const early = NOW - 300 * SEC;
+    ingest(store, [ev], [
+      ...ml('pinnacle', 1.4, 3.25, { observedAt: early, bookUpdatedAt: early }),
+      ...ml('draftkings', 1.49, 2.6, { observedAt: early }),
+    ], early);
+    ingest(store, [ev], [...ml('pinnacle', 1.36, 3.1, { bookUpdatedAt: NOW - 20 * SEC }), ...ml('draftkings', 1.49, 2.6)]);
+    const o = only(computeOpportunities(store, ctx()));
+    expect(o.side).toBe('home');
+    expect(o.fairProb).toBeLessThan(1 / 1.4 / (1 / 1.4 + 1 / 3.25));
+    expect(o.staleLine).toBe(false);
+    expect(o.verdict).toBe('BET_NOW'); // live and +EV, but not a stale line
+    expect(o.urgency).not.toBe('critical');
+    expect(o.expiresInSec).toBe(45);
+    expect(o.reasons.some((r) => r.includes('moved'))).toBe(false);
+  });
+
+  it('is not flagged when DraftKings already followed the move, even if the sharp book ticked again since', () => {
+    // Pre-match. Pinnacle home 2.00 -> 1.80 at NOW-110s; DraftKings follows 2.15 -> 1.95 at NOW-60s; Pinnacle then
+    // ticks 1.80 -> 1.79 at NOW-15s. DraftKings has repriced since the move began: not a stale line.
+    const store = new MarketStore();
+    const ev = rawEvent();
+    const early = NOW - 300 * SEC;
+    ingest(store, [ev], [
+      ...ml('pinnacle', 2.0, 1.85, { observedAt: early, bookUpdatedAt: early }),
+      ...ml('draftkings', 2.15, 1.75, { observedAt: early }),
+    ], early);
+    ingest(store, [ev], [
+      ...ml('pinnacle', 1.8, 2.1, { observedAt: NOW - 100 * SEC, bookUpdatedAt: NOW - 110 * SEC }),
+      ...ml('draftkings', 2.15, 1.75, { observedAt: NOW - 100 * SEC }),
+    ], NOW - 100 * SEC);
+    ingest(store, [ev], [
+      ...ml('pinnacle', 1.8, 2.1, { observedAt: NOW - 55 * SEC, bookUpdatedAt: NOW - 55 * SEC }),
+      ...ml('draftkings', 1.95, 1.85, { observedAt: NOW - 55 * SEC, bookUpdatedAt: NOW - 60 * SEC }),
+    ], NOW - 55 * SEC);
+    ingest(store, [ev], [...ml('pinnacle', 1.79, 2.12, { bookUpdatedAt: NOW - 15 * SEC }), ...ml('draftkings', 1.95, 1.85, { bookUpdatedAt: NOW - 60 * SEC })]);
+    const o = only(computeOpportunities(store, ctx()));
+    expect(o.side).toBe('home');
+    expect(o.staleLine).toBe(false);
+    expect(o.verdict).toBe('BET');
+    expect(o.expiresInSec).toBe(900);
+  });
+
+  it('dates a multi-step move from when it began', () => {
+    // Same sharp moves, but DraftKings never changed: stale, and the move is reported as 110 s old, not 15 s.
+    const store = new MarketStore();
+    const ev = rawEvent();
+    const early = NOW - 300 * SEC;
+    ingest(store, [ev], [
+      ...ml('pinnacle', 2.0, 1.85, { observedAt: early, bookUpdatedAt: early }),
+      ...ml('draftkings', 2.15, 1.75, { observedAt: early }),
+    ], early);
+    ingest(store, [ev], [
+      ...ml('pinnacle', 1.8, 2.1, { observedAt: NOW - 100 * SEC, bookUpdatedAt: NOW - 110 * SEC }),
+      ...ml('draftkings', 2.15, 1.75, { observedAt: NOW - 100 * SEC }),
+    ], NOW - 100 * SEC);
+    ingest(store, [ev], [...ml('pinnacle', 1.79, 2.12, { bookUpdatedAt: NOW - 15 * SEC }), ...ml('draftkings', 2.15, 1.75)]);
+    const o = only(computeOpportunities(store, ctx()));
+    expect(o.staleLine).toBe(true);
+    expect(o.verdict).toBe('BET_NOW');
+    expect(o.reasons).toContain('Pinnacle moved +100 → -127 in the last 110s; DraftKings still +115');
+  });
+});
+
+describe('computeOpportunities — longshot confidence', () => {
+  it('never turns a better DraftKings price into WATCH (confidence does not depend on the price judged)', () => {
+    // Live, Pinnacle 1.33 / 3.50 with 40 s old data: fair away ≈ +263 (27.5%).
+    const at = (dkAway: number): Opportunity => {
+      const store = build(
+        [...ml('pinnacle', 1.33, 3.5, { observedAt: NOW - 40 * SEC }), ...ml('draftkings', 1.25, dkAway)],
+        LIVE,
+      );
+      return only(computeOpportunities(store, ctx()));
+    };
+    const plus290 = at(3.9);
+    const plus310 = at(4.1);
+    expect(plus290.verdict).toBe('BET_NOW');
+    expect(plus310.verdict).toBe('BET_NOW');
+    expect(plus310.confidence).toBeCloseTo(plus290.confidence, 12);
+    expect(plus310.evPct).toBeGreaterThan(plus290.evPct);
+    expect(plus310.stake).toBeGreaterThanOrEqual(plus290.stake);
+    expect(plus310.minAcceptableAmerican).toBe(plus290.minAcceptableAmerican);
+  });
+
+  it('still discounts picks whose fair price is a longshot', () => {
+    // Pinnacle 1.20 / 5.50: fair away ≈ 5.58 (17.9%). Pre-match, fresh data.
+    const store = build([...ml('pinnacle', 1.2, 5.5), ...ml('draftkings', 1.15, 6.2)]);
+    const o = only(computeOpportunities(store, ctx()));
+    expect(o.side).toBe('away');
+    expect(o.confidence).toBeCloseTo(0.9 * (1 - (0.3 * 5) / 900) * 0.85, 9);
+  });
+});
+
 describe('computeOpportunities — reference fallback, ordering, correlation', () => {
   it('falls back to a consensus with lower confidence', () => {
     const pinnacle = only(computeOpportunities(build(baseQuotes(2.1)), ctx()));
@@ -526,7 +634,8 @@ describe('computeOpportunities — arbs', () => {
     expect(o.type).toBe('arb');
     expect(o.id).toBe('odds-api:g1|arb|moneyline|home|');
     expect(o.evPct).toBeCloseTo(1 / S - 1, 9);
-    expect(o.fairProb).toBeCloseTo(1 / 2.2 / S, 9);
+    // No reference market (one other book, no sharp): the DraftKings leg alone claims no edge.
+    expect(o.fairProb).toBeCloseTo(1 / 2.2, 9);
     expect(o.verdict).toBe('BET');
     expect(o.urgencyScore).toBe(70);
     expect(o.urgency).toBe('high');
@@ -545,6 +654,21 @@ describe('computeOpportunities — arbs', () => {
     expect(o.reasons.some((r) => r.includes('Bet $19.05 on Celtics ML at DraftKings and $20.95 on Knicks ML at FanDuel'))).toBe(true);
     expect(o.reasons.some((r) => r.includes('another sportsbook'))).toBe(true);
     expect(o.reasons.some((r) => r.includes('FanDuel'))).toBe(true);
+  });
+
+  it('reports the reference no-vig probability as fairProb, not the arb leg weight', () => {
+    // Pinnacle 2.00 / 1.87 is the reference; DraftKings home 2.10 + FanDuel away 2.05 lock ≈ +3.7%.
+    const store = build([...ml('pinnacle', 2.0, 1.87), ...ml('fanduel', 1.8, 2.05), ...ml('draftkings', 2.1, 1.7)]);
+    const arb = computeOpportunities(store, ctx({ settings: { showArbs: true } })).find((o) => o.type === 'arb');
+    expect(arb).toBeDefined();
+    const S = 1 / 2.1 + 1 / 2.05;
+    const pinHome = 1 / 2.0 / (1 / 2.0 + 1 / 1.87);
+    expect(arb!.evPct).toBeCloseTo(1 / S - 1, 9);
+    expect(arb!.fairProb).toBeCloseTo(pinHome, 9);
+    expect(arb!.fairProb).not.toBeCloseTo(1 / 2.1 / S, 3);
+    // What "I placed it" would journal as the EV of the DraftKings leg: ≈ +1.3%, not the +3.7% locked by both legs.
+    expect(arb!.fairProb * 2.1 - 1).toBeCloseTo(pinHome * 2.1 - 1, 9);
+    expect(arb!.fairProb * 2.1 - 1).toBeLessThan(0.02);
   });
 
   it('marks a live arb BET_NOW with a higher urgency', () => {
@@ -681,6 +805,25 @@ describe('OpportunityTracker', () => {
     t.update([], NOW + SEC);
     t.update([opp('a')], NOW + 2 * SEC);
     expect(t.find('a')).toMatchObject({ status: 'active', firstSeen: NOW, lastSeen: NOW + 2 * SEC });
+  });
+
+  it('starts the price window (actionableSince) when a pick becomes actionable, not when it was first seen', () => {
+    const t = new OpportunityTracker({ goneRetentionSec: 90 });
+    t.update([opp('x', { verdict: 'WATCH' })], 1_000);
+    t.update([opp('x', { verdict: 'WATCH' })], 58_000);
+    expect(t.find('x')?.actionableSince).toBeUndefined();
+    const now = t.update([opp('x', { verdict: 'BET_NOW', isLive: true, expiresInSec: 20 })], 60_000)[0];
+    expect(now.firstSeen).toBe(1_000);
+    expect(now.actionableSince).toBe(60_000); // 20 s to act from here, not already expired
+    expect(t.update([opp('x', { verdict: 'BET_NOW', isLive: true })], 65_000)[0].actionableSince).toBe(60_000);
+    // A new stale-line signal or a verdict change restarts it; so does coming back after being gone.
+    expect(t.update([opp('x', { verdict: 'BET_NOW', isLive: true, staleLine: true })], 66_000)[0].actionableSince).toBe(66_000);
+    expect(t.update([opp('x', { verdict: 'BET_NOW', isLive: true, staleLine: false })], 67_000)[0].actionableSince).toBe(66_000);
+    expect(t.update([opp('x', { verdict: 'BET' })], 68_000)[0].actionableSince).toBe(68_000);
+    t.update([], 69_000);
+    expect(t.find('x')?.status).toBe('gone');
+    expect(t.update([opp('x', { verdict: 'BET' })], 70_000)[0].actionableSince).toBe(70_000);
+    expect(t.update([opp('x', { verdict: 'WATCH' })], 71_000)[0].actionableSince).toBeUndefined();
   });
 
   it('caps the number of items after sorting', () => {

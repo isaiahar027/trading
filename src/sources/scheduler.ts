@@ -52,6 +52,12 @@ const ERROR_BACKOFF_BASE_MS = 15_000;
 const ERROR_BACKOFF_MAX_MS = 10 * 60_000;
 /** msUntilNextDue never asks the caller to sleep longer than this. */
 const MAX_WAIT_MS = 60_000;
+/**
+ * A clock reading this much earlier than the latest one seen means the wall clock stepped backwards (NTP step, VM
+ * snapshot restore). Every stored poll/refresh time is then shifted by the step, so intervals keep their real length
+ * instead of nothing being due until the clock catches up.
+ */
+const CLOCK_STEP_BACK_MS = 60_000;
 /** Bounded memory: start times kept per league. */
 const MAX_START_TIMES = 500;
 const MAX_TRACKED_ERRORS = 1_000;
@@ -168,7 +174,7 @@ export class PollScheduler {
    * when the league is live or has a start within the next 60 min. Unavailable leagues are skipped.
    */
   leaguesNeedingEventRefresh(at: number): LeagueDef[] {
-    this.touch(at);
+    this.observeNow(at);
     const out: LeagueDef[] = [];
     for (const entry of this.eligible(at)) {
       if (entry.eventRetryAt !== null && at < entry.eventRetryAt) continue;
@@ -209,7 +215,7 @@ export class PollScheduler {
 
   /** The league to poll now, or null when nothing is due or the budget cannot pay for a call. */
   nextDue(at: number, remaining: number | null, costPerCall: number): PollPlan | null {
-    this.touch(at);
+    this.observeNow(at);
     if (this.isBudgetExhausted(remaining, costPerCall)) {
       this.clearPlanFields();
       return null;
@@ -226,7 +232,7 @@ export class PollScheduler {
 
   /** Milliseconds until the earliest league becomes due: 0 if one is due now; 60 000 when nothing is active. */
   msUntilNextDue(at: number, remaining: number | null, costPerCall: number): number {
-    this.touch(at);
+    this.observeNow(at);
     if (this.isBudgetExhausted(remaining, costPerCall)) {
       this.clearPlanFields();
       return MAX_WAIT_MS;
@@ -280,8 +286,33 @@ export class PollScheduler {
 
   // ---------------------------------------------------------------------------------------------------------------
 
+  /** Records a clock value passed to a mutator (which may legitimately be a past time). */
   private touch(at: number): void {
     if (isFiniteNumber(at) && (this.lastAt === null || at > this.lastAt)) this.lastAt = at;
+  }
+
+  /** Records "now" as seen by a query; a big step backwards rebases every stored time (see CLOCK_STEP_BACK_MS). */
+  private observeNow(at: number): void {
+    if (isFiniteNumber(at) && this.lastAt !== null && at < this.lastAt - CLOCK_STEP_BACK_MS) {
+      this.rebase(at - this.lastAt);
+      this.lastAt = at;
+      return;
+    }
+    this.touch(at);
+  }
+
+  /** Shifts every time taken on this clock by `deltaMs` (event start times come from the feed and stay put). */
+  private rebase(deltaMs: number): void {
+    const shift = (t: number | null): number | null => (t === null ? null : t + deltaMs);
+    for (const entry of this.entries.values()) {
+      const st = entry.state;
+      st.lastPollAt = shift(st.lastPollAt);
+      st.nextDueAt = shift(st.nextDueAt);
+      st.eventsRefreshedAt = shift(st.eventsRefreshedAt);
+      st.unavailableUntil = shift(st.unavailableUntil);
+      entry.liveUpdatedAt = shift(entry.liveUpdatedAt);
+      entry.eventRetryAt = shift(entry.eventRetryAt);
+    }
   }
 
   private spendable(remaining: number | null): number {

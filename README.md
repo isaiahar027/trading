@@ -53,7 +53,7 @@ contacts a sportsbook's website or API.
   button is an ordinary link that *you* click.
 - Guarantee profit. It estimates edges; results have large variance and prices move.
 - Cover player props, parlays / same-game parlays, futures or live micro-markets. Main-line moneyline, spread and
-  total only (alternate lines are off by default).
+  total only (The Odds API's odds endpoint returns main lines only; alternate lines exist only in the demo).
 - Check whether betting is legal where you are. That is your responsibility.
 
 ```
@@ -79,6 +79,10 @@ moves quickly) gives a good estimate of the true probability.
 - **Reference book.** `SHARP_BOOKS` in priority order (default Pinnacle, then BetOnline, then LowVig). The first
   one with a complete, not-suspended, fresh market (all outcomes present, seen within the last 45 s for live games
   or 15 min before the game) is used.
+- **Suspended markets.** When a book pulls a market (after a goal, on injury news), The Odds API keeps returning its
+  last price for about 15 minutes while that market's `last_update` stops advancing. A market whose `last_update`
+  lags the newest one in the same response by more than 90 s (live) / 5 min (pre-game) is treated as suspended:
+  never priced, never used as the reference (`ODDS_API_MAX_MARKET_LAG_LIVE_SEC` / `_PREMATCH_SEC`).
 - **Consensus fallback.** If no sharp book qualifies, the de-vigged probabilities of every other usable book
   (at least `MIN_CONSENSUS_BOOKS`, default 3) are averaged. DraftKings is never used as a reference for itself.
 - **De-vig method.** The default `worst` computes four standard methods (multiplicative, additive, power, Shin)
@@ -122,10 +126,12 @@ line).
 | Reference = consensus of *n* books | min(0.85, 0.55 + 0.05 × n) |
 | Live game | × 0.85 |
 | Age of the reference price | × (1 − 0.3 × age / max age) |
-| Longshot (longer than +300) | × 0.85 |
+| Longshot: fair price +300 or longer (win probability 25% or less) | × 0.85 |
 | Pre-game, DraftKings repriced *after* the reference last moved | × 0.85 |
 
 The result is clamped to 0.1 – 1 and shown as a meter on each card. It scales the stake and gates the verdict.
+None of the factors depends on the DraftKings price itself, so a better price than "take at X" never turns a BET
+into a WATCH.
 
 ### 4. Verdicts
 
@@ -139,10 +145,13 @@ Defaults: minimum EV **+2% pre-game**, **+3% live** (live data is noisier, so it
 
 ### 5. Stale lines ("steam")
 
-When a single sharp book is the reference, the engine checks whether that book's implied probability for the pick
-rose by at least `STALE_MOVE_PROB` (2 percentage points) within the last `STALE_WINDOW_SEC` (120 s) while
-DraftKings has not changed its price since. Example reason: *"Pinnacle moved +105 → −120 in the last 70s;
-DraftKings still +110"*. These are the edges most likely to disappear, so they get extra urgency.
+When a single sharp book is the reference, the engine re-prices that book's whole market as it stood
+`STALE_WINDOW_SEC` (120 s) ago, removes the margin the same way as now, and checks whether the pick's **no-vig**
+probability rose by at least `STALE_MOVE_PROB` (2 percentage points). A book merely widening its margin (both
+sides' raw implied probabilities rise) is not steam. DraftKings must not have changed its price at all since the
+sharp book *started* moving (a later small tick does not reset that). Example reason: *"Pinnacle moved +105 → −120
+in the last 70s; DraftKings still +110"*, where the time is measured from the start of the move. These are the edges
+most likely to disappear, so they get extra urgency.
 
 ### 6. Urgency
 
@@ -160,7 +169,9 @@ Examples: live + stale + 5% EV = 45 + 30 + 25 = 100 (critical). Live, 4% EV = 45
 EV, starting in 50 min = 25 + 8 = 33 (medium).
 
 Each pick also gets a rough shelf life shown as "act within ~N s": live stale line 20 s, other live 45 s, pre-game
-stale line 2 min, pre-game starting within the hour 5 min, otherwise 15 min. It is an estimate, not a promise.
+stale line 2 min, pre-game starting within the hour 5 min, otherwise 15 min. The countdown starts when the pick
+became actionable (for example when it left the watch list), not when it was first seen. It is an estimate, not a
+promise.
 
 ### 7. Stake sizing (fractional Kelly)
 
@@ -195,8 +206,9 @@ better than −115. The same pick live (+3% minimum) needs +106 or better.
 If the DraftKings price on one side plus the best price at *another sportsbook* on the other side(s) implies less
 than 100% in total (Σ 1/d < 1), both bets together lock in a profit whatever happens. The Arbs tab shows each leg,
 its book and a stake split (to the cent) that equalizes the payout (minimum 0.5% profit). The second leg must be
-placed at the other sportsbook, by you. The reference books in `SHARP_BOOKS` (Pinnacle, BetOnline, LowVig by default)
-are only used for pricing, never as an arb leg: they are offshore books, and with their thin margin every +EV
+placed at the other sportsbook, by you. **I placed the DK leg** logs the DraftKings leg only, with its EV measured
+against the reference fair price (not the arb's locked profit). The reference books in `SHARP_BOOKS` (Pinnacle,
+BetOnline, LowVig by default) are only used for pricing, never as an arb leg: they are offshore books, and with their thin margin every +EV
 DraftKings price would also show up as a "DraftKings vs Pinnacle arb". Books watch for arbitrage betting and limit
 accounts that do it.
 
@@ -213,8 +225,9 @@ of related markets on the same game multiplies risk rather than edge.
 
 1. Go to [the-odds-api.com](https://the-odds-api.com) and pick a plan. The key is emailed to you.
 2. Put it in `.env` as `ODDS_API_KEY=...`.
-3. Set `ODDS_API_MONTHLY_CREDITS` to your plan size and `ODDS_API_RESET_DAY` to the day of the month your quota
-   resets (see your account page).
+3. Set `ODDS_API_MONTHLY_CREDITS` to your plan size. Leave `ODDS_API_RESET_DAY` at 1: The Odds API resets every
+   account's usage credits on the **1st of each month**, whatever day your subscription renews or bills. (Setting
+   your billing day there would make the scheduler spend the whole month's quota by that day.)
 
 At the time of writing the plans were 500 (free), 20K, 100K, 5M and 15M credits per month; check the site for
 current plans and prices. **The free 500 is only enough to try it; 20K is the practical minimum; 100K is where
@@ -312,6 +325,9 @@ occasional arbs so you can learn the dashboard. **Demo prices are fake: never be
 
 With Docker instead: `cp .env.example .env`, set `DEMO_MODE=true`, then `docker compose up -d --build`.
 
+Bets you log and settings you change in the demo are kept in `data/demo/`, apart from the real ones, so switching to
+live mode later starts with an empty journal and the values from your `.env`.
+
 ---
 
 ## Real run on your own computer
@@ -324,7 +340,8 @@ npm start                   # reads .env from the current directory
 ```
 
 Open **http://localhost:8080**. By default it listens on 127.0.0.1 only. Settings and your bet journal are stored
-in `./data`.
+in `./data`. Setting `DASHBOARD_PASSWORD` is a good idea even on your own computer (see
+[Reach the dashboard safely](#reach-the-dashboard-safely)).
 
 For a 24/7 setup (so live alerts reach your phone while your laptop sleeps) use a small VPS.
 
@@ -409,11 +426,12 @@ Set at least:
 | Variable | What to put |
 |---|---|
 | `ODDS_API_KEY` | your key |
-| `ODDS_API_MONTHLY_CREDITS`, `ODDS_API_RESET_DAY` | your plan size and reset day |
+| `ODDS_API_MONTHLY_CREDITS` | your plan size (leave `ODDS_API_RESET_DAY` at 1: credits reset on the 1st) |
 | `LEAGUES` | only what you bet, e.g. `NFL,NBA` |
 | `BANKROLL` | your betting bankroll in dollars |
 | `TZ` | your time zone, e.g. `America/Chicago` (defines "today" for the daily limit) |
 | `DASHBOARD_PASSWORD` | a long random password: `openssl rand -base64 24` |
+| `ALLOWED_HOSTS` | only if you will open the dashboard by a name: your Caddy domain or Tailscale name (see below) |
 | `BOOK_STATE` | the state you bet from, e.g. `nj` (better DraftKings links) |
 | `NTFY_URL` / `DISCORD_WEBHOOK_URL` / `TELEGRAM_*` | optional phone alerts |
 
@@ -493,30 +511,37 @@ After editing `.env`, run `docker compose up -d` (it recreates the container wit
 ### 11. Backups
 
 Everything worth keeping is in `./data` (`settings.json` and the bet journal `bets.jsonl`) plus your `.env` (secrets;
-store that copy somewhere private).
+store that copy somewhere private). The container writes those files as uid 1000 with mode 600, so read them with
+`sudo` (otherwise `tar` skips them with "Permission denied" and still writes an archive with an empty `data/`):
 
 ```bash
 mkdir -p ~/backups
-tar czf ~/backups/odds-hub-data-$(date +%F).tar.gz -C ~/odds-hub data
+sudo tar czf ~/backups/odds-hub-data-$(date +%F).tar.gz -C ~/odds-hub data
+sudo chown "$USER": ~/backups/odds-hub-data-*.tar.gz
+tar tzf ~/backups/odds-hub-data-$(date +%F).tar.gz     # must list data/bets.jsonl and data/settings.json
 ```
 
-Nightly at 04:17 with 30 days kept (`crontab -e`; `%` must be escaped in crontab):
+Nightly at 04:17 with 30 days kept, in **root's** crontab (`sudo crontab -e`; `%` must be escaped in crontab; replace
+`/home/you` with your home directory):
 
 ```
-17 4 * * * tar czf $HOME/backups/odds-hub-data-$(date +\%F).tar.gz -C $HOME/odds-hub data && find $HOME/backups -name 'odds-hub-data-*.tar.gz' -mtime +30 -delete
+17 4 * * * tar czf /home/you/backups/odds-hub-data-$(date +\%F).tar.gz -C /home/you/odds-hub data && find /home/you/backups -name 'odds-hub-data-*.tar.gz' -mtime +30 -delete
 ```
 
-Copy backups off the server now and then: `scp 'you@YOUR_VPS_IP:backups/odds-hub-data-*.tar.gz' .`
+Check a nightly archive with `tar tzf` now and then, and copy backups off the server:
+`scp 'you@YOUR_VPS_IP:backups/odds-hub-data-*.tar.gz' .`
 
 Restore:
 
 ```bash
 cd ~/odds-hub
 docker compose down
-tar xzf ~/backups/odds-hub-data-2026-09-01.tar.gz -C ~/odds-hub
+sudo tar xzf ~/backups/odds-hub-data-2026-09-01.tar.gz -C ~/odds-hub
 sudo chown -R 1000:1000 data
 docker compose up -d
 ```
+
+When the journal is compacted at startup, the previous file is kept as `data/bets.jsonl.bak`.
 
 ---
 
@@ -530,6 +555,13 @@ internet can reach it. Pick one of the options below.
 password: Docker-published ports go around ufw, so the dashboard would be open to the whole internet. Never send
 the password over plain `http://` across the internet (HTTP Basic auth is readable on the wire), and never use
 `tailscale funnel` for it (that makes it public).
+
+**Set `DASHBOARD_PASSWORD` in every setup, including the SSH tunnel and your own computer.** "Only reachable from
+this machine" is not enough on its own: any web page open in your browser can try to talk to `localhost:8080`. The
+dashboard refuses requests addressed to any name other than an IP address, `localhost` or an `ALLOWED_HOSTS` entry
+(this blocks "DNS rebinding", where a page re-points its own domain at 127.0.0.1), and the password adds a second
+lock. If you open the dashboard by a name (a Caddy domain, a Tailscale `*.ts.net` name), put that name in
+`ALLOWED_HOSTS`, otherwise the dashboard answers `403 This dashboard does not answer to "<name>"`.
 
 ### Option A: SSH tunnel (recommended, nothing to install)
 
@@ -562,16 +594,23 @@ sudo tailscale up                  # open the printed link and sign in
 sudo tailscale serve --bg 8080     # HTTPS inside your tailnet -> 127.0.0.1:8080
 ```
 
+Add the name to `.env` and apply it with `docker compose up -d`:
+
+```
+ALLOWED_HOSTS=<vps-name>.<your-tailnet>.ts.net
+```
+
 Install the Tailscale app on your phone and laptop, sign in to the same account, and open
 `https://<vps-name>.<your-tailnet>.ts.net`. Only your own devices can reach it. (If `serve` asks you to enable
-HTTPS certificates or MagicDNS, follow its link.) Stop sharing with `sudo tailscale serve reset`. Setting
-`DASHBOARD_PASSWORD` as well is still a good idea.
+HTTPS certificates or MagicDNS, follow its link.) Stop sharing with `sudo tailscale serve reset`. Set
+`DASHBOARD_PASSWORD` as well.
 
 ### Option C: Caddy reverse proxy with automatic HTTPS + DASHBOARD_PASSWORD
 
 Use this if you want a normal `https://` address. You need a domain name.
 
-1. Set a strong `DASHBOARD_PASSWORD` in `.env` (`openssl rand -base64 24`) and apply it with `docker compose up -d`.
+1. Set a strong `DASHBOARD_PASSWORD` in `.env` (`openssl rand -base64 24`) and `ALLOWED_HOSTS=odds.example.com`
+   (your domain), and apply them with `docker compose up -d`.
    **Do not skip this step: with a reverse proxy the dashboard is on the public internet.**
 2. Point a DNS **A** record, e.g. `odds.example.com`, at your VPS IP.
 3. Install Caddy: on Ubuntu 24.04 `sudo apt install -y caddy`, otherwise use the official apt repository from
@@ -643,7 +682,9 @@ Settings, System health and the light/dark theme.
   a countdown bar ("act within ~20 s").
 - **Pre-game**: BET cards for games that have not started.
 - **Watch list** (collapsed by default): WATCH picks, near-misses worth keeping an eye on. Not bets.
-- Cards that disappear from the feed turn grey, say "Price moved — gone" and fade out.
+- Cards that disappear from the feed turn grey, say "Price moved — gone" and fade out. A pick whose price slips
+  below your minimum stays in place for up to 90 s, greyed, as "Price moved — below your minimum" (it comes back to
+  life if the price recovers), instead of silently jumping to the hidden watch list.
 
 **Each card** shows the verdict badge, urgency, league, teams, start time or LIVE with the score, the pick in large
 type, the DraftKings price in American odds with **take at ≥ X**, the fair price, EV %, the suggested stake in
@@ -654,7 +695,8 @@ and the reasons. Buttons:
   page. Find the same market, check the price against "take at", then decide.
 - **Copy pick**: copies the pick text.
 - **I placed it**: log the bet with the stake and odds you actually got (both editable). This feeds the daily
-  exposure limit and the My bets stats.
+  exposure limit and the My bets stats. It still works after the pick has left the board or the server restarted:
+  the dialog then logs the pick as the dashboard last showed it.
 
 **Filters**: league chips, live-only, minimum EV slider and show-watch-list toggle; remembered in your browser.
 
@@ -663,7 +705,13 @@ and the reasons. Buttons:
 **My bets tab**: totals (bets, pending, staked, profit, ROI, average EV at placement, average CLV) and your bets
 with **Won / Lost / Push / Void** buttons to settle them. For pre-game bets the app records the fair price when the
 game starts (the "closing line"); CLV = closing fair probability × your decimal odds − 1. Consistently positive CLV
-is the best early evidence that you are beating the market, long before profit is statistically meaningful.
+is the best early evidence that you are beating the market, long before profit is statistically meaningful. If the
+sharp line closed on a different number than your spread/total (you took −3.5, it closed −5.5), the closing
+probability is converted to your number with a normal model of the final margin (only for moves up to about half
+a standard deviation) and shown with "≈". The Avg CLV tile says how many bets it covers and how many started
+pre-game bets have no closing line, so the average is not read as covering them.
+Below the list, **Placed a bet on a pick that has left the board?** lists recent picks (last 6 h, this browser) that
+are no longer shown, so a bet placed just before the price moved can still be logged.
 
 **Settings**: the runtime settings below; invalid values are rejected with a message. **System health**:
 status of each data source, credits used/remaining, events and quotes tracked, memory and engine timing.
@@ -700,27 +748,29 @@ that file (and restart) to go back to the `.env` values. The dashboard shows per
 | Variable | Default | Meaning |
 |---|---|---|
 | `ODDS_API_KEY` | (empty) | Odds API key; empty = no live odds |
-| `DEMO_MODE` | false | Simulated data, no credits |
-| `ODDS_API_MONTHLY_CREDITS` / `ODDS_API_RESET_DAY` / `ODDS_API_RESERVE_CREDITS` | 20000 / 1 / 200 | Budget inputs |
+| `DEMO_MODE` | false | Simulated data, no credits; demo bets/settings live in `DATA_DIR/demo` |
+| `ODDS_API_MONTHLY_CREDITS` / `ODDS_API_RESET_DAY` / `ODDS_API_RESERVE_CREDITS` | 20000 / 1 / 200 | Budget inputs (credits reset on the 1st for every account: keep 1) |
 | `ODDS_API_BOOKS` | 10 books incl. pinnacle, draftkings | Books requested (DraftKings always added) |
 | `SHARP_BOOKS` | pinnacle,betonlineag,lowvig | Reference books in priority order |
-| `ODDS_API_MARKETS` | h2h,spreads,totals | Markets requested |
+| `ODDS_API_MARKETS` | h2h,spreads,totals | Markets requested (only these three are accepted) |
 | `ODDS_API_SPORTS` | (empty) | Override/add sport keys, e.g. `KBO:baseball_kbo` or `UFC:none` |
 | `ODDS_API_MIN_INTERVAL_LIVE_SEC` / `…_PREMATCH_SEC` / `ODDS_API_MAX_INTERVAL_SEC` | 20 / 180 / 1800 | Poll interval limits |
 | `ODDS_API_PREMATCH_HORIZON_HOURS` | 24 | Only games starting within this window spend credits |
 | `ODDS_API_INCLUDE_LINKS` / `BOOK_STATE` | true / (empty) | DraftKings deep links and the state to fill in |
 | `ODDS_API_TIMEOUT_MS` / `ODDS_API_BASE_URL` | 15000 / https://api.the-odds-api.com | HTTP details |
+| `ODDS_API_MAX_MARKET_LAG_LIVE_SEC` / `…_PREMATCH_SEC` | 90 / 300 | A market whose `last_update` stopped advancing this long is treated as suspended |
 | `DEVIG_METHOD` | worst | worst, multiplicative, additive, power, shin |
 | `MIN_CONSENSUS_BOOKS` | 3 | Books needed for a consensus fair price |
 | `LIVE_MAX_SHARP_AGE_SEC` / `PREMATCH_MAX_SHARP_AGE_SEC` | 45 / 900 | Oldest trusted reference price |
 | `LIVE_MAX_DK_AGE_SEC` / `PREMATCH_MAX_DK_AGE_SEC` | 45 / 600 | Oldest trusted DraftKings price |
-| `STALE_MOVE_PROB` / `STALE_WINDOW_SEC` | 0.02 / 120 | Stale-line detection |
+| `STALE_MOVE_PROB` / `STALE_WINDOW_SEC` | 0.02 / 120 | Stale-line detection (no-vig move of the pick) |
 | `MAX_PLAUSIBLE_EV` | 0.25 | Hide edges above this (bad data) |
 | `MAX_DECIMAL_ODDS` | 11 | Ignore prices longer than +1000 |
-| `INCLUDE_ALT_LINES` | false | Evaluate alternate lines too |
+| `INCLUDE_ALT_LINES` | false | Evaluate alternate lines too (demo only: the Odds API odds endpoint has main lines only) |
 | `GONE_RETENTION_SEC` | 90 | How long vanished picks stay visible |
 | `HOST` / `PORT` | 127.0.0.1 / 8080 | Listen address (Docker overrides to 0.0.0.0:8080 inside the container) |
-| `DASHBOARD_USER` / `DASHBOARD_PASSWORD` | admin / (empty) | HTTP Basic auth; empty password = no auth |
+| `DASHBOARD_USER` / `DASHBOARD_PASSWORD` | admin / (empty) | HTTP Basic auth; empty password = no auth (set one anyway) |
+| `ALLOWED_HOSTS` | (empty) | Names the dashboard answers to besides IP addresses and localhost, e.g. `odds.example.com,*.ts.net` |
 | `DATA_DIR` | ./data | Settings and bet journal (Docker: /app/data ← ./data) |
 | `TZ` | America/New_York | Defines "today" for the daily limit |
 | `LOG_LEVEL` | info | debug, info, warn, error |
@@ -760,14 +810,18 @@ An invalid value (for example a typo in `LEAGUES`) stops the app at startup with
 | Edited `.env` but nothing changed | Run `docker compose up -d` (recreates the container). `restart` does not re-read `.env`. Runtime settings saved in the dashboard override `.env`: change them there or delete `data/settings.json`. |
 | "No ODDS_API_KEY" / source disabled | Set `ODDS_API_KEY` and `docker compose up -d`. |
 | The Odds API "down", invalid key | Check the key on your account page; after a 401 the app pauses that source for 30 minutes. Fix the key and recreate the container. |
-| Credits run out / "quota" | The scheduler stops when only the reserve is left. Wait for the reset day, upgrade the plan, or cut leagues/markets. Make sure `ODDS_API_RESET_DAY` matches your account. |
+| Credits run out / "quota" | The scheduler stops when only the reserve is left. Wait for the reset (the 1st of the month), upgrade the plan, or cut leagues/markets. Keep `ODDS_API_RESET_DAY=1`: credits reset on the 1st for every account, and any other day makes the scheduler run the quota dry by that day. |
 | A league never shows anything | Out of season: no games means no polling (and no credits spent). If the API rejects the sport key as unknown or unavailable, the league is skipped for 6 hours at a time; check `ODDS_API_SPORTS`, Settings → Leagues and System health. |
+| The Odds API "down" with `INVALID_MARKET` / `INVALID_BOOKMAKERS` | The API rejected the request parameters (this affects every league, so no league is blamed). Fix `ODDS_API_MARKETS` / `ODDS_API_BOOKS` and run `docker compose up -d`; the app retries every 10 minutes meanwhile. |
 | Nothing on the board | Usually normal: real edges are rare and short-lived. Open the Watch list and System health (events and quotes tracked). |
 | Every live pick is WATCH | Expected when the feed is lagging or DraftKings moved after the sharp line. |
 | Stake shows $0 | WATCH verdict, today's exposure limit used up, or the Kelly stake is under $1. |
 | "Open in DraftKings" opens the home page | The feed had no deep link for that market, or `BOOK_STATE` is empty. |
 | Password prompt keeps coming back | Wrong user/password. If the password contains `$`, `#` or spaces, wrap it in single quotes in `.env`. |
+| `This dashboard does not answer to "<name>"` (403) | You opened it by a name that is not an IP address or `localhost`. Add the name to `ALLOWED_HOSTS` in `.env` (e.g. `odds.example.com` or `*.ts.net`) and run `docker compose up -d`. |
 | `cross-origin request rejected` (403) behind a proxy | The proxy rewrites the `Host` header. Pass it through unchanged (Caddy and `tailscale serve` do by default). |
+| Startup fails with "Could not read the bet journal" | The disk or volume returned a read error. The app refuses to start from a partial journal (it would under-count today's stakes); nothing was changed on disk. Check the disk, then restart. |
+| "Could not save bet" (503) when logging | The disk is full or failing; nothing was saved and the journal is intact. Free space and log the bet again. |
 | Dashboard stuck on "reconnecting" behind a proxy | The proxy buffers the event stream. Disable buffering for `/api/stream` (nginx honors the `X-Accel-Buffering: no` header the app sends). |
 | Daily limit resets at the wrong hour | Set `TZ` in `.env`, then `docker compose up -d`. |
 | Port 8080 already used on the server | Change only the host side: `"127.0.0.1:9080:8080"`. |

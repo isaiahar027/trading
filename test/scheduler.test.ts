@@ -333,3 +333,21 @@ describe('PollScheduler events', () => {
     expect(stateOf(s, 'NBA').nextStartTime).toBe(T0 + MIN);
   });
 });
+
+describe('PollScheduler clock steps', () => {
+  it('keeps polling and refreshing events after the wall clock steps back an hour', () => {
+    const s = new PollScheduler(cfg(), [NBA]);
+    s.updateEvents('NBA', [{ startTime: T0 - 30 * MIN }], T0);
+    expect(s.nextDue(T0, null, COST)?.league.key).toBe('NBA');
+    s.markPolled('NBA', T0, true, 1);
+    const interval = (stateOf(s, 'NBA').intervalSec ?? 0) * 1000;
+    expect(interval).toBeGreaterThan(0);
+
+    const back = T0 + 10_000 - HOUR; // 10 s later in real time, but the clock now reads an hour earlier
+    expect(s.nextDue(back, null, COST)).toBeNull(); // polled 10 s ago: not due yet
+    expect(s.msUntilNextDue(back, null, COST)).toBeLessThanOrEqual(interval);
+    expect(s.nextDue(back + interval, null, COST)?.league.key).toBe('NBA');
+    // The live league's event list (refreshed "10 s ago") is due again 2 minutes later, not an hour later.
+    expect(s.leaguesNeedingEventRefresh(back + 2 * MIN).map((l) => l.key)).toEqual(['NBA']);
+  });
+});

@@ -1,12 +1,12 @@
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { loadConfig } from '../src/config';
 import type { AppConfig } from '../src/config';
 import { MarketStore } from '../src/engine/marketStore';
 import { BetJournal } from '../src/server/betJournal';
-import { closingFairProb, closingQuotes, remainingExposure, startApp } from '../src/index';
+import { closingFairProb, closingLine, closingQuotes, remainingExposure, shiftLineProb, startApp } from '../src/index';
 import type { RunningApp } from '../src/index';
 import type { Quote, RawEvent, RuntimeSettings } from '../src/types';
 import type { FetchJsonOptions, FetchJsonResult, fetchJson } from '../src/util/http';
@@ -119,6 +119,76 @@ describe('closing line (CLV) capture', () => {
   });
 });
 
+describe('closing line when the market moved off the bet\'s number', () => {
+  const event: RawEvent = { source: 'odds-api', sourceEventId: 'g1', league: 'NBA', home: 'Celtics', away: 'Knicks', startTime: T, isLive: false };
+  const q = (book: string, kind: 'spread' | 'total', side: 'home' | 'away' | 'over' | 'under', line: number, decimal: number, at: number): Quote => ({
+    book,
+    source: 'odds-api',
+    sourceEventId: 'g1',
+    kind,
+    side,
+    line,
+    decimal,
+    suspended: false,
+    isMainLine: true,
+    observedAt: at,
+    bookUpdatedAt: at,
+  });
+  const spreads = (book: string, homeLine: number, at: number): Quote[] => [
+    q(book, 'spread', 'home', homeLine, 1.95, at),
+    q(book, 'spread', 'away', -homeLine, 1.95, at),
+  ];
+  const totals = (book: string, line: number, at: number): Quote[] => [q(book, 'total', 'over', line, 1.95, at), q(book, 'total', 'under', line, 1.95, at)];
+  const snapshot = (store: MarketStore, at: number, quotes: Quote[]): void => {
+    store.ingest({ source: 'odds-api', league: 'NBA', fetchedAt: at, events: [event], quotes, complete: true, books: ['pinnacle', 'draftkings'] });
+  };
+  const cfg = loadConfig({ DEVIG_METHOD: 'multiplicative' }, []);
+  const bet = (kind: 'spread' | 'total', side: 'home' | 'away' | 'over' | 'under', line: number) => ({
+    eventId: 'odds-api:g1',
+    league: 'NBA',
+    kind,
+    side,
+    line,
+    startTime: T,
+  });
+
+  it('converts the closing -5.5 to the bet\'s -3.5 (and +3.5) instead of recording no CLV', () => {
+    const store = new MarketStore();
+    snapshot(store, T - 60 * MIN, [...spreads('pinnacle', -3.5, T - 60 * MIN), ...spreads('draftkings', -3.5, T - 60 * MIN)]);
+    // Pinnacle steams to -5.5 before tip-off; the complete snapshot drops its -3.5 quotes.
+    snapshot(store, T - 10 * MIN, [...spreads('pinnacle', -5.5, T - 10 * MIN), ...spreads('draftkings', -3.5, T - 10 * MIN)]);
+    expect(closingQuotes(store, 'odds-api:g1', T).some((x) => x.book === 'pinnacle' && x.line === -3.5)).toBe(false);
+
+    const home = closingLine(store, bet('spread', 'home', -3.5), cfg);
+    expect(home?.approx).toBe(true);
+    // 50% at -5.5, two points better with an NBA margin sd of 12.
+    expect(home?.prob).toBeCloseTo(shiftLineProb('spread', 'home', -5.5, 0.5, -3.5, 12), 12);
+    expect(home?.prob).toBeGreaterThan(0.56);
+    expect(home?.prob).toBeLessThan(0.57);
+    const away = closingLine(store, bet('spread', 'away', 3.5), cfg);
+    expect(away?.approx).toBe(true);
+    expect((away?.prob ?? 0) + (home?.prob ?? 0)).toBeCloseTo(1, 6);
+    expect(closingFairProb(store, bet('spread', 'home', -3.5), cfg)).toBeCloseTo(home?.prob ?? 0, 12);
+  });
+
+  it('moves totals the right way and stays exact when the number did not move', () => {
+    const store = new MarketStore();
+    snapshot(store, T - 10 * MIN, [...totals('pinnacle', 228.5, T - 10 * MIN), ...spreads('pinnacle', -3.5, T - 10 * MIN)]);
+    const over = closingLine(store, bet('total', 'over', 224.5), cfg);
+    expect(over?.approx).toBe(true);
+    expect(over?.prob).toBeGreaterThan(0.5); // the total closed 4 points higher: Over 224.5 was the better bet
+    const under = closingLine(store, bet('total', 'under', 224.5), cfg);
+    expect(under?.prob).toBeLessThan(0.5);
+    expect(closingLine(store, bet('spread', 'home', -3.5), cfg)).toEqual({ prob: 0.5, approx: false });
+  });
+
+  it('gives up when the line moved too far to convert reliably', () => {
+    const store = new MarketStore();
+    snapshot(store, T - 10 * MIN, spreads('pinnacle', -10.5, T - 10 * MIN));
+    expect(closingLine(store, bet('spread', 'home', -3.5), cfg)).toBeNull();
+  });
+});
+
 // ---------------------------------------------------------------------------------------------------------------
 
 describe('startApp', () => {
@@ -159,7 +229,37 @@ describe('startApp', () => {
     });
     expect(put.status).toBe(200);
     expect(app.tick().remainingDailyExposure).toBe(300);
-    expect(JSON.parse(fs.readFileSync(path.join(cfg.dataDir, 'settings.json'), 'utf8')).bankroll).toBe(2000);
+    // Demo settings live in DATA_DIR/demo, apart from the real ones.
+    expect(JSON.parse(fs.readFileSync(path.join(cfg.dataDir, 'demo', 'settings.json'), 'utf8')).bankroll).toBe(2000);
+    expect(fs.existsSync(path.join(cfg.dataDir, 'settings.json'))).toBe(false);
+  });
+
+  it('keeps demo bets and settings out of the real (live) journal and settings', async () => {
+    const demoCfg = config({ BANKROLL: '1000' }, ['--demo']);
+    const demo = await run(demoCfg, { demoSeed: 7 });
+    const base = `http://127.0.0.1:${demo.port}`;
+    const opp = demo.tick().opportunities.find((o) => o.status === 'active');
+    expect(opp).toBeDefined();
+    const placed = await fetch(`${base}/api/bets`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ opportunityId: opp!.id, stake: 10, americanTaken: 110 }),
+    });
+    expect(placed.status).toBe(201);
+    await fetch(`${base}/api/settings`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ bankroll: 2000 }) });
+    expect(demo.tick().betSummary.stakedToday).toBe(10);
+    await demo.stop();
+
+    // Same DATA_DIR, real mode (no key: idle), BANKROLL from .env.
+    const liveCfg = config({ BANKROLL: '1000' });
+    liveCfg.dataDir = demoCfg.dataDir;
+    const live = await run(liveCfg);
+    const state = live.tick();
+    expect(state.health.demoMode).toBe(false);
+    expect(state.betSummary.totalBets).toBe(0);
+    expect(state.betSummary.stakedToday).toBe(0);
+    expect(state.settings.bankroll).toBe(1000);
+    expect(state.remainingDailyExposure).toBe(150);
   });
 
   it('idle mode (no key, no demo): stays up, polls nothing and reports the source as disabled', async () => {
@@ -254,6 +354,87 @@ describe('startApp', () => {
     const closing = 1 / 1.408 / (1 / 1.408 + 1 / 3.05);
     expect(state.betSummary.avgClvPct).toBeCloseTo(closing * 1.4 - 1, 9);
     expect(new BetJournal(journalFile).load().get(bet.id)?.closingFairProb).toBeCloseTo(closing, 12);
+  });
+
+  it('retries saving a closing line after a disk error instead of giving up on it', async () => {
+    const fixture = JSON.parse(fs.readFileSync(FIXTURE, 'utf8')) as unknown[];
+    const fake = async <T>(url: string): Promise<FetchJsonResult<T>> => {
+      const data = url.includes('/events?')
+        ? (fixture as Array<Record<string, unknown>>).map((e) => ({ id: e.id, home_team: e.home_team, away_team: e.away_team, commence_time: e.commence_time }))
+        : fixture;
+      return { data: data as T, status: 200, headers: new Headers({ 'x-requests-remaining': '500' }), durationMs: 1 };
+    };
+    const cfg = config({ ODDS_API_KEY: 'k-123456', LEAGUES: 'NBA', DEVIG_METHOD: 'multiplicative' });
+    const start = Date.parse('2026-10-28T00:00:00Z');
+    const journalFile = path.join(cfg.dataDir, 'bets.jsonl');
+    const bet = new BetJournal(journalFile).load().place({
+      opportunityId: 'odds-api:8c1f0e4a2b7d4c6e9f1a3b5c7d9e0f12|ev|moneyline|home|',
+      eventId: 'odds-api:8c1f0e4a2b7d4c6e9f1a3b5c7d9e0f12',
+      league: 'NBA',
+      eventName: 'New York Knicks @ Boston Celtics',
+      startTime: start,
+      pick: 'Boston Celtics ML',
+      kind: 'moneyline',
+      side: 'home',
+      line: null,
+      wasLive: false,
+      americanTaken: -250,
+      stake: 10,
+      fairProbAtPlace: 0.69,
+    });
+    let clock = start - 30 * MIN;
+    const app = await run(cfg, { oddsApiDeps: { fetchJson: fake as typeof fetchJson }, now: () => clock });
+    await waitFor(() => app.tick().health.quotesTracked > 0);
+
+    // The journal cannot be written when the game starts (a directory is in the file's way: EISDIR).
+    const aside = `${journalFile}.aside`;
+    fs.renameSync(journalFile, aside);
+    fs.mkdirSync(journalFile);
+    clock = start + 5 * SEC;
+    expect(app.tick().betSummary.avgClvPct).toBeNull();
+
+    // The disk recovers; the next attempt records the closing line from the price history at the start.
+    fs.rmdirSync(journalFile);
+    fs.renameSync(aside, journalFile);
+    clock = start + 40 * SEC;
+    const closing = 1 / 1.408 / (1 / 1.408 + 1 / 3.05);
+    expect(app.tick().betSummary.avgClvPct).toBeCloseTo(closing * 1.4 - 1, 9);
+    expect(new BetJournal(journalFile).load().get(bet.id)?.closingFairProb).toBeCloseTo(closing, 12);
+  });
+
+  it('warns at startup that INCLUDE_ALT_LINES does nothing with The Odds API', async () => {
+    const writes: string[] = [];
+    const spy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk: string | Uint8Array) => {
+      writes.push(String(chunk));
+      return true;
+    });
+    try {
+      const fake = (async () => ({ data: [], status: 200, headers: new Headers(), durationMs: 1 })) as unknown as typeof fetchJson;
+      await run(config({ ODDS_API_KEY: 'k-123456', LEAGUES: 'NBA', INCLUDE_ALT_LINES: 'true' }), { oddsApiDeps: { fetchJson: fake } });
+      await run(config({ INCLUDE_ALT_LINES: 'true' }, ['--demo']), { demoSeed: 1 });
+    } finally {
+      spy.mockRestore();
+    }
+    const warnings = writes.filter((w) => w.includes('INCLUDE_ALT_LINES'));
+    expect(warnings).toHaveLength(1); // live mode only; the demo feed does have alternate lines
+    expect(warnings[0]).toMatch(/main lines only/);
+  });
+
+  it('warns when ODDS_API_RESET_DAY is not the 1st (credits reset on the 1st for every account)', async () => {
+    const writes: string[] = [];
+    const spy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk: string | Uint8Array) => {
+      writes.push(String(chunk));
+      return true;
+    });
+    try {
+      const fake = (async () => ({ data: [], status: 200, headers: new Headers(), durationMs: 1 })) as unknown as typeof fetchJson;
+      await run(config({ ODDS_API_KEY: 'k-123456', LEAGUES: 'NBA' }), { oddsApiDeps: { fetchJson: fake } });
+      expect(writes.some((w) => w.includes('ODDS_API_RESET_DAY'))).toBe(false);
+      await run(config({ ODDS_API_KEY: 'k-123456', LEAGUES: 'NBA', ODDS_API_RESET_DAY: '15' }), { oddsApiDeps: { fetchJson: fake } });
+    } finally {
+      spy.mockRestore();
+    }
+    expect(writes.filter((w) => w.includes('ODDS_API_RESET_DAY=15'))).toHaveLength(1);
   });
 
   it('requires the dashboard password on everything except /healthz', async () => {

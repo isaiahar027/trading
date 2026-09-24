@@ -205,6 +205,7 @@ export class CircuitBreaker {
   private opens = 0;
   private currentCooldown: number;
   private openedUntil = 0;
+  private openedAt = 0;
   private trialInFlight = false;
   private lastErr: string | null = null;
 
@@ -215,7 +216,11 @@ export class CircuitBreaker {
   }
 
   get state(): BreakerState {
-    if (this._state === 'open' && Date.now() >= this.openedUntil) this._state = 'half-open';
+    if (this._state === 'open') {
+      const now = Date.now();
+      // A clock that stepped back more than a minute since the circuit opened would keep it open for that long too.
+      if (now >= this.openedUntil || now < this.openedAt - 60_000) this._state = 'half-open';
+    }
     return this._state;
   }
 
@@ -247,7 +252,8 @@ export class CircuitBreaker {
       const cooldown = cooldownOverrideMs ?? this.currentCooldown;
       this._state = 'open';
       this.opens++;
-      this.openedUntil = Date.now() + cooldown;
+      this.openedAt = Date.now();
+      this.openedUntil = this.openedAt + cooldown;
       this.currentCooldown = Math.min(this.opts.maxCooldownMs, Math.max(this.currentCooldown, cooldown) * 2);
     }
   }

@@ -4,7 +4,7 @@ import * as net from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
-import { DashboardServer, type ServerDeps } from '../src/server/httpServer';
+import { DashboardServer, hostAllowed, hostnameOf, type ServerDeps } from '../src/server/httpServer';
 import type { PlaceBetInput } from '../src/server/betJournal';
 import type { BetRecord, BetResult, BetSummary, DashboardState, Opportunity, RuntimeSettings } from '../src/types';
 import { setLogLevel } from '../src/util/logger';
@@ -417,6 +417,78 @@ describe('DashboardServer: health and auth', () => {
   });
 });
 
+describe('DashboardServer: Host allow-list (DNS rebinding)', () => {
+  it('refuses reads and writes addressed to a foreign name, even with a matching Origin', async () => {
+    const h = await startServer();
+    const host = `rebind.attacker.example:${h.port}`;
+    const put = await rawRequest(h.port, {
+      method: 'PUT',
+      path: '/api/settings',
+      headers: { ...JSON_HEADERS, Host: host, Origin: `http://${host}` },
+      body: JSON.stringify({ bankroll: 1_000_000, kellyMultiplier: 1 }),
+    });
+    expect(put.status).toBe(403);
+    expect(JSON.parse(put.body).error).toMatch(/ALLOWED_HOSTS/);
+    expectSecurityHeaders(put.headers);
+    expect(h.onSettingsChanged).not.toHaveBeenCalled();
+    const settings = await fetch(`${h.base}/api/settings`);
+    expect(((await settings.json()) as RuntimeSettings).bankroll).toBe(makeSettings().bankroll);
+
+    const post = await rawRequest(h.port, {
+      method: 'POST',
+      path: '/api/bets',
+      headers: { ...JSON_HEADERS, Host: host, Origin: `http://${host}` },
+      body: JSON.stringify({ opportunityId: h.opp.id, stake: 10, americanTaken: 110 }),
+    });
+    expect(post.status).toBe(403);
+    expect(h.journal.placed).toHaveLength(0);
+    for (const p of ['/api/state', '/api/bets', '/api/settings', '/', '/app.js', '/api/stream']) {
+      expect((await rawRequest(h.port, { path: p, headers: { Host: host } })).status, p).toBe(403);
+    }
+    // /healthz stays open for container health checks and uptime monitors.
+    expect((await rawRequest(h.port, { path: '/healthz', headers: { Host: host } })).status).toBe(200);
+  });
+
+  it('answers to IP addresses, localhost, the bind host and ALLOWED_HOSTS entries', async () => {
+    const h = await startServer({ host: '127.0.0.1', allowedHosts: ['odds.example.com', '*.ts.net'] });
+    const ok = [
+      `127.0.0.1:${h.port}`,
+      `localhost:${h.port}`,
+      'LOCALHOST',
+      `[::1]:${h.port}`,
+      '100.101.102.103',
+      `app.localhost:${h.port}`,
+      'odds.example.com',
+      'Odds.Example.com.:443',
+      'vps.tail1234.ts.net',
+    ];
+    for (const host of ok) expect((await rawRequest(h.port, { path: '/api/state', headers: { Host: host } })).status, host).toBe(200);
+    const bad = ['evil.example.com', 'example.com', 'odds.example.com.evil.net', 'ts.net.evil.io', `localhost.evil.io:${h.port}`, 'a b', '[nothex]:80', 'host:99999x'];
+    for (const host of bad) expect((await rawRequest(h.port, { path: '/api/state', headers: { Host: host } })).status, host).toBe(403);
+  });
+
+  it('allows a named bind host', () => {
+    expect(hostAllowed(hostnameOf('dashboard.lan:8080'), 'dashboard.lan', [])).toBe(true);
+    expect(hostAllowed(hostnameOf('dashboard.lan:8080'), '0.0.0.0', [])).toBe(false);
+    expect(hostAllowed(hostnameOf('[::1]:8080'), '::', [])).toBe(true);
+    expect(hostAllowed(hostnameOf(undefined), '127.0.0.1', [])).toBe(false);
+  });
+
+  it('rejects requests without a Host header', async () => {
+    const h = await startServer();
+    const sock = net.connect(h.port, '127.0.0.1');
+    let received = '';
+    sock.setEncoding('utf8');
+    sock.on('data', (d: string) => {
+      received += d;
+    });
+    await new Promise<void>((resolve) => sock.once('connect', () => resolve()));
+    sock.write('GET /api/state HTTP/1.0\r\n\r\n');
+    await new Promise<void>((resolve) => sock.once('close', () => resolve()));
+    expect(received).toMatch(/^HTTP\/1\.[01] 403/);
+  });
+});
+
 describe('DashboardServer: static files', () => {
   it('serves whitelisted files with correct content types and no-cache', async () => {
     const h = await startServer();
@@ -604,6 +676,76 @@ describe('DashboardServer: POST /api/bets', () => {
     expect(res.status).toBe(404);
     expect(((await res.json()) as { error: string }).error).toMatch(/not found/i);
     expect(h.journal.placed).toHaveLength(0);
+  });
+
+  it('logs a bet on a pick that expired on the server from the dashboard\'s copy of it', async () => {
+    const h = await startServer({ findOpportunity: () => undefined });
+    const snapshot = {
+      eventId: 'odds-api:e9',
+      league: 'NBA',
+      eventName: 'Lakers @ Suns',
+      startTime: 1_700_000_000_000,
+      pick: 'Suns -4.5',
+      kind: 'spread',
+      side: 'home',
+      line: -4.5,
+      isLive: true,
+      fairProb: 0.52,
+    };
+    const post = (body: unknown) => fetch(`${h.base}/api/bets`, { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify(body) });
+    const res = await post({ opportunityId: 'odds-api:e9|ev|spread|home|-4.5', stake: 25, americanTaken: 110, snapshot });
+    expect(res.status).toBe(201);
+    expect(h.journal.placed[0]).toMatchObject({
+      opportunityId: 'odds-api:e9|ev|spread|home|-4.5',
+      eventId: 'odds-api:e9',
+      pick: 'Suns -4.5',
+      line: -4.5,
+      wasLive: true,
+      stake: 25,
+      fairProbAtPlace: 0.52,
+      fromSnapshot: true,
+    });
+    // The copy must describe exactly the pick the id names.
+    for (const bad of [
+      { ...snapshot, line: -5.5 },
+      { ...snapshot, side: 'away' },
+      { ...snapshot, eventId: 'odds-api:other' },
+      { ...snapshot, fairProb: 1.2 },
+      { ...snapshot, isLive: 'yes' },
+      { ...snapshot, pick: '' },
+    ]) {
+      expect((await post({ opportunityId: 'odds-api:e9|ev|spread|home|-4.5', stake: 25, americanTaken: 110, snapshot: bad })).status).toBe(404);
+    }
+    expect(h.journal.placed).toHaveLength(1);
+  });
+
+  it('prefers the server\'s own opportunity over a client copy when it still has it', async () => {
+    const h = await startServer();
+    const res = await fetch(`${h.base}/api/bets`, {
+      method: 'POST',
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ opportunityId: h.opp.id, stake: 10, americanTaken: 110, snapshot: { ...h.opp, fairProb: 0.9 } }),
+    });
+    expect(res.status).toBe(201);
+    expect(h.journal.placed[0].fairProbAtPlace).toBe(h.opp.fairProb);
+    expect(h.journal.placed[0].fromSnapshot).toBeUndefined();
+  });
+
+  it('503 with the reason when the journal cannot be written', async () => {
+    const failing = makeJournal();
+    failing.journal.place = () => {
+      const err = new Error('Could not save bet: ENOSPC: no space left on device, write');
+      err.name = 'JournalWriteError';
+      throw err;
+    };
+    const h = await startServer({ journal: failing.journal });
+    const res = await fetch(`${h.base}/api/bets`, {
+      method: 'POST',
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ opportunityId: h.opp.id, stake: 10, americanTaken: 110 }),
+    });
+    expect(res.status).toBe(503);
+    expect(((await res.json()) as { error: string }).error).toMatch(/Could not save bet: ENOSPC/);
   });
 
   it('415 for a wrong content type, 400 for bad JSON or invalid fields', async () => {

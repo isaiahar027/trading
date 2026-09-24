@@ -9,7 +9,10 @@ import { ValidationError } from './settingsStore';
 /**
  * Append-only bet journal (JSON Lines). Every line is a complete BetRecord snapshot; the last line for an id wins.
  * place/settle/updateClosing append synchronously (with fsync) before the change is acknowledged, so a crash never
- * loses a bet the user was told was saved. load() compacts the file when superseded/corrupt lines pile up.
+ * loses a bet the user was told was saved. A failed append is rolled back (the file is truncated to its previous
+ * size), and every append starts on a fresh line, so a half-written record can never swallow the next one.
+ * load() compacts the file when superseded/corrupt lines pile up, keeping a .bak copy of the original; it refuses to
+ * start from a journal it could not read completely rather than risk rewriting it from a partial view.
  */
 
 const log = createLogger('journal');
@@ -29,6 +32,8 @@ export interface PlaceBetInput {
   stake: number;
   fairProbAtPlace: number;
   notes?: string;
+  /** The pick had expired on the server; its details come from the dashboard's copy (see BetRecord.fromSnapshot). */
+  fromSnapshot?: boolean;
 }
 
 /** Thrown when an id is not in the journal (settled bets evicted from memory also count as unknown). */
@@ -39,10 +44,51 @@ export class UnknownBetError extends Error {
   }
 }
 
+/** The file-system calls the journal makes (injectable so tests can simulate disk errors). */
+export type JournalFs = Pick<
+  typeof fs,
+  | 'openSync'
+  | 'closeSync'
+  | 'readSync'
+  | 'writeSync'
+  | 'fsyncSync'
+  | 'fstatSync'
+  | 'ftruncateSync'
+  | 'mkdirSync'
+  | 'renameSync'
+  | 'rmSync'
+  | 'copyFileSync'
+>;
+
 export interface BetJournalOptions {
   now?: () => number;
   /** Max bets held in memory (default 20 000). Oldest settled bets are evicted first; they stay on disk. */
   maxInMemory?: number;
+  /** File-system implementation (default node:fs). */
+  fs?: JournalFs;
+}
+
+/** Thrown when a record could not be written to disk (nothing changed in memory or on disk). */
+export class JournalWriteError extends Error {
+  constructor(cause: unknown) {
+    super(`Could not save bet: ${(cause as Error)?.message ?? String(cause)}`);
+    this.name = 'JournalWriteError';
+  }
+}
+
+/** Thrown by load() when the journal exists but cannot be read completely. Nothing on disk was changed. */
+export class JournalReadError extends Error {
+  readonly code: string | undefined;
+
+  constructor(file: string, cause: unknown) {
+    const code = (cause as NodeJS.ErrnoException | null)?.code;
+    super(
+      `Could not read the bet journal ${file} (${(cause as Error)?.message ?? String(cause)}). ` +
+        'Nothing was changed on disk. Check the disk / DATA_DIR volume and restart.',
+    );
+    this.name = 'JournalReadError';
+    this.code = code;
+  }
 }
 
 const DEFAULT_MAX_IN_MEMORY = 20_000;
@@ -53,6 +99,8 @@ const MAX_ID_LENGTH = 400;
 /** Lines longer than this are treated as corrupt instead of being buffered without bound. */
 const MAX_LINE_BYTES = 64 * 1024;
 const READ_CHUNK_BYTES = 64 * 1024;
+/** A failed read of the journal at startup is retried this many times before load() gives up. */
+const READ_ATTEMPTS = 3;
 
 const KINDS: readonly MarketKind[] = ['moneyline', 'spread', 'total'];
 const SIDES: readonly Side[] = ['home', 'away', 'draw', 'over', 'under'];
@@ -83,7 +131,8 @@ function parseRecord(v: unknown): BetRecord | null {
   if (!isObj(v)) return null;
   const {
     id, placedAt, opportunityId, eventId, league, eventName, startTime, pick, kind, side, line, wasLive,
-    americanTaken, decimalTaken, stake, fairProbAtPlace, evPctAtPlace, closingFairProb, result, settledAt, profit, notes,
+    americanTaken, decimalTaken, stake, fairProbAtPlace, evPctAtPlace, closingFairProb, closingApprox, fromSnapshot, result,
+    settledAt, profit, notes,
   } = v;
   if (typeof id !== 'string' || id === '' || id.length > MAX_ID_LENGTH) return null;
   if (!isFiniteNum(placedAt) || !isFiniteNum(startTime)) return null;
@@ -103,6 +152,8 @@ function parseRecord(v: unknown): BetRecord | null {
   if (settledAt !== null && !isFiniteNum(settledAt)) return null;
   if (profit !== null && !isFiniteNum(profit)) return null;
   if (notes !== undefined && typeof notes !== 'string') return null;
+  if (closingApprox !== undefined && typeof closingApprox !== 'boolean') return null;
+  if (fromSnapshot !== undefined && typeof fromSnapshot !== 'boolean') return null;
   const rec: BetRecord = {
     id,
     placedAt,
@@ -127,6 +178,8 @@ function parseRecord(v: unknown): BetRecord | null {
     profit: profit as number | null,
   };
   if (typeof notes === 'string') rec.notes = notes;
+  if (closingApprox === true && rec.closingFairProb !== null) rec.closingApprox = true;
+  if (fromSnapshot === true) rec.fromSnapshot = true;
   return rec;
 }
 
@@ -143,6 +196,13 @@ function byPlacedAt(a: BetRecord, b: BetRecord): number {
   return a.placedAt - b.placedAt;
 }
 
+interface ReadResult {
+  all: Map<string, BetRecord>;
+  lines: number;
+  corrupt: number;
+  firstCorruptLine: number;
+}
+
 /** Running totals for settled bets evicted from memory, so the summary stays exact. */
 interface Archived {
   count: number;
@@ -152,10 +212,17 @@ interface Archived {
   evSum: number;
   clvSum: number;
   clvCount: number;
+  /** Evicted bets that were eligible for a closing line but never got one. */
+  clvMissing: number;
 }
 
 function emptyArchive(): Archived {
-  return { count: 0, staked: 0, settledStake: 0, profit: 0, evSum: 0, clvSum: 0, clvCount: 0 };
+  return { count: 0, staked: 0, settledStake: 0, profit: 0, evSum: 0, clvSum: 0, clvCount: 0, clvMissing: 0 };
+}
+
+/** A pre-game, non-void bet whose game has started should have a closing line; true when it has none. */
+function missingClv(b: BetRecord, now: number): boolean {
+  return b.closingFairProb === null && !b.wasLive && b.result !== 'void' && b.startTime <= now;
 }
 
 function clvOf(b: BetRecord): number | null {
@@ -166,6 +233,7 @@ export class BetJournal {
   private readonly file: string;
   private readonly now: () => number;
   private readonly maxInMemory: number;
+  private readonly fs: JournalFs;
   /** id -> latest record, in journal (insertion) order. */
   private bets = new Map<string, BetRecord>();
   private archived: Archived = emptyArchive();
@@ -175,6 +243,7 @@ export class BetJournal {
   constructor(file: string, opts: BetJournalOptions = {}) {
     this.file = path.resolve(file);
     this.now = opts.now ?? Date.now;
+    this.fs = opts.fs ?? fs;
     const cap = opts.maxInMemory;
     this.maxInMemory = cap !== undefined && Number.isFinite(cap) && cap >= 1 ? Math.floor(cap) : DEFAULT_MAX_IN_MEMORY;
   }
@@ -182,98 +251,22 @@ export class BetJournal {
   /**
    * Reads the JSONL file. Corrupt lines are skipped (one warning with the count); the last valid line per id wins.
    * Rewrites the file compactly when it has more than 2 × bets + 50 lines. Missing file = empty journal.
+   * Throws JournalReadError (after a few retries) when the file exists but cannot be opened or read to the end: a
+   * partial view would under-count today's stakes and, if compacted, would permanently delete the unread bets.
    */
   load(): this {
-    const all = new Map<string, BetRecord>();
-    let lines = 0;
-    let corrupt = 0;
-    let firstCorruptLine = 0;
-    let endsWithNewline = true;
-    let size = 0;
-
-    let fd: number | null = null;
-    try {
-      fd = fs.openSync(this.file, 'r');
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-        log.error('could not open bet journal; starting empty in memory', { file: this.file, error: (err as Error).message });
-      }
-    }
-
-    if (fd !== null) {
+    let result: ReadResult | null = null;
+    let lastError: unknown = null;
+    for (let attempt = 1; attempt <= READ_ATTEMPTS && result === null; attempt++) {
       try {
-        const buf = Buffer.allocUnsafe(READ_CHUNK_BYTES);
-        let pending: Buffer[] = [];
-        let pendingBytes = 0;
-        let oversized = false;
-        let lineNo = 0;
-        const handleLine = (bytes: Buffer): void => {
-          lineNo++;
-          const text = bytes.toString('utf8').trim();
-          if (text === '') return;
-          lines++;
-          let rec: BetRecord | null = null;
-          try {
-            rec = parseRecord(JSON.parse(text));
-          } catch {
-            rec = null;
-          }
-          if (rec === null) {
-            corrupt++;
-            if (firstCorruptLine === 0) firstCorruptLine = lineNo;
-            return;
-          }
-          // Map#set on an existing key keeps its first-seen position, so ties on placedAt stay in journal order.
-          all.set(rec.id, rec);
-        };
-        for (;;) {
-          const n = fs.readSync(fd, buf, 0, buf.length, null);
-          if (n <= 0) break;
-          size += n;
-          endsWithNewline = buf[n - 1] === 0x0a;
-          let start = 0;
-          for (let i = 0; i < n; i++) {
-            if (buf[i] !== 0x0a) continue;
-            if (oversized) {
-              lineNo++;
-              lines++;
-              corrupt++;
-              if (firstCorruptLine === 0) firstCorruptLine = lineNo;
-              oversized = false;
-            } else {
-              pending.push(buf.subarray(start, i));
-              handleLine(Buffer.concat(pending));
-            }
-            pending = [];
-            pendingBytes = 0;
-            start = i + 1;
-          }
-          if (start < n && !oversized) {
-            const rest = Buffer.from(buf.subarray(start, n));
-            pendingBytes += rest.length;
-            if (pendingBytes > MAX_LINE_BYTES) {
-              oversized = true;
-              pending = [];
-              pendingBytes = 0;
-            } else {
-              pending.push(rest);
-            }
-          }
-        }
-        if (oversized) {
-          lineNo++;
-          lines++;
-          corrupt++;
-          if (firstCorruptLine === 0) firstCorruptLine = lineNo;
-        } else if (pendingBytes > 0) {
-          handleLine(Buffer.concat(pending));
-        }
+        result = this.readAll();
       } catch (err) {
-        log.error('error while reading bet journal; loaded what was readable', { file: this.file, error: (err as Error).message });
-      } finally {
-        fs.closeSync(fd);
+        lastError = err;
+        log.error('error while reading bet journal', { file: this.file, attempt, error: (err as Error).message });
       }
     }
+    if (result === null) throw new JournalReadError(this.file, lastError);
+    const { all, lines, corrupt, firstCorruptLine } = result;
 
     if (corrupt > 0) {
       log.warn('skipped corrupt lines in bet journal', { file: this.file, corrupt, firstCorruptLine });
@@ -282,21 +275,99 @@ export class BetJournal {
     const sorted = Array.from(all.values()).sort(byPlacedAt);
     this.lineCount = lines;
 
-    if (lines > 2 * sorted.length + 50) {
-      this.compact(sorted, corrupt > 0);
-    } else if (size > 0 && !endsWithNewline) {
-      // A crash mid-append can leave a partial last line; terminate it so the next append starts on a fresh line.
-      try {
-        fs.appendFileSync(this.file, '\n', { flush: true });
-      } catch (err) {
-        log.error('could not repair the end of the bet journal', { file: this.file, error: (err as Error).message });
-      }
-    }
+    // A crash mid-append can leave a partial last line; appendRaw() starts the next record on a fresh line.
+    if (lines > 2 * sorted.length + 50) this.compact(sorted);
 
     this.bets = new Map(sorted.map((b) => [b.id, b]));
     this.archived = emptyArchive();
     this.evictIfNeeded();
     return this;
+  }
+
+  /** Reads and parses the whole file. Missing file = empty result; any other open/read error throws. */
+  private readAll(): ReadResult {
+    const out: ReadResult = { all: new Map(), lines: 0, corrupt: 0, firstCorruptLine: 0 };
+    let fd: number;
+    try {
+      fd = this.fs.openSync(this.file, 'r');
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return out;
+      throw err;
+    }
+    try {
+      const buf = Buffer.allocUnsafe(READ_CHUNK_BYTES);
+      let pending: Buffer[] = [];
+      let pendingBytes = 0;
+      let oversized = false;
+      let lineNo = 0;
+      const markCorrupt = (): void => {
+        out.corrupt++;
+        if (out.firstCorruptLine === 0) out.firstCorruptLine = lineNo;
+      };
+      const handleLine = (bytes: Buffer): void => {
+        lineNo++;
+        const text = bytes.toString('utf8').trim();
+        if (text === '') return;
+        out.lines++;
+        let rec: BetRecord | null = null;
+        try {
+          rec = parseRecord(JSON.parse(text));
+        } catch {
+          rec = null;
+        }
+        if (rec === null) {
+          markCorrupt();
+          return;
+        }
+        // Map#set on an existing key keeps its first-seen position, so ties on placedAt stay in journal order.
+        out.all.set(rec.id, rec);
+      };
+      for (;;) {
+        const n = this.fs.readSync(fd, buf, 0, buf.length, null);
+        if (n <= 0) break;
+        let start = 0;
+        for (let i = 0; i < n; i++) {
+          if (buf[i] !== 0x0a) continue;
+          if (oversized) {
+            lineNo++;
+            out.lines++;
+            markCorrupt();
+            oversized = false;
+          } else {
+            pending.push(buf.subarray(start, i));
+            handleLine(Buffer.concat(pending));
+          }
+          pending = [];
+          pendingBytes = 0;
+          start = i + 1;
+        }
+        if (start < n && !oversized) {
+          const rest = Buffer.from(buf.subarray(start, n));
+          pendingBytes += rest.length;
+          if (pendingBytes > MAX_LINE_BYTES) {
+            oversized = true;
+            pending = [];
+            pendingBytes = 0;
+          } else {
+            pending.push(rest);
+          }
+        }
+      }
+      if (oversized) {
+        lineNo++;
+        out.lines++;
+        markCorrupt();
+      } else if (pendingBytes > 0) {
+        handleLine(Buffer.concat(pending));
+      }
+      return out;
+    } finally {
+      try {
+        this.fs.closeSync(fd);
+      } catch {
+        // nothing useful to do; the read result (or error) stands
+      }
+    }
   }
 
   /** Records a bet the user says they placed. Validates input; throws ValidationError on bad values. */
@@ -354,6 +425,7 @@ export class BetJournal {
       profit: null,
     };
     if (notes !== undefined && notes !== '') rec.notes = notes;
+    if (input.fromSnapshot === true) rec.fromSnapshot = true;
 
     this.append(rec);
     this.bets.set(rec.id, rec);
@@ -378,13 +450,18 @@ export class BetJournal {
     return { ...next };
   }
 
-  /** Stores the closing fair probability used for closing-line value. */
-  updateClosing(id: string, closingFairProb: number): BetRecord {
+  /**
+   * Stores the closing fair probability used for closing-line value. `approx` marks a probability converted from a
+   * closing line at another number.
+   */
+  updateClosing(id: string, closingFairProb: number, opts: { approx?: boolean } = {}): BetRecord {
     if (!isFiniteNum(closingFairProb) || closingFairProb <= 0 || closingFairProb >= 1) {
       throw new ValidationError('Closing fair probability must be between 0 and 1 (exclusive)');
     }
     const prev = this.require(id);
     const next: BetRecord = { ...prev, closingFairProb };
+    if (opts.approx === true) next.closingApprox = true;
+    else delete next.closingApprox;
     this.append(next);
     this.bets.set(id, next);
     return { ...next };
@@ -448,6 +525,7 @@ export class BetJournal {
     let evSum = a.evSum;
     let clvSum = a.clvSum;
     let clvCount = a.clvCount;
+    let clvMissing = a.clvMissing;
     for (const b of this.bets.values()) {
       totalBets++;
       evSum += b.evPctAtPlace;
@@ -459,6 +537,8 @@ export class BetJournal {
       if (clv !== null) {
         clvSum += clv;
         clvCount++;
+      } else if (missingClv(b, now)) {
+        clvMissing++;
       }
     }
     return {
@@ -469,6 +549,8 @@ export class BetJournal {
       roiPct: settledStake > 0 ? profit / settledStake : null,
       avgEvPct: totalBets > 0 ? evSum / totalBets : null,
       avgClvPct: clvCount > 0 ? clvSum / clvCount : null,
+      clvBets: clvCount,
+      clvMissing,
       stakedToday: this.stakedToday(now),
     };
   }
@@ -486,44 +568,97 @@ export class BetJournal {
 
   /** Synchronous, fsync'ed append of one full record. Throws (and nothing changes in memory) if the disk write fails. */
   private append(rec: BetRecord): void {
-    const line = `${JSON.stringify(rec)}\n`;
     try {
-      fs.mkdirSync(path.dirname(this.file), { recursive: true });
-      fs.appendFileSync(this.file, line, { encoding: 'utf8', mode: 0o600, flush: true });
+      this.appendRaw(Buffer.from(`${JSON.stringify(rec)}\n`, 'utf8'));
       this.lineCount++;
     } catch (err) {
       log.error('failed to write to bet journal', { file: this.file, error: (err as Error).message });
-      throw new Error(`Could not save bet: ${(err as Error).message}`);
+      throw new JournalWriteError(err);
     }
   }
 
-  /** Rewrites the file with one line per bet (atomic: tmp + fsync + rename). Keeps a .bak when lines were corrupt. */
-  private compact(sorted: BetRecord[], hadCorrupt: boolean): void {
+  /**
+   * Appends bytes all-or-nothing: starts on a fresh line when the file does not end with a newline, writes the whole
+   * buffer, fsyncs, and on any failure truncates the file back to its previous size so no partial record is left for
+   * the next append to run into (which would make both unreadable).
+   */
+  private appendRaw(data: Buffer): void {
+    const f = this.fs;
+    f.mkdirSync(path.dirname(this.file), { recursive: true });
+    const fd = f.openSync(this.file, 'a+', 0o600);
+    let sizeBefore = -1;
+    try {
+      sizeBefore = f.fstatSync(fd).size;
+      let buf = data;
+      if (sizeBefore > 0) {
+        const last = Buffer.alloc(1);
+        if (f.readSync(fd, last, 0, 1, sizeBefore - 1) === 1 && last[0] !== 0x0a) buf = Buffer.concat([Buffer.from('\n'), data]);
+      }
+      let written = 0;
+      while (written < buf.length) {
+        const n = f.writeSync(fd, buf, written, buf.length - written);
+        if (!(n > 0)) throw new Error('short write to the bet journal');
+        written += n;
+      }
+      f.fsyncSync(fd);
+    } catch (err) {
+      if (sizeBefore >= 0) {
+        try {
+          f.ftruncateSync(fd, sizeBefore);
+          f.fsyncSync(fd);
+        } catch (rollbackErr) {
+          // The next append still starts on a fresh line, so only this record's partial bytes stay behind.
+          log.error('could not roll back a failed bet journal write', { file: this.file, error: (rollbackErr as Error).message });
+        }
+      }
+      throw err;
+    } finally {
+      try {
+        f.closeSync(fd);
+      } catch {
+        // closing a descriptor we already wrote and synced cannot lose data
+      }
+    }
+  }
+
+  /**
+   * Rewrites the file with one line per bet (atomic: tmp + fsync + rename). The original is first copied to
+   * `<file>.bak`, so a compaction can always be undone by hand.
+   */
+  private compact(sorted: BetRecord[]): void {
+    const f = this.fs;
     const dir = path.dirname(this.file);
     const tmp = path.join(dir, `.${path.basename(this.file)}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`);
     try {
-      if (hadCorrupt) fs.copyFileSync(this.file, `${this.file}.bak`);
-      const fd = fs.openSync(tmp, 'w', 0o600);
+      f.copyFileSync(this.file, `${this.file}.bak`);
+      const fd = f.openSync(tmp, 'w', 0o600);
       try {
         let chunk = '';
+        const flush = (): void => {
+          const buf = Buffer.from(chunk, 'utf8');
+          let written = 0;
+          while (written < buf.length) {
+            const n = f.writeSync(fd, buf, written, buf.length - written);
+            if (!(n > 0)) throw new Error('short write while compacting the bet journal');
+            written += n;
+          }
+          chunk = '';
+        };
         for (const b of sorted) {
           chunk += `${JSON.stringify(b)}\n`;
-          if (chunk.length >= 1 << 20) {
-            fs.writeSync(fd, chunk);
-            chunk = '';
-          }
+          if (chunk.length >= 1 << 20) flush();
         }
-        if (chunk !== '') fs.writeSync(fd, chunk);
-        fs.fsyncSync(fd);
+        if (chunk !== '') flush();
+        f.fsyncSync(fd);
       } finally {
-        fs.closeSync(fd);
+        f.closeSync(fd);
       }
-      fs.renameSync(tmp, this.file);
+      f.renameSync(tmp, this.file);
       log.info('compacted bet journal', { file: this.file, linesBefore: this.lineCount, bets: sorted.length });
       this.lineCount = sorted.length;
     } catch (err) {
       try {
-        fs.rmSync(tmp, { force: true });
+        f.rmSync(tmp, { force: true });
       } catch {
         // best effort; the original journal is untouched
       }
@@ -552,6 +687,8 @@ export class BetJournal {
       if (clv !== null) {
         a.clvSum += clv;
         a.clvCount++;
+      } else if (missingClv(b, b.settledAt ?? this.now())) {
+        a.clvMissing++;
       }
       excess--;
     }

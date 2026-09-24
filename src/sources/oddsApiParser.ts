@@ -51,6 +51,13 @@ const MARKET_KINDS: ReadonlyMap<string, MarketKind> = new Map<string, MarketKind
 ]);
 
 const MAX_LINK_LENGTH = 2048;
+/**
+ * The market-level `last_update` is the last time The Odds API saw odds for that market at the bookmaker. It stops
+ * advancing while the market is suspended or closed, and the feed keeps returning the frozen price for ~15 minutes.
+ * A market whose `last_update` lags the rest of the response by more than this is treated as suspended.
+ */
+export const DEFAULT_MAX_MARKET_LAG_LIVE_MS = 90_000;
+export const DEFAULT_MAX_MARKET_LAG_PREMATCH_MS = 300_000;
 const PLACEHOLDER = /\{[^{}]*\}/;
 const HAS_STATE_PLACEHOLDER = /\{state\}/i;
 const STATE_PLACEHOLDERS = /\{state\}/gi;
@@ -154,6 +161,10 @@ function firstResolvableLink(candidates: unknown[], state: string): string | und
   return undefined;
 }
 
+function lagLimit(value: number | undefined, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
 function isNewer(candidate: Quote, existing: Quote): boolean {
   const a = candidate.bookUpdatedAt ?? Number.NEGATIVE_INFINITY;
   const b = existing.bookUpdatedAt ?? Number.NEGATIVE_INFINITY;
@@ -167,13 +178,15 @@ function isNewer(candidate: Quote, existing: Quote): boolean {
  * @param league    league the request was made for (events are attributed to it)
  * @param books     bookmaker keys to keep; empty = keep every bookmaker in the payload
  * @param fetchedAt when the response was received (epoch ms); drives observedAt and isLive
+ * @param opts      linkState fills `{state}` in deep links; maxMarketLag*Ms set when a market whose `last_update`
+ *                  stopped advancing counts as suspended (live / pre-match)
  */
 export function parseOddsResponse(
   raw: unknown,
   league: LeagueDef,
   books: string[],
   fetchedAt: number,
-  opts?: { linkState?: string },
+  opts?: { linkState?: string; maxMarketLagLiveMs?: number; maxMarketLagPrematchMs?: number },
 ): SourceSnapshot {
   if (!Array.isArray(raw)) {
     throw new Error(`Unexpected Odds API payload: expected an array of events, got ${describePayload(raw)}`);
@@ -185,6 +198,7 @@ export function parseOddsResponse(
   const seenEventIds = new Set<string>();
   const events: RawEvent[] = [];
   const quotes = new Map<string, Quote>();
+  const liveEvents = new Set<string>();
   let skipped = 0;
   let duplicates = 0;
 
@@ -202,6 +216,7 @@ export function parseOddsResponse(
       continue;
     }
     seenEventIds.add(id);
+    if (startTime <= fetchedAt) liveEvents.add(id);
     events.push({
       source: 'odds-api',
       sourceEventId: id,
@@ -304,8 +319,10 @@ export function parseOddsResponse(
     }
   }
 
-  if (skipped > 0 || duplicates > 0) {
-    log.debug(`${league.key}: skipped ${skipped} malformed item(s), merged ${duplicates} duplicate quote(s)`, {
+  const frozen = markFrozenMarkets(quotes.values(), liveEvents, fetchedAt, opts);
+
+  if (skipped > 0 || duplicates > 0 || frozen > 0) {
+    log.debug(`${league.key}: skipped ${skipped} malformed item(s), merged ${duplicates} duplicate quote(s), ${frozen} frozen price(s)`, {
       events: events.length,
       quotes: quotes.size,
     });
@@ -321,4 +338,35 @@ export function parseOddsResponse(
     complete: true,
     books: snapshotBooks,
   };
+}
+
+/**
+ * Marks quotes whose market stopped updating as suspended, so no freshness gate downstream mistakes a frozen price
+ * (a market the book pulled, still echoed by the feed) for a fresh one. The lag is measured against the newest
+ * `last_update` in the response (capped at `fetchedAt`), which keeps the check independent of clock skew between this
+ * server and the API. Returns the number of quotes marked.
+ */
+function markFrozenMarkets(
+  quotes: Iterable<Quote>,
+  liveEvents: ReadonlySet<string>,
+  fetchedAt: number,
+  opts: { maxMarketLagLiveMs?: number; maxMarketLagPrematchMs?: number } | undefined,
+): number {
+  const list = [...quotes];
+  let newest = Number.NEGATIVE_INFINITY;
+  for (const q of list) if (q.bookUpdatedAt !== null && q.bookUpdatedAt > newest) newest = q.bookUpdatedAt;
+  if (!Number.isFinite(newest)) return 0;
+  const ref = Math.min(fetchedAt, newest);
+  const liveLimit = lagLimit(opts?.maxMarketLagLiveMs, DEFAULT_MAX_MARKET_LAG_LIVE_MS);
+  const prematchLimit = lagLimit(opts?.maxMarketLagPrematchMs, DEFAULT_MAX_MARKET_LAG_PREMATCH_MS);
+  let marked = 0;
+  for (const q of list) {
+    if (q.bookUpdatedAt === null) continue;
+    const limit = liveEvents.has(q.sourceEventId) ? liveLimit : prematchLimit;
+    if (ref - q.bookUpdatedAt > limit) {
+      q.suspended = true;
+      marked++;
+    }
+  }
+  return marked;
 }

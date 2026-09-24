@@ -128,7 +128,8 @@ describe('parseOddsResponse — NBA fixture', () => {
     const snap = nba();
     for (const q of snap.quotes) {
       expect(q.source).toBe('odds-api');
-      expect(q.suspended).toBe(false);
+      // DraftKings' Lakers market last updated 23:24:00, 6 min behind the rest of the response: frozen (see below).
+      expect(q.suspended).toBe(q.sourceEventId === LAKERS && q.book === 'draftkings');
       expect(q.isMainLine).toBe(true);
       expect(q.observedAt).toBe(NBA_FETCHED_AT);
     }
@@ -359,6 +360,78 @@ describe('parseOddsResponse — edge cases', () => {
   it('does not accept a draw in a spread market', () => {
     const raw = [event([{ key: 'pinnacle', markets: [{ key: 'spreads', outcomes: [{ name: 'Draw', price: 3.5, point: 0 }] }] }])];
     expect(parseOddsResponse(raw, EPL, [], T0).quotes).toHaveLength(0);
+  });
+});
+
+describe('parseOddsResponse — frozen (suspended) markets', () => {
+  const FETCHED = Date.parse('2026-10-27T20:00:00Z');
+  const iso = (msBefore: number): string => new Date(FETCHED - msBefore).toISOString();
+
+  function h2h(book: string, updatedMsAgo: number, home: number, away: number): Record<string, unknown> {
+    return {
+      key: book,
+      title: book,
+      markets: [
+        {
+          key: 'h2h',
+          last_update: iso(updatedMsAgo),
+          outcomes: [
+            { name: 'Boston Celtics', price: home },
+            { name: 'New York Knicks', price: away },
+          ],
+        },
+      ],
+    };
+  }
+
+  function game(bookmakers: unknown[], live: boolean): Record<string, unknown> {
+    return {
+      id: 'evt1',
+      sport_key: 'basketball_nba',
+      commence_time: new Date(FETCHED + (live ? -3_600_000 : 3 * 3_600_000)).toISOString(),
+      home_team: 'Boston Celtics',
+      away_team: 'New York Knicks',
+      bookmakers,
+    };
+  }
+
+  const dk = (snap: SourceSnapshot): Quote => one(snap, { book: 'draftkings', side: 'home' });
+  const pin = (snap: SourceSnapshot): Quote => one(snap, { book: 'pinnacle', side: 'home' });
+
+  it('marks a live market whose last_update stopped advancing as suspended', () => {
+    // DraftKings pulled the moneyline 9 minutes ago; the feed still echoes 1.80. Pinnacle is current.
+    const snap = parseOddsResponse([game([h2h('pinnacle', 5_000, 1.4, 3.15), h2h('draftkings', 540_000, 1.8, 2.05)], true)], NBA, [], FETCHED);
+    expect(dk(snap).suspended).toBe(true);
+    expect(pin(snap).suspended).toBe(false);
+    // Just inside the 90 s live limit it is still a normal price.
+    const ok = parseOddsResponse([game([h2h('pinnacle', 5_000, 1.4, 3.15), h2h('draftkings', 80_000, 1.8, 2.05)], true)], NBA, [], FETCHED);
+    expect(dk(ok).suspended).toBe(false);
+  });
+
+  it('uses a longer limit pre-match (and honours configured limits)', () => {
+    const raw = [game([h2h('pinnacle', 5_000, 1.4, 3.15), h2h('draftkings', 240_000, 1.8, 2.05)], false)];
+    expect(dk(parseOddsResponse(raw, NBA, [], FETCHED)).suspended).toBe(false);
+    const frozen = [game([h2h('pinnacle', 5_000, 1.4, 3.15), h2h('draftkings', 480_000, 1.8, 2.05)], false)];
+    expect(dk(parseOddsResponse(frozen, NBA, [], FETCHED)).suspended).toBe(true);
+    expect(dk(parseOddsResponse(raw, NBA, [], FETCHED, { maxMarketLagPrematchMs: 120_000 })).suspended).toBe(true);
+  });
+
+  it('measures the lag against the newest market in the response, so clock skew does not freeze everything', () => {
+    // This server's clock runs 10 minutes ahead of the API: every last_update looks 10+ minutes old against fetchedAt.
+    const skew = 600_000;
+    const raw = [game([h2h('pinnacle', skew + 5_000, 1.4, 3.15), h2h('draftkings', skew + 20_000, 1.8, 2.05)], true)];
+    const snap = parseOddsResponse(raw, NBA, [], FETCHED);
+    expect(dk(snap).suspended).toBe(false);
+    expect(pin(snap).suspended).toBe(false);
+  });
+
+  it('leaves quotes without any last_update alone', () => {
+    const noTimes = game(
+      [{ key: 'draftkings', markets: [{ key: 'h2h', outcomes: [{ name: 'Boston Celtics', price: 1.8 }, { name: 'New York Knicks', price: 2.05 }] }] }],
+      true,
+    );
+    const snap = parseOddsResponse([noTimes, { ...game([h2h('pinnacle', 1_000, 1.4, 3.15)], true), id: 'evt2' }], NBA, [], FETCHED);
+    expect(one(snap, { book: 'draftkings', side: 'home' }).suspended).toBe(false);
   });
 });
 

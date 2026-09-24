@@ -38,7 +38,9 @@ export type OddsApiErrorKind =
   | 'rate-limited'
   | 'network'
   | 'circuit-open'
-  | 'bad-payload';
+  | 'bad-payload'
+  /** The API rejected the request itself (e.g. INVALID_MARKET, INVALID_BOOKMAKERS): a configuration problem. */
+  | 'bad-request';
 
 export class OddsApiError extends Error {
   readonly kind: OddsApiErrorKind;
@@ -63,6 +65,10 @@ const INVALID_KEY_COOLDOWN_MS = 30 * 60_000;
 const QUOTA_COOLDOWN_MS = 60 * 60_000;
 const MAX_RATE_LIMIT_COOLDOWN_MS = 10 * 60_000;
 const QUOTA_BODY = /quota|usage limit|usage credits|out_of_usage/i;
+/** A rejected request (bad market, bookmaker or date parameter) is a config error: retry rarely until it is fixed. */
+const BAD_REQUEST_COOLDOWN_MS = 10 * 60_000;
+/** Error codes that mean "this sport key is not available", i.e. the league (not the request) is the problem. */
+const SPORT_UNAVAILABLE_CODES = new Set(['UNKNOWN_SPORT', 'INVALID_SPORT', 'EVENT_NOT_FOUND']);
 const MAX_EVENT_SUMMARIES = 2000;
 
 interface HeaderReader {
@@ -101,6 +107,12 @@ function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
 
+/** The Odds API `error_code` (e.g. "INVALID_MARKET") from an error body, when present. */
+function apiErrorCode(body: string): string | null {
+  const m = /"error_code"\s*:\s*"([A-Za-z0-9_]{1,64})"/.exec(body);
+  return m ? m[1].toUpperCase() : null;
+}
+
 function errorMessage(err: unknown): string {
   if (err instanceof Error) return err.message;
   return typeof err === 'string' ? err : 'unknown error';
@@ -118,6 +130,8 @@ export class OddsApiClient {
   private consecutiveFailures = 0;
   private invalidKey = false;
   private quotaExhausted = false;
+  /** The API rejected our request parameters (cleared by the next successful odds call). */
+  private badRequest = false;
 
   constructor(cfg: AppConfig['oddsApi'], deps: OddsApiClientDeps = {}) {
     this.cfg = cfg;
@@ -146,7 +160,13 @@ export class OddsApiClient {
       consecutiveFailures: this.consecutiveFailures,
     };
     if (!this.enabled) {
-      return { ...base, status: 'disabled', detail: 'No ODDS_API_KEY set, so live odds are off (npm run demo shows simulated data)' };
+      return {
+        ...base,
+        status: 'disabled',
+        detail:
+          'No ODDS_API_KEY set, so live odds are off. Add it to .env, then run `docker compose up -d` (Docker) or restart ' +
+          '`npm start`. Simulated odds: DEMO_MODE=true (Docker) or `npm run demo`.',
+      };
     }
 
     const breaker = this.breaker.snapshot();
@@ -155,7 +175,7 @@ export class OddsApiClient {
     const lowCredits = remaining !== null && remaining > 0 && remaining <= this.cfg.reserveCredits;
 
     let status: SourceStatus = 'ok';
-    if (breaker.state === 'open' || this.invalidKey || exhausted) status = 'down';
+    if (breaker.state === 'open' || this.invalidKey || exhausted || this.badRequest) status = 'down';
     else if (this.consecutiveFailures > 0 || breaker.state === 'half-open' || lowCredits) status = 'degraded';
 
     const parts: string[] = [];
@@ -164,6 +184,7 @@ export class OddsApiClient {
     if (last !== null) parts.push(`last call cost ${last}`);
     parts.push(`${this.costPerOddsCall()} credits per odds call`);
     if (this.invalidKey) parts.push('API key rejected, check ODDS_API_KEY');
+    if (this.badRequest) parts.push('request rejected by the API, check ODDS_API_MARKETS / ODDS_API_BOOKS (see the error below)');
     if (exhausted) parts.push('monthly credits exhausted');
     else if (lowCredits) parts.push(`credits at or below the ${this.cfg.reserveCredits} reserve`);
     if (breaker.state === 'open' && breaker.nextAttemptAt !== null) {
@@ -187,11 +208,15 @@ export class OddsApiClient {
     const res = await this.call(url, league, signal);
     let snapshot: SourceSnapshot;
     try {
-      snapshot = parseOddsResponse(res.data, league, this.cfg.books, this.now(), { linkState: this.cfg.linkState });
+      snapshot = parseOddsResponse(res.data, league, this.cfg.books, this.now(), {
+        linkState: this.cfg.linkState,
+        maxMarketLagLiveMs: this.cfg.maxMarketLagLiveSec * 1000,
+        maxMarketLagPrematchMs: this.cfg.maxMarketLagPrematchSec * 1000,
+      });
     } catch (err) {
       throw this.failure(new OddsApiError('bad-payload', `${league.key} odds: ${this.sanitize(errorMessage(err))}`, res.status));
     }
-    this.succeeded();
+    this.succeeded('odds');
     log.debug(`${league.key}: ${snapshot.events.length} events, ${snapshot.quotes.length} quotes`, {
       ms: res.durationMs,
       creditsRemaining: this._usage.remaining,
@@ -226,7 +251,7 @@ export class OddsApiClient {
       seen.add(id);
       out.push({ id, league: league.key, home: home.trim(), away: away.trim(), startTime });
     }
-    this.succeeded();
+    this.succeeded('events');
     return out;
   }
 
@@ -295,12 +320,29 @@ export class OddsApiClient {
         return this.failure(new OddsApiError('rate-limited', `The Odds API rate limit was hit (HTTP 429)${suffix}`, status), cooldown);
       }
       if (status === 400 || status === 404 || status === 422) {
-        // The API answered: the league is out of season or the sport is unknown. Not a breaker failure.
-        this.breaker.recordSuccess();
-        this.consecutiveFailures = 0;
-        const e = new OddsApiError('unavailable', `${what} is unavailable on The Odds API (HTTP ${status})${suffix}`, status);
-        log.info(e.message);
-        return e;
+        const code = apiErrorCode(err.bodySnippet);
+        const sportProblem =
+          code !== null ? SPORT_UNAVAILABLE_CODES.has(code) : status === 404 || /\bsport\b/i.test(err.bodySnippet);
+        if (sportProblem) {
+          // The API answered: this league's sport key is unknown or not offered right now. Not a breaker failure.
+          this.breaker.recordSuccess();
+          this.consecutiveFailures = 0;
+          const e = new OddsApiError('unavailable', `${what} is unavailable on The Odds API (HTTP ${status})${suffix}`, status);
+          log.info(e.message);
+          return e;
+        }
+        // The request itself was rejected (INVALID_MARKET, INVALID_BOOKMAKERS, ...). That affects every league, so it
+        // is reported as a failure with the API's reason instead of blaming (and skipping) the league.
+        this.badRequest = true;
+        return this.failure(
+          new OddsApiError(
+            'bad-request',
+            `The Odds API rejected the request for ${what} (HTTP ${status}${code ? ` ${code}` : ''})${suffix}. ` +
+              'Check ODDS_API_MARKETS (only h2h, spreads, totals) and ODDS_API_BOOKS in .env.',
+            status,
+          ),
+          BAD_REQUEST_COOLDOWN_MS,
+        );
       }
       return this.failure(new OddsApiError('network', `The Odds API request for ${what} failed (HTTP ${status})${suffix}`, status));
     }
@@ -327,11 +369,13 @@ export class OddsApiClient {
     return e;
   }
 
-  private succeeded(): void {
+  /** `odds` = an odds call succeeded (only that proves the market/bookmaker parameters are accepted). */
+  private succeeded(what: 'odds' | 'events'): void {
     this.breaker.recordSuccess();
     this.lastSuccess = this.now();
     this.consecutiveFailures = 0;
     this.invalidKey = false;
+    if (what === 'odds') this.badRequest = false;
     if (this._usage.remaining === null || this._usage.remaining > 0) this.quotaExhausted = false;
   }
 

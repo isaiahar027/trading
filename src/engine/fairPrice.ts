@@ -7,7 +7,7 @@
  *
  * A book's market is usable only when it has every required side (and no side that does not belong to the market,
  * e.g. a draw price in a two-way moneyline), none of them suspended, every price valid, and every quote observed
- * within `maxAgeMs` of `now`.
+ * within `maxAgeMs` before `now` (and not after it: a future observation means the clock stepped back).
  */
 import type { DevigMethod } from '../config';
 import type { MarketKind, Side } from '../types';
@@ -112,8 +112,19 @@ export function groupQuotes(quotes: StoredQuote[]): MarketGroup[] {
   return [...groups.values()];
 }
 
+/**
+ * Observations more than this far after `now` mean the wall clock stepped backwards since they were taken: their age
+ * is unknown, so they are not treated as fresh.
+ */
+const FUTURE_SKEW_MS = 5_000;
+
 /** The required-side quotes (in `sides` order) when the book's market is usable, else null. */
-function usableQuotes(outcomes: BookOutcomes | undefined, sides: Side[], minObservedAt: number): StoredQuote[] | null {
+function usableQuotes(
+  outcomes: BookOutcomes | undefined,
+  sides: Side[],
+  minObservedAt: number,
+  maxObservedAt: number,
+): StoredQuote[] | null {
   if (!outcomes) return null;
   for (const side of outcomes.keys()) {
     if (!sides.includes(side)) return null;
@@ -122,7 +133,7 @@ function usableQuotes(outcomes: BookOutcomes | undefined, sides: Side[], minObse
   for (const side of sides) {
     const q = outcomes.get(side);
     if (!q || q.suspended) return null;
-    if (!(q.observedAt >= minObservedAt)) return null;
+    if (!(q.observedAt >= minObservedAt && q.observedAt <= maxObservedAt)) return null;
     if (typeof q.decimal !== 'number' || !Number.isFinite(q.decimal) || q.decimal <= 1) return null;
     out.push(q);
   }
@@ -172,6 +183,7 @@ export function fairForGroup(group: MarketGroup, opts: FairOptions): FairResult 
   const sides = requiredSides(group.kind, opts.threeWay);
   const excluded = new Set((opts.excludeBooks ?? []).map((b) => b.toLowerCase()));
   const minObservedAt = opts.now - opts.maxAgeMs;
+  const maxObservedAt = opts.now + FUTURE_SKEW_MS;
 
   // 1. First usable sharp book in priority order.
   const tried = new Set<string>();
@@ -182,7 +194,7 @@ export function fairForGroup(group: MarketGroup, opts: FairOptions): FairResult 
     const found = findBook(group, name);
     if (!found) continue;
     const [book, outcomes] = found;
-    const used = usableQuotes(outcomes, sides, minObservedAt);
+    const used = usableQuotes(outcomes, sides, minObservedAt, maxObservedAt);
     if (!used) continue;
     const probs = safeDevig(used, opts.method);
     if (!probs) continue;
@@ -211,7 +223,7 @@ export function fairForGroup(group: MarketGroup, opts: FairOptions): FairResult 
   let count = 0;
   for (const [book, outcomes] of group.books) {
     if (excluded.has(book.toLowerCase())) continue;
-    const used = usableQuotes(outcomes, sides, minObservedAt);
+    const used = usableQuotes(outcomes, sides, minObservedAt, maxObservedAt);
     if (!used) continue;
     const probs = safeDevig(used, opts.method);
     if (!probs) continue;

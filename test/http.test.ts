@@ -470,4 +470,12 @@ describe('CircuitBreaker', () => {
     b.recordSuccess();
     expect(b.snapshot().lastError).toBeNull();
   });
+  it('does not stay open for the length of a backwards clock step', () => {
+    const b = make();
+    for (let i = 0; i < 3; i++) b.recordFailure(new Error('down'));
+    expect(b.state).toBe('open');
+    now -= 3_600_000; // NTP step / VM snapshot restore: the wall clock goes back an hour
+    expect(b.state).toBe('half-open');
+    expect(b.canRequest()).toBe(true);
+  });
 });

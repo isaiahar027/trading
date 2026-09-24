@@ -316,13 +316,13 @@ describe('OddsApiClient — error mapping', () => {
     await expectKind(c.fetchOdds(NBA), 'quota', 429);
   });
 
-  it('404 and 422 -> unavailable and never trip the breaker', async () => {
+  it('unknown sport (404, UNKNOWN_SPORT / INVALID_SPORT) -> unavailable and never trips the breaker', async () => {
     const { c, calls } = client([
       { error: httpError(422, '{"message":"Invalid sport"}') },
       { error: httpError(404, '{"message":"Unknown sport"}') },
-      { error: httpError(422, '') },
+      { error: httpError(404, '{"message":"Sport not found","error_code":"UNKNOWN_SPORT"}') },
       { error: httpError(404, '') },
-      { error: httpError(422, '') },
+      { error: httpError(422, '{"message":"x","error_code":"INVALID_SPORT"}') },
       { error: httpError(404, '') },
       { data: [] },
     ]);
@@ -336,12 +336,44 @@ describe('OddsApiClient — error mapping', () => {
     expect(calls).toHaveLength(7);
   });
 
+  it('request validation errors (INVALID_MARKET, ...) -> bad-request with the API reason, not "league unavailable"', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(NOW);
+    const body = '{"message":"Markets not supported by this endpoint: alternate_spreads","error_code":"INVALID_MARKET"}';
+    const { c, calls } = client([{ error: httpError(422, body) }, { data: [] }, { data: [] }]);
+    const e = await expectKind(c.fetchOdds(NBA), 'bad-request', 422);
+    expect(e.message).toMatch(/INVALID_MARKET/);
+    expect(e.message).toMatch(/ODDS_API_MARKETS/);
+    const h = c.health();
+    expect(h.status).toBe('down');
+    expect(h.lastError).toMatch(/INVALID_MARKET/);
+    expect(h.consecutiveFailures).toBe(1);
+    expect(h.detail).toMatch(/ODDS_API_MARKETS/);
+    // It pauses requests for a while instead of hammering the API with a request it will reject again.
+    await expectKind(c.fetchOdds(EPL), 'circuit-open');
+    expect(calls).toHaveLength(1);
+    vi.setSystemTime(NOW + 10 * 60_000 + 1);
+    await c.fetchEvents(NBA); // an events call does not prove the odds parameters are fixed
+    expect(c.health().status).toBe('down');
+    await c.fetchOdds(NBA);
+    expect(c.health().status).toBe('ok');
+  });
+
+  it('a 400/422 without a recognisable sport error is a bad request too', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(NOW);
+    const { c } = client([{ error: httpError(422, '') }, { error: httpError(400, '{"message":"Invalid bookmakers","error_code":"INVALID_BOOKMAKERS"}') }]);
+    await expectKind(c.fetchOdds(NBA), 'bad-request', 422);
+    vi.setSystemTime(NOW + 11 * 60_000);
+    await expectKind(c.fetchOdds(NBA), 'bad-request', 400);
+  });
+
   it('unavailable clears a failure streak because the API answered', async () => {
-    const { c } = client([{ error: httpError(503, 'down') }, { error: httpError(503, 'down') }, { error: httpError(422, '') }]);
+    const { c } = client([{ error: httpError(503, 'down') }, { error: httpError(503, 'down') }, { error: httpError(404, '') }]);
     await expectKind(c.fetchOdds(NBA), 'network');
     await expectKind(c.fetchOdds(NBA), 'network');
     expect(c.health().consecutiveFailures).toBe(2);
-    await expectKind(c.fetchOdds(NBA), 'unavailable', 422);
+    await expectKind(c.fetchOdds(NBA), 'unavailable', 404);
     expect(c.health().consecutiveFailures).toBe(0);
   });
 
@@ -526,11 +558,13 @@ describe('OddsApiClient — never leaks the API key', () => {
       const { c } = client([
         { data: fixture('oddsapi-nba.json'), headers: usageHeaders(100, 1, 3) },
         { error: new TypeError(`fetch failed ${API_KEY}`) },
-        { error: httpError(422, `bad ${API_KEY}`) },
+        { error: httpError(404, `bad ${API_KEY}`) },
+        { error: httpError(422, `{"error_code":"INVALID_MARKET","message":"bad ${API_KEY}"}`) },
       ]);
       await c.fetchOdds(NBA);
       await expectKind(c.fetchOdds(NBA), 'network');
       await expectKind(c.fetchOdds(EPL), 'unavailable');
+      await expectKind(c.fetchOdds(EPL), 'bad-request');
     } finally {
       setLogLevel('error');
       out.mockRestore();

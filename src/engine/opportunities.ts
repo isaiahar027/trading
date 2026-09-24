@@ -7,7 +7,8 @@
  *   - confidence (reference quality, freshness, live noise, longshot noise, feed desync),
  *   - verdict (BET_NOW / BET / WATCH), urgency and a rough expiry,
  *   - suggested stake (fractional Kelly with caps) and the worst price still worth taking,
- *   - stale-line flag when the sharp book moved recently and DraftKings has not followed.
+ *   - stale-line flag when the sharp book's no-vig price moved towards the pick recently and DraftKings has not
+ *     changed its price since that move began.
  * Optionally it also reports two/three-way arbitrage between a DraftKings price and the best prices at other
  * (non-reference) books.
  *
@@ -30,6 +31,7 @@ import type {
 } from '../types';
 import { createLogger } from '../util/logger';
 import { decimalToAmerican, formatAmerican } from '../util/odds';
+import { devig } from './devig';
 import { fairForGroup, groupQuotes, requiredSides } from './fairPrice';
 import type { FairOptions, FairResult, MarketGroup } from './fairPrice';
 import { suggestStake } from './kelly';
@@ -52,9 +54,13 @@ const DK = 'draftkings';
 const MAX_EVENT_AGE_MS = 6 * 60 * 60_000;
 /** DraftKings repricing this long after the reference last moved means the reference may be lagging. */
 const DESYNC_MS = 10_000;
-/** DraftKings must have last changed at least this long before the sharp move to count as stale. */
+/** DraftKings must have last changed at least this long before the sharp move began to count as stale. */
 const STALE_LAG_MS = 5_000;
+/** Fair prices at or above this decimal (win probability 25% or less) are longshots: noisier, lower confidence. */
+const LONGSHOT_FAIR_DECIMAL = 4;
 const MIN_BET_CONFIDENCE = 0.5;
+/** Timestamps up to this far in the future are clock jitter; beyond it the clock stepped back (see ageMs). */
+const FUTURE_SKEW_MS = 5_000;
 const MIN_ARB_PROFIT = 0.005;
 const ARB_BASE_CONFIDENCE = 0.95;
 const WATCH_URGENCY_CAP = 40;
@@ -152,8 +158,13 @@ function clamp(x: number, lo: number, hi: number): number {
   return x < lo ? lo : x > hi ? hi : x;
 }
 
+/**
+ * Age of a timestamp taken on this server's clock. A timestamp more than a few seconds in the future means the wall
+ * clock stepped backwards since it was taken: its real age is unknown, so it counts as too old (never as 0 s old).
+ */
 function ageMs(now: number, at: number): number {
-  return Number.isFinite(at) ? Math.max(0, now - at) : Number.POSITIVE_INFINITY;
+  if (!Number.isFinite(at) || at - now > FUTURE_SKEW_MS) return Number.POSITIVE_INFINITY;
+  return Math.max(0, now - at);
 }
 
 function ageSec(now: number, at: number): number {
@@ -260,6 +271,8 @@ interface EventFrame {
    * thin margin every +EV DraftKings price would also show up as a "DraftKings vs Pinnacle arb".
    */
   arbExcludedBooks: Set<string>;
+  /** Soccer-style three-way moneyline (home / draw / away) in this league. */
+  threeWay: boolean;
 }
 
 /** An EV opportunity whose reasons are finalised once every pick of the event is known (correlation note). */
@@ -302,8 +315,9 @@ function evaluateEvent(
     maxDkAgeMs: (live ? model.liveMaxDkAgeSec : model.prematchMaxDkAgeSec) * 1000,
     minEv: live ? settings.minEvLive : settings.minEvPrematch,
     arbExcludedBooks: new Set([DK, ...ctx.sharpBooks.map((b) => b.toLowerCase())]),
+    threeWay: league?.threeWay === true,
   };
-  const threeWay = league?.threeWay === true;
+  const threeWay = frame.threeWay;
   const fairOpts: FairOptions = {
     sharpBooks: ctx.sharpBooks,
     excludeBooks: [DK],
@@ -335,7 +349,7 @@ function evaluateEvent(
     if (settings.showArbs) {
       const sides = requiredSides(group.kind, threeWay);
       for (const dk of candidates) {
-        const arb = arbOpportunity(frame, group, sides, dk);
+        const arb = arbOpportunity(frame, group, sides, dk, fair);
         if (arb) out.push(arb);
       }
     }
@@ -355,7 +369,7 @@ function isUsableDkQuote(q: StoredQuote, frame: EventFrame): boolean {
 }
 
 function evDraft(frame: EventFrame, group: MarketGroup, fair: FairResult, dk: StoredQuote): EvDraft | null {
-  const { ctx, event, live, store, minEv } = frame;
+  const { ctx, event, live, minEv } = frame;
   const { settings, model, now } = ctx;
   const side = dk.side;
   const p = fair.probs[side];
@@ -368,23 +382,16 @@ function evDraft(frame: EventFrame, group: MarketGroup, fair: FairResult, dk: St
   const desync = dk.lastChangeAt > fair.lastChangeAt + DESYNC_MS;
   const forcedWatch = desync && live;
 
-  // 5. Stale line: the sharp book moved towards our side recently and DraftKings has not followed.
+  // 5. Stale line: the sharp book's no-vig price moved towards our side recently and DraftKings has not changed since.
+  const stale = fair.sharpQuotes ? staleSignal(frame, group.kind, fair, side) : null;
   let staleLine = false;
   let staleText: string | null = null;
-  const sharpQuote = fair.sharpQuotes ? fair.sharpQuotes[side] : undefined;
-  if (sharpQuote) {
-    const sharpThen = store.priceAt(sharpQuote, now - model.staleWindowSec * 1000);
-    const sharpNow = sharpQuote.decimal;
-    if (sharpThen !== null && sharpThen > 1 && sharpNow > 1) {
-      const moveProb = 1 / sharpNow - 1 / sharpThen;
-      if (moveProb >= model.staleMoveProb && dk.lastChangeAt <= sharpQuote.lastChangeAt - STALE_LAG_MS) {
-        staleLine = true;
-        const ago = Math.max(1, ageSec(now, sharpQuote.lastChangeAt));
-        staleText =
-          `${bookName(sharpQuote.book)} moved ${fmtDecimalAsAmerican(sharpThen)} → ${fmtDecimalAsAmerican(sharpNow)} ` +
-          `in the last ${ago}s; DraftKings still ${fmtDecimalAsAmerican(d)}`;
-      }
-    }
+  if (stale && stale.moveProb >= model.staleMoveProb && dk.lastChangeAt <= stale.moveStart - STALE_LAG_MS) {
+    staleLine = true;
+    const ago = Math.max(1, ageSec(now, stale.moveStart));
+    staleText =
+      `${bookName(stale.book)} moved ${fmtDecimalAsAmerican(stale.priceThen)} → ${fmtDecimalAsAmerican(stale.priceNow)} ` +
+      `in the last ${ago}s; DraftKings still ${fmtDecimalAsAmerican(d)}`;
   }
 
   // 6. Confidence.
@@ -398,7 +405,9 @@ function evDraft(frame: EventFrame, group: MarketGroup, fair: FairResult, dk: St
   const sharpAgeMs = ageMs(now, fair.observedAt);
   const ageFraction = frame.maxSharpAgeMs > 0 ? clamp(sharpAgeMs / frame.maxSharpAgeMs, 0, 1) : 1;
   confidence *= 1 - 0.3 * ageFraction;
-  if (d > 4) confidence *= 0.85;
+  // Longshot noise depends on the pick, not on the price being judged: a better DraftKings price must never lower the
+  // confidence (the verdict has to stay monotonic in the price the card tells the user to accept).
+  if (1 / p >= LONGSHOT_FAIR_DECIMAL) confidence *= 0.85;
   if (desync && !live) confidence *= 0.85;
   confidence = clamp(Number.isFinite(confidence) ? confidence : 0.1, 0.1, 1);
 
@@ -526,6 +535,63 @@ function evDraft(frame: EventFrame, group: MarketGroup, fair: FairResult, dk: St
   return { opp, evLine, refLine, signal, action };
 }
 
+interface StaleSignal {
+  book: string;
+  /** Change of the pick's no-vig probability at the sharp book over the stale window (positive = towards the pick). */
+  moveProb: number;
+  /** When the sharp market first changed inside the window (the move DraftKings must not have followed). */
+  moveStart: number;
+  priceThen: number;
+  priceNow: number;
+}
+
+/**
+ * Re-prices the single sharp book's market as it stood `staleWindowSec` ago (every required side, de-vigged with the
+ * same method as now) and compares the pick's no-vig probability then and now. Comparing raw implied probabilities
+ * would count a wider margin (both sides' implied probabilities rise) as steam. Null when the history does not reach
+ * back far enough for every side.
+ */
+function staleSignal(frame: EventFrame, kind: MarketKind, fair: FairResult, side: Side): StaleSignal | null {
+  const { store, ctx } = frame;
+  const sharp = fair.sharpQuotes;
+  const pNow = fair.probs[side];
+  const quote = sharp ? sharp[side] : undefined;
+  if (!sharp || !quote || typeof pNow !== 'number') return null;
+  const windowStart = ctx.now - ctx.model.staleWindowSec * 1000;
+  const sides = requiredSides(kind, frame.threeWay);
+  const then: number[] = [];
+  let moveStart = Number.POSITIVE_INFINITY;
+  for (const s of sides) {
+    const q = sharp[s];
+    if (!q) return null;
+    const price = store.priceAt(q, windowStart);
+    if (price === null || !(price > 1)) return null;
+    then.push(price);
+    for (const point of q.history) {
+      if (point.t > windowStart) {
+        if (point.t < moveStart) moveStart = point.t;
+        break;
+      }
+    }
+  }
+  if (!Number.isFinite(moveStart)) return null; // the sharp market did not change inside the window
+  let probsThen: number[];
+  try {
+    probsThen = devig(then, ctx.model.devigMethod);
+  } catch {
+    return null;
+  }
+  const pThen = probsThen[sides.indexOf(side)];
+  if (!(typeof pThen === 'number' && pThen > 0 && pThen < 1)) return null;
+  return {
+    book: quote.book,
+    moveProb: pNow - pThen,
+    moveStart,
+    priceThen: then[sides.indexOf(side)],
+    priceNow: quote.decimal,
+  };
+}
+
 /** Adds the correlation note (a higher-EV actionable pick exists on the same event) and assembles reasons. */
 function finaliseDraft(draft: EvDraft, all: EvDraft[]): Opportunity {
   const self = draft.opp;
@@ -556,7 +622,13 @@ function isUsableArbLeg(q: StoredQuote, frame: EventFrame): boolean {
   return true;
 }
 
-function arbOpportunity(frame: EventFrame, group: MarketGroup, sides: Side[], dk: StoredQuote): Opportunity | null {
+function arbOpportunity(
+  frame: EventFrame,
+  group: MarketGroup,
+  sides: Side[],
+  dk: StoredQuote,
+  fair: FairResult | null,
+): Opportunity | null {
   const { ctx, event, live } = frame;
   const { settings, model, now } = ctx;
   const s = dk.side;
@@ -599,7 +671,11 @@ function arbOpportunity(frame: EventFrame, group: MarketGroup, sides: Side[], dk
   }));
   const dkLeg = legs[0];
 
-  const fairProb = 1 / dk.decimal / booksum;
+  // fairProb is the pick's win probability (what "I placed it" journals as the EV at placement), so it comes from the
+  // reference no-vig price. The arb's leg weight (1/d)/S is not a probability: it would book the whole arb profit as
+  // the DraftKings leg's EV. Without a reference, claim no edge on the leg alone (break-even at the DraftKings price).
+  const refProb = fair ? fair.probs[s] : undefined;
+  const fairProb = typeof refProb === 'number' && refProb > 0 && refProb < 1 ? refProb : 1 / dk.decimal;
   const fairDecimal = 1 / fairProb;
   const othersSum = booksum - 1 / dk.decimal;
   const minDkInverse = 1 / (1 + MIN_ARB_PROFIT) - othersSum;
@@ -707,7 +783,20 @@ export class OpportunityTracker {
     for (const c of Array.isArray(candidates) ? candidates : []) {
       if (!c || typeof c.id !== 'string' || next.has(c.id)) continue;
       const existing = this.items.get(c.id);
-      next.set(c.id, { ...c, firstSeen: existing ? existing.firstSeen : now, lastSeen: now, status: 'active' });
+      const item: Opportunity = { ...c, firstSeen: existing ? existing.firstSeen : now, lastSeen: now, status: 'active' };
+      delete item.actionableSince;
+      if (c.verdict !== 'WATCH') {
+        // The price window (expiresInSec) starts when the pick became actionable, not when it was first seen: a pick
+        // that sat on the watch list for a minute must not arrive as BET NOW with its countdown already expired.
+        const continuing =
+          existing !== undefined &&
+          existing.status === 'active' &&
+          existing.verdict === c.verdict &&
+          existing.actionableSince !== undefined &&
+          (existing.staleLine || !c.staleLine);
+        item.actionableSince = continuing ? existing.actionableSince : now;
+      }
+      next.set(c.id, item);
     }
     for (const [id, old] of this.items) {
       if (next.has(id)) continue;

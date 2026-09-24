@@ -19,7 +19,7 @@ import * as path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { loadConfig, loadDotEnv } from './config';
 import type { AppConfig } from './config';
-import { fairProbForPick } from './engine/fairPrice';
+import { fairForGroup, fairProbForPick, groupKey, groupQuotes } from './engine/fairPrice';
 import type { FairOptions } from './engine/fairPrice';
 import { MarketStore } from './engine/marketStore';
 import type { StoredQuote } from './engine/marketStore';
@@ -57,6 +57,8 @@ const POLL_MAX_SLEEP_MS = 5_000;
 const UNAVAILABLE_BACKOFF_MS = 6 * 3_600_000;
 /** Closing lines are only captured this soon after the start (later prices would be live prices). */
 const CLOSING_WINDOW_MS = 15 * 60_000;
+/** A closing line that could not be saved (disk error) is retried this often; the price is read from history. */
+const CLOSING_RETRY_MS = 30_000;
 /** Oldest pre-start price accepted as the closing line (pre-game leagues can be polled rarely on small plans). */
 const CLOSING_MAX_AGE_MS = 2 * 3_600_000;
 /**
@@ -65,6 +67,8 @@ const CLOSING_MAX_AGE_MS = 2 * 3_600_000;
  */
 const ODDS_API_EVENT_RETENTION_MS = 2 * 3_600_000;
 const STOP_TIMEOUT_MS = 4_000;
+/** The clock going back more than this is reported (see runEngine); smaller steps are ordinary NTP corrections. */
+const CLOCK_STEP_BACK_MS = 60_000;
 const DK = 'draftkings';
 
 export type AppMode = 'demo' | 'live' | 'idle';
@@ -124,12 +128,77 @@ export function closingQuotes(store: MarketStore, eventId: string, startTime: nu
   return out;
 }
 
-/** Closing fair win probability for a bet's pick, or null when the store has no usable pre-start reference. */
-export function closingFairProb(
+/**
+ * Standard deviation of the final margin (spreads) and of the total, by Odds API sport key. Used only to move a
+ * closing probability by a few points when the reference line closed on a different number than the bet.
+ */
+function lineSigma(oddsApiKey: string | null | undefined, kind: 'spread' | 'total'): number | null {
+  const key = (oddsApiKey ?? '').toLowerCase();
+  const table: Array<[string, number, number]> = [
+    ['americanfootball_nfl', 13.5, 13.5],
+    ['americanfootball_', 16, 17],
+    ['basketball_nba', 12, 18],
+    ['basketball_', 11, 15],
+    ['baseball_', 4.3, 4.4],
+    ['icehockey_', 2.3, 2.3],
+    ['soccer_', 1.6, 1.6],
+  ];
+  for (const [prefix, spread, total] of table) if (key.startsWith(prefix)) return kind === 'spread' ? spread : total;
+  return null;
+}
+
+/** A closing line is converted from another number only when it closed within this many standard deviations. */
+const MAX_LINE_SHIFT_SIGMAS = 0.5;
+
+/** Standard normal CDF (Abramowitz & Stegun 7.1.26, |error| < 1.5e-7). */
+function normCdf(z: number): number {
+  const x = Math.abs(z) / Math.SQRT2;
+  const t = 1 / (1 + 0.3275911 * x);
+  const erf = 1 - ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.exp(-x * x);
+  return z >= 0 ? 0.5 * (1 + erf) : 0.5 * (1 - erf);
+}
+
+/** Inverse of normCdf by bisection (p in (0, 1)). */
+function normInv(p: number): number {
+  let lo = -10;
+  let hi = 10;
+  for (let i = 0; i < 100; i++) {
+    const mid = (lo + hi) / 2;
+    if (normCdf(mid) < p) lo = mid;
+    else hi = mid;
+  }
+  return (lo + hi) / 2;
+}
+
+/**
+ * Win probability of a spread/total pick at `toLine` given its probability `p0` at `fromLine`, with the margin (or
+ * total) modelled as normal with standard deviation `sigma`. Lines are the pick's own: the side's spread line, or
+ * the total. More points for a spread side, or a higher total for an Under, raise the probability.
+ */
+export function shiftLineProb(kind: 'spread' | 'total', side: string, fromLine: number, p0: number, toLine: number, sigma: number): number {
+  const sign = kind === 'total' && side === 'over' ? -1 : 1;
+  return normCdf(normInv(p0) + (sign * (toLine - fromLine)) / sigma);
+}
+
+export interface ClosingLine {
+  prob: number;
+  /** True when the reference closed on another number and the probability was converted to the bet's line. */
+  approx: boolean;
+}
+
+/**
+ * Closing fair win probability for a bet's pick, or null when the store has no usable pre-start reference.
+ *
+ * A complete snapshot drops quotes at numbers the market left, so when the line moved through the bet's number
+ * before the start (the biggest CLV cases) no reference remains at that number. Spreads and totals then fall back to
+ * the reference's closing market at the nearest line (within half a standard deviation), converted to the bet's
+ * number with a normal margin model and flagged `approx`.
+ */
+export function closingLine(
   store: MarketStore,
   bet: Pick<BetRecord, 'eventId' | 'league' | 'kind' | 'side' | 'line' | 'startTime'>,
   cfg: Pick<AppConfig, 'leagues' | 'model' | 'oddsApi'>,
-): number | null {
+): ClosingLine | null {
   const quotes = closingQuotes(store, bet.eventId, bet.startTime);
   if (quotes.length === 0) return null;
   const league = cfg.leagues.find((l) => l.key === bet.league);
@@ -142,8 +211,44 @@ export function closingFairProb(
     now: bet.startTime,
     maxAgeMs: CLOSING_MAX_AGE_MS,
   };
-  const p = fairProbForPick(quotes, bet.kind, bet.side, bet.line, opts);
-  return p !== null && p > 0 && p < 1 ? p : null;
+  const exact = fairProbForPick(quotes, bet.kind, bet.side, bet.line, opts);
+  if (exact !== null && exact > 0 && exact < 1) return { prob: exact, approx: false };
+
+  if (bet.kind === 'moneyline' || bet.line === null || !Number.isFinite(bet.line)) return null;
+  const kind = bet.kind;
+  const sigma = lineSigma(league?.oddsApiKey, kind);
+  if (sigma === null) return null;
+  const betKey = groupKey(kind, bet.side, bet.line);
+  let best: { prob: number; line: number; distance: number; sharp: boolean } | null = null;
+  for (const group of groupQuotes(quotes.filter((q) => q.kind === kind))) {
+    if (group.groupKey === betKey) continue;
+    const lineText = group.groupKey.slice(group.groupKey.indexOf('|') + 1);
+    const groupLine = Number(lineText);
+    if (lineText === '' || !Number.isFinite(groupLine)) continue;
+    // The pick's own line in that market: spreads are keyed by the home line.
+    const line = kind === 'spread' && bet.side === 'away' ? -groupLine : groupLine;
+    const distance = Math.abs(line - bet.line);
+    if (distance > sigma * MAX_LINE_SHIFT_SIGMAS) continue;
+    const fair = fairForGroup(group, opts);
+    const p = fair?.probs[bet.side];
+    if (!fair || typeof p !== 'number' || !(p > 0 && p < 1)) continue;
+    const sharp = fair.sharpBook !== null;
+    if (!best || distance < best.distance || (distance === best.distance && sharp && !best.sharp)) {
+      best = { prob: p, line, distance, sharp };
+    }
+  }
+  if (!best) return null;
+  const prob = shiftLineProb(kind, bet.side, best.line, best.prob, bet.line, sigma);
+  return prob > 0 && prob < 1 ? { prob, approx: true } : null;
+}
+
+/** Closing fair win probability for a bet's pick (see closingLine), or null. */
+export function closingFairProb(
+  store: MarketStore,
+  bet: Pick<BetRecord, 'eventId' | 'league' | 'kind' | 'side' | 'line' | 'startTime'>,
+  cfg: Pick<AppConfig, 'leagues' | 'model' | 'oddsApi'>,
+): number | null {
+  return closingLine(store, bet, cfg)?.prob ?? null;
 }
 
 function isLoopback(host: string): boolean {
@@ -176,6 +281,14 @@ function fmtDuration(ms: number): string {
 
 function clampNum(x: number, lo: number, hi: number): number {
   return Number.isFinite(x) ? Math.min(hi, Math.max(lo, x)) : hi;
+}
+
+/**
+ * Where settings.json and bets.jsonl live. Demo mode uses its own `demo/` sub-folder so simulated bets and settings
+ * tried out in the demo never count toward (or override) the real ones.
+ */
+export function stateDirFor(cfg: Pick<AppConfig, 'dataDir' | 'demoMode'>): string {
+  return cfg.demoMode ? path.join(cfg.dataDir, 'demo') : cfg.dataDir;
 }
 
 /**
@@ -221,10 +334,14 @@ class OddsHub implements RunningApp {
   private stopping: Promise<void> | null = null;
   private lastPruneAt = 0;
   private lastEngineRunAt: number | null = null;
+  /** Latest clock reading of the engine, to notice the wall clock stepping backwards. */
+  private lastClock: number | null = null;
   private engineDurationMs: number | null = null;
 
   /** Pending pre-game bets whose closing line could not be captured (never retried). Pruned to pending bets. */
   private readonly closingGaveUp = new Set<string>();
+  /** Pending bets whose closing line was found but could not be saved: bet id -> next attempt. Pruned likewise. */
+  private readonly closingRetryAt = new Map<string, number>();
 
   // demo feed health
   private demoLastTick: number | null = null;
@@ -250,9 +367,10 @@ class OddsHub implements RunningApp {
     this.mode = cfg.demoMode ? 'demo' : client.enabled ? 'live' : 'idle';
 
     const leagueKeys = cfg.leagues.map((l) => l.key);
-    this.settings = new SettingsStore(path.join(cfg.dataDir, 'settings.json'), cfg.defaults, leagueKeys);
+    const stateDir = stateDirFor(cfg);
+    this.settings = new SettingsStore(path.join(stateDir, 'settings.json'), cfg.defaults, leagueKeys);
     this.settings.load();
-    this.journal = new BetJournal(path.join(cfg.dataDir, 'bets.jsonl'), { now: this.now }).load();
+    this.journal = new BetJournal(path.join(stateDir, 'bets.jsonl'), { now: this.now }).load();
     this.store = new MarketStore(this.mode === 'live' ? { eventRetentionMs: ODDS_API_EVENT_RETENTION_MS } : {});
     this.tracker = new OpportunityTracker({ goneRetentionSec: cfg.model.goneRetentionSec });
     this.notifier = new Notifier(cfg.notify, opts.notifierDeps);
@@ -277,6 +395,7 @@ class OddsHub implements RunningApp {
       port: this.cfg.server.port,
       user: this.cfg.server.user,
       password: this.cfg.server.password,
+      allowedHosts: this.cfg.server.allowedHosts,
       publicDir: this.publicDir,
       getState: () => this.state(),
       settings: this.settings,
@@ -338,6 +457,14 @@ class OddsHub implements RunningApp {
 
   private runEngine(): DashboardState {
     const now = this.now();
+    if (this.lastClock !== null && now < this.lastClock - CLOCK_STEP_BACK_MS) {
+      log.warn(
+        `the system clock stepped back by ${fmtDuration(this.lastClock - now)}: prices observed before the step count as ` +
+          'stale until they are polled again, and polling resumes on the new clock',
+      );
+      this.lastPruneAt = now;
+    }
+    if (this.lastClock === null || now > this.lastClock || now < this.lastClock - CLOCK_STEP_BACK_MS) this.lastClock = now;
     if (now - this.lastPruneAt >= PRUNE_EVERY_MS) {
       this.lastPruneAt = now;
       const pruned = this.store.prune(now);
@@ -391,6 +518,7 @@ class OddsHub implements RunningApp {
     const pending = this.journal.pendingWithoutClosing();
     if (pending.length === 0) {
       this.closingGaveUp.clear();
+      this.closingRetryAt.clear();
       return 0;
     }
     let updated = 0;
@@ -398,21 +526,30 @@ class OddsHub implements RunningApp {
     for (const bet of pending) {
       pendingIds.add(bet.id);
       if (bet.wasLive || bet.startTime > now || this.closingGaveUp.has(bet.id)) continue;
-      let prob: number | null = null;
+      const retryAt = this.closingRetryAt.get(bet.id);
+      if (retryAt !== undefined && now < retryAt) continue;
+      let closing: ClosingLine | null = null;
       try {
-        prob = closingFairProb(this.store, bet, this.cfg);
+        closing = closingLine(this.store, bet, this.cfg);
       } catch (err) {
         log.warn('closing line lookup failed', { bet: bet.id, error: errorText(err) });
       }
-      if (prob !== null) {
+      if (closing !== null) {
+        const prob = closing.prob;
         try {
-          this.journal.updateClosing(bet.id, prob);
+          this.journal.updateClosing(bet.id, prob, { approx: closing.approx });
+          this.closingRetryAt.delete(bet.id);
           updated++;
           const clv = prob * bet.decimalTaken - 1;
-          log.info(`closing line recorded for ${bet.pick} (${bet.eventName}): fair ${(prob * 100).toFixed(1)}%, CLV ${(clv * 100).toFixed(1)}%`);
+          log.info(
+            `closing line recorded for ${bet.pick} (${bet.eventName}): fair ${(prob * 100).toFixed(1)}%, ` +
+              `CLV ${(clv * 100).toFixed(1)}%${closing.approx ? ' (converted from the closing line at another number)' : ''}`,
+          );
         } catch (err) {
-          this.closingGaveUp.add(bet.id);
-          log.warn('could not save closing line', { bet: bet.id, error: errorText(err) });
+          // A disk error is usually temporary, and the closing price is rebuilt from the price history at the start
+          // time, so a later attempt still records the right value. It stops once the history no longer has it.
+          this.closingRetryAt.set(bet.id, now + CLOSING_RETRY_MS);
+          log.warn(`could not save closing line; retrying in ${CLOSING_RETRY_MS / 1000} s`, { bet: bet.id, error: errorText(err) });
         }
       } else if (now - bet.startTime > CLOSING_WINDOW_MS) {
         this.closingGaveUp.add(bet.id);
@@ -420,6 +557,7 @@ class OddsHub implements RunningApp {
       }
     }
     for (const id of this.closingGaveUp) if (!pendingIds.has(id)) this.closingGaveUp.delete(id);
+    for (const id of this.closingRetryAt.keys()) if (!pendingIds.has(id)) this.closingRetryAt.delete(id);
     return updated;
   }
 
@@ -650,7 +788,9 @@ class OddsHub implements RunningApp {
         ? 'DEMO (simulated odds, not real prices; no credits used, no alerts sent)'
         : this.mode === 'live'
           ? 'LIVE (The Odds API)'
-          : 'IDLE (no ODDS_API_KEY set: nothing is polled; add a key or run `npm run demo`)';
+          : 'IDLE (no ODDS_API_KEY set: nothing is polled). Add ODDS_API_KEY to .env and restart ' +
+            '(Docker: `docker compose up -d`, since `restart` does not re-read .env; otherwise restart `npm start`). ' +
+            'To try simulated odds: DEMO_MODE=true (Docker) or `npm run demo`';
     const auth = cfg.server.password !== '';
     log.info('Odds Decision Hub: read-only analytics. You place every bet yourself.');
     log.info(`mode: ${modeText}`);
@@ -664,12 +804,29 @@ class OddsHub implements RunningApp {
       );
     }
     log.info(`dashboard: ${dashboardUrl(cfg.server.host, this.port)} (auth ${auth ? `on, user "${cfg.server.user}"` : 'off'})`);
-    log.info(`data: ${cfg.dataDir}`);
+    log.info(
+      `answers to: IP addresses, localhost${cfg.server.allowedHosts.length > 0 ? `, ${cfg.server.allowedHosts.join(', ')}` : ''} ` +
+        '(set ALLOWED_HOSTS for a proxy domain or Tailscale name)',
+    );
+    log.info(`data: ${stateDirFor(cfg)}${this.mode === 'demo' ? ' (demo bets and settings are kept apart from the real ones)' : ''}`);
     if (!auth && !isLoopback(cfg.server.host)) {
       log.warn(
         `HOST=${cfg.server.host} is not a loopback address and DASHBOARD_PASSWORD is empty: anyone who can reach this ` +
           'port can see and change your settings and bets. Set DASHBOARD_PASSWORD, or keep the port private ' +
           '(Docker Compose publishes it on 127.0.0.1 only).',
+      );
+    }
+    if (this.mode === 'live' && cfg.oddsApi.resetDayOfMonth !== 1) {
+      log.warn(
+        `ODDS_API_RESET_DAY=${cfg.oddsApi.resetDayOfMonth}: The Odds API resets usage credits on the 1st of every ` +
+          'month (your billing date does not matter). With another day the scheduler spends the whole quota by that ' +
+          'day and then has only the reserve until the 1st. Remove the setting unless you are sure.',
+      );
+    }
+    if (cfg.model.includeAltLines && this.mode !== 'demo') {
+      log.warn(
+        'INCLUDE_ALT_LINES=true has no effect with The Odds API: its odds endpoint returns main lines only ' +
+          '(alternate lines exist only in demo mode).',
       );
     }
     if (this.notifier.enabled && this.mode === 'demo') log.info('alerts: configured, but not sent in demo mode');
@@ -681,6 +838,7 @@ class OddsHub implements RunningApp {
 export async function startApp(cfg: AppConfig, opts: AppOptions = {}): Promise<RunningApp> {
   setLogLevel(cfg.logLevel);
   ensureDataDir(cfg.dataDir);
+  if (cfg.demoMode) ensureDataDir(stateDirFor(cfg));
   const app = new OddsHub(cfg, opts);
   await app.start();
   return app;

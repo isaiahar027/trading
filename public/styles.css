@@ -609,6 +609,10 @@ code {
   color: var(--text);
 }
 
+.chip-btn.is-empty:not([aria-pressed="true"]) {
+  color: var(--muted);
+}
+
 .filter-controls {
   display: flex;
   flex-wrap: wrap;
@@ -920,8 +924,22 @@ main {
   background: var(--surface-3);
 }
 
-.is-gone .cd-track {
+.is-gone .cd-track,
+.is-demoted .cd-track {
   display: none;
+}
+
+/* A pick that dropped below the betting threshold stays in place, greyed, instead of vanishing. */
+.card.is-demoted {
+  padding-top: 44px;
+  filter: grayscale(0.85);
+  box-shadow: none;
+  border-color: var(--border);
+}
+
+.demoted-banner {
+  background: var(--amber-soft);
+  color: var(--amber);
 }
 
 .cd-bar {
@@ -1357,7 +1375,8 @@ main {
 
 .leg {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1.5fr) 62px 62px;
+  /* Price and stake columns size to their content: stakes carry cents and must never be clipped. */
+  grid-template-columns: minmax(min-content, 1fr) minmax(0, 1.5fr) auto auto;
   gap: 8px;
   align-items: center;
   padding: 9px 12px;
@@ -1389,6 +1408,7 @@ main {
 
 .leg .num {
   text-align: right;
+  white-space: nowrap;
 }
 
 .leg-price,
@@ -1594,6 +1614,92 @@ main {
   font-size: 22px;
   font-weight: 850;
   letter-spacing: -0.01em;
+}
+
+.tile-sub {
+  margin: 2px 0 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* "Placed a bet on a pick that has left the board?" */
+.recent {
+  margin-top: 18px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+}
+
+.recent-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 14px;
+  font-weight: 800;
+  cursor: pointer;
+  list-style: none;
+}
+
+.recent-summary::-webkit-details-marker {
+  display: none;
+}
+
+.recent-summary .chevron {
+  margin-left: auto;
+  transition: transform 0.15s ease;
+}
+
+.recent[open] .recent-summary .chevron {
+  transform: rotate(180deg);
+}
+
+.recent .section-hint {
+  margin: 0 14px 10px;
+}
+
+.recent-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.recent-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 4px 12px;
+  padding: 10px 14px;
+  border-top: 1px solid var(--border);
+}
+
+.recent-main {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.recent-pick {
+  overflow-wrap: anywhere;
+}
+
+.recent-ctx {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--text-2);
+}
+
+.recent-meta {
+  grid-column: 1;
+  font-size: 12.5px;
+  color: var(--muted);
+}
+
+.recent-item .btn {
+  grid-column: 2;
+  grid-row: 1 / span 2;
 }
 
 .bets-toolbar {
@@ -2592,7 +2698,8 @@ dialog {
     padding: 16px 14px 14px;
   }
 
-  .card.is-gone {
+  .card.is-gone,
+  .card.is-demoted {
     padding-top: 42px;
   }
 
@@ -2647,7 +2754,7 @@ dialog {
   }
 
   .leg {
-    grid-template-columns: minmax(86px, 1fr) minmax(0, 1.3fr) 50px 46px;
+    grid-template-columns: minmax(min-content, 1fr) minmax(0, 1.3fr) auto auto;
     gap: 8px;
     padding: 9px 10px;
   }
