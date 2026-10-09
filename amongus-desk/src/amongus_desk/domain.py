@@ -202,7 +202,7 @@ class BreakoutSignal(Record):
     atr: float  # fast ATR at the bar *before* the breakout bar (no look-ahead into the trigger bar)
     atr_slow: float
     range_atr: float  # breakout bar true range / atr
-    extension_atr: float  # distance of close beyond the channel edge, in ATRs
+    extension_atr: float  # distance of close beyond the channel edge, in "vol" units = max(atr, atr_slow)
     squeeze_percentile: float | None  # Bollinger bandwidth percentile before the breakout (0..1)
     strength: float = Field(ge=0.0, le=1.0)
     reasons: list[str] = Field(default_factory=list)
@@ -215,7 +215,7 @@ class TradePlan(Record):
     stop_price: float
     target_price: float
     stop_distance: float  # absolute price distance entry_ref -> stop_price (> 0)
-    atr: float
+    atr: float  # the volatility unit the stop was built from: max(fast ATR, slow ATR)
     target_r: float
     time_stop_bars: int
     spread_price: float  # spread assumed for sizing/cost, in price units

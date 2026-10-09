@@ -12,7 +12,7 @@ configuration in `config.py`, and the cross-module protocols in:
 | `GuiBackend`, `WindowInfo`, `OperatorAbortError` | `execution/unitrader/backend.py` |
 | `Layout`, `LayoutFile` (calibrated screen layout) | `execution/unitrader/layout.py` |
 | `TradeReviewer`, `ReviewVerdict`, `ReviewContext`, `ReviewOutcome` | `llm/base.py` |
-| `Notifier`, `NullNotifier` | `notify.py` |
+| `Notifier`, `NullNotifier`, `AlertNotifier` (ntfy JSON + Telegram, dedup), `build_notifier` | `notify.py` |
 | `quantize_lots`, `format_lots`, `parse_lots`, `estimate_pnl`, `trading_day_start` | `money.py` |
 
 Those files are the spine. Change them only when a contract is genuinely wrong, and keep every caller
@@ -111,7 +111,8 @@ the trigger bar does not inflate its own yardstick:
 - `close_t > donchian_high_t + breakout_buffer_atr * ATR_{t-1}`;
 - `TR_t >= min_range_atr * ATR_{t-1}` (range expansion);
 - body ratio `|close-open| / range >= min_body_ratio`; close location `(close-low)/range >= min_close_location`;
-- extension `(close_t - donchian_high_t) / ATR_{t-1} <= max_extension_atr` (don't chase);
+- extension `(close_t - donchian_high_t) / vol <= max_extension_atr` (don't chase), where
+  `vol = max(ATR_{t-1}, ATR_slow_{t-1})` (after a squeeze the fast ATR is tiny; "vol" is normal noise);
 - squeeze: Bollinger bandwidth percentile at `t-1` over the previous `squeeze_lookback` values
   `<= max_squeeze_percentile` (`1.0` disables);
 - cooldown: no second signal on the same symbol within `signal_cooldown_bars` bars of the last signal;
@@ -119,7 +120,7 @@ the trigger bar does not inflate its own yardstick:
 
 Charts rules: with `require_trend_alignment`, a long needs `close > EMA(trend_ema_period)` and an EMA slope
 over `trend_slope_bars` of `>= 0` (mirror for shorts); otherwise vote EJECT. Plan: `entry_ref = signal.close`,
-`stop_distance = stop_atr_mult * signal.atr`, stop/target from `target_r`. EJECT if
+`stop_distance = stop_atr_mult * max(signal.atr, signal.atr_slow)`, stop/target from `target_r`. EJECT if
 `stop_distance < min_stop_spread_multiple * spread_price`. Round prices to `instrument.price_decimals`.
 
 ### `news.py` — Yellow News
@@ -486,7 +487,7 @@ class DeskEngine:
   "equity": {"estimate": 10000.0, "day_start": 10000.0, "realized_today": 0.0, "unrealized": 0.0, "currency": "USD"},
   "limits": {"trades_today": 0, "max_trades_per_day": 4, "open_positions": 0, "max_open_positions": 1,
              "daily_loss_pct": 0.0, "max_daily_loss_pct": 1.5},
-  "positions": [Position, …],
+  "positions": [Position + {"unrealized_pnl": float | null}, …],
   "crew": [{"id": "CYAN_SCOUT", "name": "Cyan Scout", "color": "#38fedc", "role": "…", "vote": "HOLD", "summary": "…", "at": null}],
   "meetings": [MeetingRecord, … latest first, max 20],
   "intents": [{"intent": OrderIntent, "status": "CONFIRMED", "report": ExecutionReport | null}, … max 20],
