@@ -33,9 +33,6 @@ desk = "amongus_desk.cli:main"
 [tool.hatch.build.targets.wheel]
 packages = ["src/amongus_desk"]
 
-[tool.hatch.build.targets.wheel.force-include]
-"src/amongus_desk/dashboard/static" = "amongus_desk/dashboard/static"
-
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["tests"]

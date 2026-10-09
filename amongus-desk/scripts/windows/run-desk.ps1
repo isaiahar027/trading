@@ -2,8 +2,8 @@
 .SYNOPSIS
   Runs the desk in the current (interactive) Windows session and restarts it after a crash.
 .DESCRIPTION
-  Loads environment variables from .env, then runs `desk run`. A clean exit (Ctrl+C, `desk kill` is not an
-  exit) stops the loop. After a crash it waits and restarts, at most -MaxRestartsPerHour times; on restart
+  Loads environment variables from .env, then runs `desk run`. A clean exit or Ctrl+C stops the loop
+  (`desk kill` only pauses trading; it does not exit). After a crash it waits and restarts, at most -MaxRestartsPerHour times; on restart
   the desk reconciles: any order that may have been clicked but not confirmed halts trading until you
   resolve it on the dashboard. GUI automation needs this to run in YOUR logged-in desktop session, not as
   a service.
@@ -39,7 +39,8 @@ while ($true) {
     Write-Host "$(Get-Date -Format s) starting desk ($Config)" -ForegroundColor Cyan
     & $desk run -c $Config
     $code = $LASTEXITCODE
-    if ($code -eq 0) { Write-Host "desk exited cleanly"; break }
+    if ($code -eq 0 -or $code -eq 130) { Write-Host "desk stopped (exit code $code)"; break }
+    if ($code -eq 4) { Write-Host "stopped at the login gate / preflight; log in to UniTrader yourself and start again" -ForegroundColor Yellow; break }
     if ($code -eq 3) { Write-Host "another desk instance is already running; not restarting" -ForegroundColor Red; break }
     if ($code -eq 2) { Write-Host "configuration error; fix config and start again" -ForegroundColor Red; break }
     $now = Get-Date

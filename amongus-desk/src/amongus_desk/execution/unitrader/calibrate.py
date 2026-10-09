@@ -107,6 +107,10 @@ class CalibrationResult:
         """True when every always-visible template re-verified above its threshold."""
         return not self.failed
 
+    def __bool__(self) -> bool:
+        """Same as :attr:`ok`, so ``if run_calibration(...):`` means "saved and verified"."""
+        return self.ok
+
 
 def run_calibration(  # noqa: PLR0917 - positional signature fixed by docs/ARCHITECTURE.md
     cfg: DeskConfig,
@@ -171,7 +175,9 @@ def _slug(text: str) -> str:
 
 
 def _title_matches(pattern: str, title: str) -> bool:
-    return re.search(pattern, title) is not None
+    # Same rule as the venue: the pattern must match the WHOLE title (re.fullmatch), and only visible
+    # windows count.
+    return re.fullmatch(pattern, title) is not None
 
 
 def _process_matches(process: str | None, window: WindowInfo) -> bool:
@@ -499,7 +505,7 @@ class _Wizard:
             matches = [
                 w
                 for w in self._backend.list_windows()
-                if _title_matches(pattern, w.title) and _process_matches(process, w)
+                if w.visible and _title_matches(pattern, w.title) and _process_matches(process, w)
             ]
             where = f" in program {process!r}" if process else ""
             self._say(f"Windows matching {pattern!r}{where}:")
@@ -522,11 +528,12 @@ class _Wizard:
         raise AssertionError("unreachable")
 
     def _title_pattern(self, chosen: WindowInfo) -> str:
-        default = "^" + re.escape(chosen.title) + "$"
+        default = re.escape(chosen.title)
         for _ in range(_MAX_INVALID_ANSWERS):
             answer = self._ask(
-                "Title pattern (regular expression) the desk will use to find this window. Press Enter to use "
-                f"the exact title {default!r}, or type a pattern (useful if the title changes):"
+                "Title pattern (a regular expression that must match the WHOLE title) the desk will use to find "
+                f"this window. Press Enter to use the exact title {default!r}, or type a pattern (useful if the "
+                "title changes, e.g. 'Name - .*'):"
             )
             pattern = answer or default
             try:
@@ -534,8 +541,8 @@ class _Wizard:
             except re.error as exc:
                 self._say(f"  That is not a valid regular expression: {exc}.")
                 continue
-            if compiled.search(chosen.title) is None:
-                self._say(f"  That pattern does not match the chosen window's title {chosen.title!r}.")
+            if compiled.fullmatch(chosen.title) is None:
+                self._say(f"  That pattern does not match the whole title of the chosen window, {chosen.title!r}.")
                 continue
             return pattern
         raise CalibrationAborted("No usable title pattern. Calibration aborted; nothing was saved.")
@@ -558,20 +565,24 @@ class _Wizard:
         info = self._backend.get_window(self._handle)
         if info is None:
             raise CalibrationError(
-                "The terminal window disappeared. Open UniTrader, log in yourself, and run calibrate again. "
-                "Nothing was saved."
+                self._failure_text(
+                    "The terminal window disappeared. Open UniTrader, log in yourself, and run calibrate again"
+                )
             )
         if info.minimized:
             raise CalibrationError(
-                "The terminal window was minimized during calibration. Restore it and run calibrate again. "
-                "Nothing was saved."
+                self._failure_text(
+                    "The terminal window was minimized during calibration. Restore it and run calibrate again"
+                )
             )
         width, height, dpi = self._geometry
         if (info.client_width, info.client_height, info.dpi) != self._geometry:
             raise CalibrationError(
-                "The terminal window was resized or its display scaling changed during calibration "
-                f"({width}x{height} at {dpi} DPI -> {info.client_width}x{info.client_height} at {info.dpi} DPI). "
-                "Keep it fixed and run calibrate again. Nothing was saved."
+                self._failure_text(
+                    "The terminal window was resized or its display scaling changed during calibration "
+                    f"({width}x{height} at {dpi} DPI -> {info.client_width}x{info.client_height} at {info.dpi} "
+                    "DPI). Keep it fixed and run calibrate again"
+                )
             )
         return info
 
@@ -651,12 +662,14 @@ class _Wizard:
             )
         region = Region(x=top_left.x, y=top_left.y, w=width, h=height)
         if own_window:
+            # Same rule as the venue: the centre and all four corners must belong to the terminal window.
             info = self._window()
-            cx = info.client_left + region.x + region.w // 2
-            cy = info.client_top + region.y + region.h // 2
-            if self._backend.root_window_at(cx, cy) != self._handle:
-                raise _Retry("the middle of the marked area is covered by another window")
-        if self._park is not None and self._inside(self._park, region, _PARK_MARGIN):
+            x0, y0 = info.client_left + region.x, info.client_top + region.y
+            x1, y1 = x0 + region.w - 1, y0 + region.h - 1
+            probes = ((x0 + region.w // 2, y0 + region.h // 2), (x0, y0), (x1, y0), (x0, y1), (x1, y1))
+            if any(self._backend.root_window_at(x, y) != self._handle for x, y in probes):
+                raise _Retry("part of the marked area is covered by another window (move this console away)")
+        if own_window and self._park is not None and self._inside(self._park, region, _PARK_MARGIN):
             raise _Retry(
                 "the mouse rest spot is inside (or right next to) this area, so the mouse would sit on it; mark "
                 "the area again, or quit and pick another rest spot"
@@ -673,9 +686,9 @@ class _Wizard:
         info = self._window()
         image = self._backend.capture(info.client_left + region.x, info.client_top + region.y, region.w, region.h)
         if image.size != (region.w, region.h):
-            raise CalibrationError(
-                f"the GUI backend returned a {image.size[0]}x{image.size[1]} screenshot for a "
-                f"{region.w}x{region.h} area. Nothing was saved."
+            raise BackendError(
+                f"the GUI backend returned a {image.size[0]}x{image.size[1]} screenshot "
+                f"for a {region.w}x{region.h} area"
             )
         return image if image.mode == "RGB" else image.convert("RGB")
 
@@ -747,7 +760,6 @@ class _Wizard:
         return kind
 
     def _positions_indicator(self) -> Region:
-        threshold = self._ut.change_threshold
         what = (
             "an area that changes when a position opens or closes and otherwise stays still (the desk watches "
             "it to confirm fills)"
@@ -757,10 +769,13 @@ class _Wizard:
             region = self._region(what, own_window=True)
             first, second = self._two_captures(region)
             fraction = changed_fraction(first, second)
-            if fraction >= threshold:
+            # The venue refuses to trade when ANY pixel of this area changes between its two baseline
+            # captures, and counts a change as a fill afterwards, so it has to be perfectly still now.
+            if fraction > 0.0:
                 raise _Retry(
-                    f"{fraction:.1%} of that area changed by itself within {self._settle:.1f} s, and the desk "
-                    f"counts a change of {threshold:.1%} as a fill; mark an area that only changes with positions"
+                    f"{fraction:.1%} of that area changed by itself within {self._settle:.1f} s; the desk would "
+                    "refuse every order (or mistake the change for a fill). Mark an area that only changes when "
+                    "positions open or close"
                 )
             return region
 

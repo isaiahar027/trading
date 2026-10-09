@@ -71,6 +71,17 @@ second copy of the bot) would interleave mouse and keyboard actions. Nothing per
 it is sent. A crash right after the click therefore can't tell "sent" from "not sent", and an automatic
 retry could double the position.
 
+**Execution latency.** The prototype doesn't measure latency anywhere, so slippage can't be checked
+after the fact. The real chain is: bar closes → data feed delivers it (polled a few seconds after the
+close) → local checks (milliseconds) → optional Claude review (typically a few seconds; bounded by
+`llm.timeout_seconds`) → GUI sequence (focus, verify, type lot, read back, click: roughly 1-3 s at the
+default delays) → fill detection. For a 5-minute breakout strategy, a few seconds is acceptable *if it
+is measured*. A latency that is never measured turns into hidden slippage. The rebuild timestamps every
+stage. `ExecutionReport.started_at` / `clicked_at` / `finished_at` are recorded against the bar close in
+the audit log. The evidence screenshots let you compare the feed price at the click with the terminal's
+fill. Claude's review is skipped entirely unless every deterministic check passes, so it adds latency
+only to trades that will actually be sent.
+
 **Dashboard security.** `demo.launch(server_name="0.0.0.0", server_port=3000)` with no authentication
 puts the desk on the public internet. Anyone who finds the VPS IP and port can reach it. Once a panic or
 trade button is wired, that becomes a remote trading trigger.
@@ -144,6 +155,7 @@ phone alert.
    `max_open_positions: 1`). Each evening, compare the terminal's history with the desk's journal
    (`desk status`, dashboard) and record the real fill prices.
 4. **Measure.**
+   - Signal-to-click latency (bar close → `clicked_at`) and fill-detection time.
    - Verification success rate (CONFIRMED vs UNCONFIRMED).
    - Aborts by stage.
    - Signal count.

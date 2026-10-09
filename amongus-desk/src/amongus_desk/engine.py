@@ -280,6 +280,8 @@ class DeskEngine:
                 "symbol": meeting.symbol,
                 "trigger": meeting.trigger,
                 "decision": meeting.decision.value,
+                "bar_close": meeting.signal.detected_at if meeting.signal else None,
+                "called_at": meeting.called_at,
                 "lots": meeting.lots,
                 "reasons": meeting.reasons,
                 "votes": {r.crew_id.value: r.vote.value for r in meeting.reports},
@@ -333,7 +335,11 @@ class DeskEngine:
                 "message": report.message,
                 "stage": report.stage,
                 "fill_price": report.fill_price,
+                "fill_price_source": report.fill_price_source,
                 "operator_abort": report.operator_abort,
+                "started_at": report.started_at,
+                "clicked_at": report.clicked_at,
+                "finished_at": report.finished_at,
             },
         )
         self._hub.publish("intent", {"id": intent.id, "status": report.status.value, "purpose": intent.purpose})
