@@ -1,0 +1,77 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "amongus-desk"
+version = "0.1.0"
+description = "Among Us-themed multi-agent trading desk: breakout scanner, crew risk review, veto-only Claude reviewer and guarded GUI execution for the UniTrader desktop terminal."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "UNLICENSED" }
+dependencies = [
+  "pydantic>=2.8,<3",
+  "PyYAML>=6.0",
+  "numpy>=1.26",
+  "pillow>=10.3",
+  "anthropic>=1.13,<2",
+  "httpx2>=2.0,<3",
+  "fastapi>=0.115",
+  "uvicorn>=0.30",
+  "sse-starlette>=2.1",
+]
+
+[project.optional-dependencies]
+# GUI automation backend. Only installable/usable on the Windows VPS that runs UniTrader.
+windows = ["pyautogui>=0.9.54; sys_platform == 'win32'"]
+# Optional OCR of on-screen prices (pre-trade broker price check). Needs the Tesseract binary too.
+ocr = ["pytesseract>=0.3.10"]
+dev = ["pytest>=8.2", "ruff>=0.6", "mypy>=1.11", "types-PyYAML>=6.0"]
+
+[project.scripts]
+desk = "amongus_desk.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/amongus_desk"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/amongus_desk/dashboard/static" = "amongus_desk/dashboard/static"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+  "windows: needs a real Windows desktop session (skipped elsewhere)",
+]
+filterwarnings = ["error::DeprecationWarning:amongus_desk.*"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "BLE", "A", "C4", "DTZ", "T20", "SIM", "RUF", "PL", "ASYNC"]
+ignore = [
+  "PLR0911", "PLR0912", "PLR0913", "PLR0915", "PLR2004", # complexity/magic numbers: judged in review instead
+  "S101",   # assert is fine in tests
+  "RUF001", "RUF002", "RUF003", # unicode punctuation in strings/comments is intentional (UI copy)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S", "PLR", "DTZ", "BLE", "T20"]
+"src/amongus_desk/cli.py" = ["T20"]
+"src/amongus_desk/execution/unitrader/calibrate.py" = ["T20"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+mypy_path = "src"
+packages = ["amongus_desk"]
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["pyautogui", "pyautogui.*", "pytesseract", "sse_starlette.*"]
+ignore_missing_imports = true

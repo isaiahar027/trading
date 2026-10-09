@@ -1,0 +1,19 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+# runtime state, evidence screenshots, logs and secrets
+data/
+!data/.gitkeep
+.env
+.env.*
+!.env.example
+*.log
+# calibrated layouts contain screenshots of your own terminal; keep them local
+config/*.layout.yaml
+config/templates/
