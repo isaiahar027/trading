@@ -116,7 +116,7 @@ Unsafe combinations are rejected at start-up, for example:
 | `desk run` | Engine + dashboard (login gate first in demo/live) |
 | `desk preflight [--wait-for-login]` | Checks config, layout, window, badge and panels. Never clicks |
 | `desk calibrate [--simulate]` | Interactive layout wizard (hover, don't click) |
-| `desk test-order --symbol S --side BUY [--lots L] [--close]` | Exactly one order, after typed confirmation |
+| `desk test-order --symbol S --side BUY [--lots L]` | Round trip: one order after a typed confirmation, then close on Enter |
 | `desk backtest --csv F \| --synthetic N` | Same strategy and risk code on historical bars |
 | `desk kill [--reason]` / `desk resume` | Persistent kill switch (also: create `data/KILL`) |
 | `desk status` | Positions, orders, reconcile items, kill state |

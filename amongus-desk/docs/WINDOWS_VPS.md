@@ -59,9 +59,9 @@ or clicking anything. If the window or badge is missing it tells you to log in, 
 Enter, and re-checks. With `dry_run: true` the desk runs every pre-click check on real signals but never
 types or clicks. Run it like that for a day before letting it trade.
 
-`desk test-order --symbol EURUSD --side BUY --lots 0.01` places exactly one order (after you type a
-confirmation) so you can watch the full click sequence once. Close the position yourself afterwards, or
-use `--close`.
+`desk test-order --symbol EURUSD --side BUY --lots 0.01` is a round trip: it places exactly one order
+(after you type a confirmation), lets you watch the full click sequence, then closes the position with
+the calibrated close method when you press Enter.
 
 ## 5. Running unattended
 

@@ -544,8 +544,9 @@ class DeskEngine:
 * `preflight` runs the config + layout + venue preflight (with the same interactive login gate when
   `--wait-for-login` is passed) and exits non-zero on failure.
 * `calibrate` runs the wizard (Windows backend, or `--simulate` for the fake terminal).
-* `test-order --symbol EURUSD --side BUY [--lots 0.01] [--close]` places ONE order through the configured
-  venue after an explicit typed confirmation. It refuses in live mode unless `--i-know-this-is-live`.
+* `test-order --symbol EURUSD --side BUY [--lots 0.01]` is a round trip: it opens ONE position after a typed
+  confirmation, then closes it with the calibrated close method when you press Enter. Anything unconfirmed
+  is recorded for reconciliation. It refuses in live mode unless `--i-know-this-is-live`.
 * `backtest --csv PATH | --synthetic N [--symbol S] [--json]`.
 * `kill [--reason]`, `resume`, `status` (summary from the store + kill file; works while the desk is
   running) and `audit-verify`.

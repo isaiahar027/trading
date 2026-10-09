@@ -181,7 +181,7 @@ class FakeTerminal:
       ``process_name``, ``client_origin``, ``client_size``, ``dpi``;
     * desktop: ``locked`` (screenshots go black, input is silently dropped), ``popup`` (a foreign window
       covering a client rectangle), ``refuse_focus``, ``steal_focus_after_actions``;
-    * looks: ``badge_text`` ("DEMO"/"LIVE"/anything), ``one_click_enabled``, ``swap_panels``,
+    * looks: ``badge_text`` (alias ``badge``; "DEMO"/"LIVE"/anything), ``one_click_enabled``, ``swap_panels``,
       ``indicator_flicker``;
     * fields: ``lot_field_ignores_select_all``, ``clipboard_copy_broken``, ``lot_field_transform``;
     * orders: ``fill_enabled``, ``fill_delay_seconds``, ``order_confirm_dialog``,
@@ -200,7 +200,7 @@ class FakeTerminal:
         client_origin: tuple[int, int] = (120, 90),
         client_size: tuple[int, int] = (960, 600),
         dpi: int = 96,
-        badge_text: str = "DEMO",
+        badge: str = "DEMO",
         one_click_enabled: bool = True,
         has_close_all: bool = True,
         protective_fields: bool = False,
@@ -231,7 +231,7 @@ class FakeTerminal:
         self.refuse_focus = False
         self.steal_focus_after_actions: int | None = None
         # looks
-        self.badge_text = badge_text
+        self.badge_text = badge
         self.one_click_enabled = one_click_enabled
         self.has_close_all = has_close_all
         self.protective_fields = protective_fields
@@ -280,6 +280,15 @@ class FakeTerminal:
         self._fonts: dict[int, Font] = {}
         self._render_cache: tuple[tuple[Any, ...], Image.Image] | None = None
         self.geometry()  # validates that everything fits
+
+    @property
+    def badge(self) -> str:
+        """Alias of :attr:`badge_text` (the text drawn in the simulated account badge)."""
+        return self.badge_text
+
+    @badge.setter
+    def badge(self, value: str) -> None:
+        self.badge_text = value
 
     # ------------------------------------------------------------------ geometry
     def geometry(self, *, calibration: bool = True) -> _Geometry:
@@ -372,25 +381,56 @@ class FakeTerminal:
             if self.window_present:
                 out.append(
                     WindowInfo(
-                        HANDLE_TERMINAL, self.title, self.pid, self.process_name, left, top, w, h,
-                        self.minimized, True, self.dpi,
+                        HANDLE_TERMINAL,
+                        self.title,
+                        self.pid,
+                        self.process_name,
+                        left,
+                        top,
+                        w,
+                        h,
+                        self.minimized,
+                        True,
+                        self.dpi,
                     )
                 )
             for i in range(self.duplicate_windows):
                 off = 30 * (i + 1)
                 out.append(
                     WindowInfo(
-                        HANDLE_DUPLICATE_BASE + i, self.title, self.pid + 1 + i, self.process_name,
-                        left + off, top + off, w, h, False, True, self.dpi,
+                        HANDLE_DUPLICATE_BASE + i,
+                        self.title,
+                        self.pid + 1 + i,
+                        self.process_name,
+                        left + off,
+                        top + off,
+                        w,
+                        h,
+                        False,
+                        True,
+                        self.dpi,
                     )
                 )
             if self.popup is not None:
                 p = self.popup
                 out.append(
-                    WindowInfo(HANDLE_POPUP, "Popup (simulation)", 777, "popup.exe", left + p.x, top + p.y, p.w, p.h,
-                               False, True, 96)
+                    WindowInfo(
+                        HANDLE_POPUP,
+                        "Popup (simulation)",
+                        777,
+                        "popup.exe",
+                        left + p.x,
+                        top + p.y,
+                        p.w,
+                        p.h,
+                        False,
+                        True,
+                        96,
+                    )
                 )
-            out.append(WindowInfo(HANDLE_OTHER, "Notes (simulation)", 999, "notes.exe", 0, 0, 400, 300, False, True, 96))
+            out.append(
+                WindowInfo(HANDLE_OTHER, "Notes (simulation)", 999, "notes.exe", 0, 0, 400, 300, False, True, 96)
+            )
             out.extend(self.extra_windows)
             return out
 
@@ -668,9 +708,17 @@ class FakeTerminal:
     def _render(self, *, calibration: bool, dialog: DialogKind | None) -> Image.Image:
         flicker = (not calibration) and self.indicator_flicker and self._flicker_phase % 2 == 1
         key: tuple[Any, ...] = (
-            calibration, dialog, flicker, self.client_size, self.badge_text, self.one_click_enabled,
-            self.has_close_all, self.protective_fields, self.swap_panels and not calibration,
-            tuple(sorted(self._fields.items())), self._focused,
+            calibration,
+            dialog,
+            flicker,
+            self.client_size,
+            self.badge_text,
+            self.one_click_enabled,
+            self.has_close_all,
+            self.protective_fields,
+            self.swap_panels and not calibration,
+            tuple(sorted(self._fields.items())),
+            self._focused,
             tuple((p.symbol, p.side, p.lots) for p in self.positions),
             self._dialog.order if self._dialog else None,
         )
@@ -695,9 +743,10 @@ class FakeTerminal:
         self._render_cache = (key, img)
         return img.copy()
 
-    def _button(self, draw: ImageDraw.ImageDraw, r: Rect, text: str, fill: tuple[int, int, int],
-                ink: tuple[int, int, int]) -> None:
-        draw.rectangle(r.box[:2] + (r.box[2] - 1, r.box[3] - 1), fill=fill, outline=(30, 30, 30))
+    def _button(
+        self, draw: ImageDraw.ImageDraw, r: Rect, text: str, fill: tuple[int, int, int], ink: tuple[int, int, int]
+    ) -> None:
+        draw.rectangle((r.x, r.y, r.x + r.w - 1, r.y + r.h - 1), fill=fill, outline=(30, 30, 30))
         draw.text(r.center, text, fill=ink, font=self._font(16), anchor="mm")
 
     def _draw_badge(self, draw: ImageDraw.ImageDraw, r: Rect) -> None:
@@ -745,8 +794,13 @@ class FakeTerminal:
             ry = r.y + 28 + i * 27
             shade = (205, 225, 250) if pos.side == "BUY" else (250, 215, 210)
             draw.rectangle((r.x + 4, ry, r.x + r.w - 5, ry + 24), fill=shade)
-            draw.text((r.x + 10, ry + 12), f"{pos.symbol}  {pos.side}  {pos.lots}", fill=_TEXT,
-                      font=self._font(14), anchor="lm")
+            draw.text(
+                (r.x + 10, ry + 12),
+                f"{pos.symbol}  {pos.side}  {pos.lots}",
+                fill=_TEXT,
+                font=self._font(14),
+                anchor="lm",
+            )
         if flicker:
             draw.rectangle((r.x + r.w - 36, r.y + 4, r.x + r.w - 8, r.y + 24), fill=(255, 0, 255))
 
@@ -769,8 +823,9 @@ class FakeTerminal:
         if kind != "error":
             self._button(draw, geo.dialog_cancel, "Cancel", (150, 150, 150), (255, 255, 255))
 
-    def render_screen_region(self, left: int, top: int, width: int, height: int,
-                             desktop: tuple[int, int, int] = _DESKTOP) -> Image.Image:
+    def render_screen_region(
+        self, left: int, top: int, width: int, height: int, desktop: tuple[int, int, int] = _DESKTOP
+    ) -> Image.Image:
         """Compose the simulated screen inside a rectangle (screen coordinates)."""
         with self._lock:
             if self.locked:
