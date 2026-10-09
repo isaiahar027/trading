@@ -11,7 +11,9 @@ Invariants every venue must uphold (the engine and the risk logic rely on them):
    after the click is detected on restart. If it raises, the venue must abort without clicking.
 4. After the irreversible action the venue reports ``CONFIRMED``, ``REJECTED`` or ``UNCONFIRMED`` —
    never ``ABORTED``. When in doubt: ``UNCONFIRMED``.
-5. ``is_halted`` (constructor argument) is checked at the start and again immediately before the click.
+5. ``is_halted`` (constructor argument) is checked at the start and again immediately before the click
+   for **opening** orders only. Closing orders (``close_position``/``close_all``) must still run while the
+   kill switch is engaged; that is how PANIC flattens the book.
 """
 
 from __future__ import annotations

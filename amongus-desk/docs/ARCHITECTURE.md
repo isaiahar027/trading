@@ -245,21 +245,25 @@ def configure_logging(data_dir: Path, level: str = "INFO") -> None   # rotating 
 `PaperVenue(instruments: Mapping[str, InstrumentConfig], cfg: PaperConfig, clock: Clock, is_halted: HaltCheck,
 quote_source: Callable[[str], Quote | None])`. Fills at ask/bid (+/- slippage), falling back to
 `entry_ref`/last price +/- half the typical spread. Calls `on_before_click` before "sending". Reports
-`CONFIRMED` with `fill_price_source="venue"`. Halted gives `ABORTED`. `supports_protective_orders = True`.
+`CONFIRMED` with `fill_price_source="venue"`. Halted gives `ABORTED` for opening orders only. `supports_protective_orders = True`.
 
 ### `positions.py`
 
 ```python
 @dataclass(frozen=True) class ExitDue: position: Position; reason: ExitReason; price: float
 class PositionBook:
-    def __init__(self, cfg: DeskConfig, active: Iterable[Position] = (), history: Iterable[Position] = ()) -> None
+    def __init__(self, cfg: DeskConfig, active: Iterable[Position] = (), history: Iterable[Position] = (), *,
+                 equity_base: float | None = None, equity_base_at: datetime | None = None) -> None
     def active(self) -> list[Position]
+    def get(self, position_id: str) -> Position | None
+    def history(self) -> list[Position]                     # closed positions, oldest close first
     def add_open(self, intent: OrderIntent, report: ExecutionReport, *, protective: bool, at: datetime) -> Position
-    def mark_bar(self, bar: Bar) -> list[ExitDue]
+    def mark_bar(self, bar: Bar) -> list[ExitDue]           # updates last_price/bars_held; never closes by itself
     def set_status(self, position_id: str, status: PositionStatus, *, close_intent_id: str | None = None) -> Position
     def close(self, position_id: str, *, price: float, source: PriceSource, reason: ExitReason, at: datetime) -> Position
     def remove(self, position_id: str) -> Position          # reconciled "never filled"
-    def adjust_equity(self, delta: float, note: str) -> None
+    def set_equity_base(self, equity: float, at: datetime) -> None   # operator re-sync from the terminal balance
+    def equity(self) -> float ; def unrealized(self) -> float ; def realized_since_base(self) -> float
     def snapshot(self, now: datetime, *, kill_switch: bool, kill_reason: str | None,
                  reconcile_pending: list[str], degraded: list[str]) -> RiskSnapshot
 ```
@@ -268,7 +272,9 @@ TARGET. Both in the same bar gives STOP (conservative). Otherwise `bars_held >= 
 Exit price: with `protective_at_broker`, the stop/target level (or the bar open if it gapped through).
 Software-managed positions use the bar close, because the desk only acts at bar close. P&L comes from
 `money.estimate_pnl`. Equity = starting equity + all realized estimates + operator adjustments. Unrealized
-uses `last_price`. `trades_today` counts positions opened since `trading_day_start`.
+uses `last_price`. `trades_today` counts positions opened since `trading_day_start`. A bar affects a
+position when `bar.end > position.opened_at` (the bar during which it opened counts). The engine should load
+history since `min(equity_base_at, now - 30 days)` so streaks and today's P&L are complete.
 
 ### `execution/unitrader/vision.py`
 
@@ -300,7 +306,8 @@ clock: Clock, is_halted: HaltCheck, evidence_dir: Path, dry_run: bool = False)`.
 dedicated worker thread (`ThreadPoolExecutor(max_workers=1)`) behind a `threading.Lock`. Order flow
 (`submit`), each step recorded in `report.evidence["steps"]`:
 
-1. halted? → ABORTED. `input_desktop_available()` false → ABORTED ("session locked/disconnected").
+1. halted? → ABORTED (opening orders only — close_position/close_all ignore the kill switch so PANIC can
+   flatten). `input_desktop_available()` false → ABORTED ("session locked/disconnected").
 2. Locate the window: exactly one window whose title matches `window_title_regex` (and `process_name` if
    set). None or several → ABORTED with "log in to UniTrader / close duplicate windows" guidance.
 3. Restore if minimized. Client size and DPI must equal the layout → else ABORTED (never resize the window).

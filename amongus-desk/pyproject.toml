@@ -60,7 +60,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S", "PLR", "DTZ", "BLE", "T20"]
+"tests/**" = ["S", "PLR", "PLC0415", "DTZ", "BLE", "T20"]
 "src/amongus_desk/cli.py" = ["T20"]
 "src/amongus_desk/execution/unitrader/calibrate.py" = ["T20"]
 
