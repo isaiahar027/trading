@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import deque
-from collections.abc import AsyncIterator
+from types import TracebackType
 from typing import Any
 
 from .clock import Clock, SystemClock
@@ -35,15 +35,53 @@ class EventHub:
     def recent(self, limit: int = 50) -> list[DeskEvent]:
         return list(self._recent)[-limit:]
 
-    async def subscribe(self) -> AsyncIterator[DeskEvent]:
+    def subscribe(self) -> Subscription:
+        """Start receiving events. Use as ``async with hub.subscribe() as sub: async for event in sub: ...``
+        so the subscription is released deterministically when the consumer goes away."""
         queue: asyncio.Queue[DeskEvent] = asyncio.Queue(maxsize=self._queue_size)
         self._subscribers.add(queue)
-        try:
-            while True:
-                yield await queue.get()
-        finally:
-            self._subscribers.discard(queue)
+        return Subscription(self, queue)
+
+    def _unsubscribe(self, queue: asyncio.Queue[DeskEvent]) -> None:
+        self._subscribers.discard(queue)
 
     @property
     def subscriber_count(self) -> int:
         return len(self._subscribers)
+
+
+class Subscription:
+    """An event stream for one consumer; iterate it, and close it (or use ``async with``) when done."""
+
+    def __init__(self, hub: EventHub, queue: asyncio.Queue[DeskEvent]) -> None:
+        self._hub = hub
+        self._queue = queue
+        self._closed = False
+
+    def __aiter__(self) -> Subscription:
+        return self
+
+    async def __anext__(self) -> DeskEvent:
+        if self._closed:
+            raise StopAsyncIteration
+        return await self._queue.get()
+
+    async def next_within(self, seconds: float) -> DeskEvent | None:
+        """Next event, or ``None`` after ``seconds`` (lets SSE handlers send keep-alives)."""
+        try:
+            return await asyncio.wait_for(self._queue.get(), seconds)
+        except TimeoutError:
+            return None
+
+    def close(self) -> None:
+        if not self._closed:
+            self._closed = True
+            self._hub._unsubscribe(self._queue)
+
+    async def __aenter__(self) -> Subscription:
+        return self
+
+    async def __aexit__(
+        self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: TracebackType | None
+    ) -> None:
+        self.close()

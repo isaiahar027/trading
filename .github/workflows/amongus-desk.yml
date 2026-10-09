@@ -1,0 +1,44 @@
+name: amongus-desk
+
+on:
+  push:
+    paths: ["amongus-desk/**", ".github/workflows/amongus-desk.yml"]
+  pull_request:
+    paths: ["amongus-desk/**", ".github/workflows/amongus-desk.yml"]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: amongus-desk
+
+jobs:
+  checks:
+    name: lint, types, tests (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, python: "3.11" }
+          - { os: ubuntu-latest, python: "3.13" }
+          - { os: windows-latest, python: "3.13" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install
+        run: python -m pip install -e ".[dev,windows]"
+      - name: Ruff
+        run: |
+          ruff check src tests
+          ruff format --check src tests
+      - name: Mypy
+        run: mypy
+      - name: Mypy (Windows platform view of the GUI backend)
+        if: runner.os == 'Linux'
+        run: mypy --platform win32 src/amongus_desk/execution/unitrader/win32_backend.py
+      - name: Pytest
+        run: pytest -q

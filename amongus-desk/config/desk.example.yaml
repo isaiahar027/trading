@@ -1,0 +1,187 @@
+# Among Us Trading Desk — example configuration.
+#
+# Copy to config/desk.yaml (`desk init-config`) and edit. Secrets (API keys, dashboard token, alert
+# topics) are NOT configured here; they come from environment variables — see .env.example.
+#
+# Every UniTrader-specific value below is a PLACEHOLDER until you confirm it on your own terminal:
+#   * instrument contract specs: copy them from UniTrader's symbol specification, then set
+#     specs_verified: true (demo/live mode refuses to trade an instrument until you do);
+#   * all screen coordinates live in the calibrated layout file produced by `desk calibrate`.
+
+# paper = simulated fills, no GUI automation (default)
+# demo  = clicks the UniTrader terminal; refuses unless the calibrated DEMO badge is on screen
+# live  = real money; also needs DESK_LIVE_ACK=I-ACCEPT-REAL-MONEY-RISK and a layout calibrated on the live account
+mode: paper
+data_dir: data
+
+instruments:
+  - symbol: EURUSD            # exactly as UniTrader names it (check your terminal)
+    feed_symbol: EUR/USD      # the market-data feed's name for it
+    enabled: true
+    pip_size: 0.0001
+    contract_size: 100000     # VERIFY in UniTrader's symbol specification
+    quote_currency: USD
+    lot_step: "0.01"          # VERIFY
+    min_lot: "0.01"           # VERIFY
+    max_lot: "0.10"           # your own per-order cap for this instrument
+    typical_spread_pips: 1.0  # used by paper fills and when the feed has no bid/ask
+    max_spread_pips: 3.0
+    price_decimals: 5
+    currencies: [EUR, USD]    # for news blackouts
+    sessions:                 # UTC; London + New York
+      - {days: [0, 1, 2, 3, 4], start: "07:00", end: "20:00"}
+    specs_verified: false     # set true only after copying the specs above from UniTrader
+
+  - symbol: GBPUSD
+    feed_symbol: GBP/USD
+    enabled: true
+    pip_size: 0.0001
+    contract_size: 100000     # VERIFY
+    quote_currency: USD
+    lot_step: "0.01"          # VERIFY
+    min_lot: "0.01"           # VERIFY
+    max_lot: "0.10"
+    typical_spread_pips: 1.5
+    max_spread_pips: 4.0
+    price_decimals: 5
+    currencies: [GBP, USD]
+    sessions:
+      - {days: [0, 1, 2, 3, 4], start: "07:00", end: "20:00"}
+    specs_verified: false
+
+  # Index CFDs differ a lot between brokers (value per point per lot, lot step, minimum size).
+  # They are disabled until you fill in UniTrader's real specification and your feed covers them.
+  - symbol: NAS100
+    feed_symbol: NDX          # check that your data plan includes this symbol
+    enabled: false
+    pip_size: 1.0             # one index point
+    contract_size: 1          # VERIFY: account-currency value of 1 point for 1.0 lot
+    quote_currency: USD
+    lot_step: "0.1"           # VERIFY
+    min_lot: "0.1"            # VERIFY
+    max_lot: "1.0"
+    typical_spread_pips: 2.0
+    max_spread_pips: 6.0
+    price_decimals: 1
+    currencies: [USD]
+    sessions:
+      - {days: [0, 1, 2, 3, 4], start: "13:30", end: "20:00"}
+    specs_verified: false
+
+  - symbol: US30
+    feed_symbol: DJI
+    enabled: false
+    pip_size: 1.0
+    contract_size: 1          # VERIFY
+    quote_currency: USD
+    lot_step: "0.1"           # VERIFY
+    min_lot: "0.1"            # VERIFY
+    max_lot: "1.0"
+    typical_spread_pips: 3.0
+    max_spread_pips: 8.0
+    price_decimals: 1
+    currencies: [USD]
+    sessions:
+      - {days: [0, 1, 2, 3, 4], start: "13:30", end: "20:00"}
+    specs_verified: false
+
+strategy:                     # Cyan Scout + Lime Charts
+  timeframe_minutes: 5
+  donchian_lookback: 20
+  atr_period: 14
+  atr_slow_period: 100
+  breakout_buffer_atr: 0.05
+  min_range_atr: 1.2
+  min_body_ratio: 0.5
+  min_close_location: 0.6
+  max_extension_atr: 1.0
+  squeeze_period: 20
+  squeeze_lookback: 100
+  max_squeeze_percentile: 0.5
+  trend_ema_period: 50
+  trend_slope_bars: 5
+  require_trend_alignment: true
+  stop_atr_mult: 1.5
+  target_r: 2.0
+  time_stop_bars: 24
+  min_stop_spread_multiple: 4.0
+  signal_cooldown_bars: 6
+  stale_after_bars: 2
+
+risk:                         # Red Skeptic
+  account_currency: USD
+  starting_equity: 10000      # set to your demo balance; re-sync from the dashboard when it drifts
+  risk_per_trade_pct: 0.25    # hard ceiling 2.0
+  max_lots_per_order: "0.10"
+  max_open_positions: 1       # must stay 1 with exit_method: close_all
+  max_positions_per_symbol: 1
+  max_trades_per_day: 4
+  max_daily_loss_pct: 1.5
+  max_consecutive_losses: 3
+  loss_streak_cooldown_minutes: 240
+  min_minutes_between_trades: 15
+  symbol_cooldown_minutes_after_loss: 60
+  day_rollover_utc: "00:00"
+  flatten_on_daily_loss: false
+
+news:                         # Yellow News
+  block_weekends: true
+  weekend_close_utc: "20:45"
+  weekend_open_utc: "22:15"
+  rollover_block: {days: [0, 1, 2, 3, 4, 5, 6], start: "20:50", end: "22:10"}
+  blackout_minutes_before: 15
+  blackout_minutes_after: 15
+  # Add high-impact events you care about (UTC). Or point events_file at a YAML list you maintain.
+  events: []
+  #  - {at: "2026-10-09T12:30:00Z", currencies: [USD], title: "US Non-Farm Payrolls"}
+  # events_file: config/news_events.yaml
+
+llm:                          # Pink Sentiment (Claude, veto-only)
+  enabled: false              # needs ANTHROPIC_API_KEY
+  model: claude-opus-5-5
+  effort: low
+  max_tokens: 4096
+  timeout_seconds: 60
+  max_retries: 2
+  server_fallback: true       # server-side refusal fallback (beta)
+  failure_policy: veto        # veto = no trade when Claude is unreachable; abstain = trade on deterministic checks
+  max_calls_per_day: 40
+  recent_bars: 30
+
+feed:
+  kind: synthetic             # synthetic | csv | twelvedata (needs TWELVEDATA_API_KEY)
+  poll_delay_seconds: 5
+  max_staleness_bars: 3
+  synthetic: {seed: 7, interval_seconds: 1.0}
+  twelvedata:
+    daily_credit_limit: 800   # check your plan in the Twelve Data dashboard
+    per_minute_credit_limit: 8
+    poll_outside_sessions: false
+
+execution:
+  venue: paper                # paper | unitrader (demo/live)
+  dry_run: false              # true = run every pre-click check against the terminal, never type or click
+  paper: {slippage_pips: 0.2}
+  unitrader:
+    layout_path: config/unitrader.layout.yaml   # written by `desk calibrate`
+    backend: win32                              # win32 on the VPS; fake = built-in simulator for demos/tests
+    template_threshold: 0.92
+    lot_readback: clipboard
+    commit_key: tab
+    decimal_separator: "."
+    fill_timeout_seconds: 8
+    protective_orders: none   # panel_fields only if YOUR one-click panel has SL/TP inputs (calibrate them)
+    exit_method: close_all    # opposite_order only on a netting account (set netting_account_confirmed)
+    save_evidence: true
+    health_interval_seconds: 30
+
+dashboard:
+  enabled: true
+  host: 127.0.0.1             # reach it from your phone via an SSH tunnel or Tailscale, not a public port
+  port: 8765
+  allowed_hosts: [127.0.0.1, localhost]
+  allow_manual_meetings: true
+
+notify:
+  ntfy_server: https://ntfy.sh
+  min_interval_seconds: 300

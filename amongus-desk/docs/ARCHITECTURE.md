@@ -267,7 +267,7 @@ Exit rules per closed bar (long; mirror for short): `low <= stop` gives STOP. Ot
 TARGET. Both in the same bar gives STOP (conservative). Otherwise `bars_held >= time_stop_bars` gives TIME.
 Exit price: with `protective_at_broker`, the stop/target level (or the bar open if it gapped through).
 Software-managed positions use the bar close, because the desk only acts at bar close. P&L comes from
-`risk.estimate_pnl`. Equity = starting equity + all realized estimates + operator adjustments. Unrealized
+`money.estimate_pnl`. Equity = starting equity + all realized estimates + operator adjustments. Unrealized
 uses `last_price`. `trades_today` counts positions opened since `trading_day_start`.
 
 ### `execution/unitrader/vision.py`
@@ -376,17 +376,183 @@ numeric JSON, that the reviewer can only APPROVE or VETO, and when to veto.
 
 ### Wave 2/3 (built on top of the above)
 
-* `crew.py` / `meeting.py`: crewmate classes producing `CrewReport`s and `EmergencyMeeting.convene(...)
-  -> MeetingRecord` with an Among Us-style transcript. Pink runs only when every deterministic crewmate
-  votes PROCEED.
-* `engine.py`: `DeskEngine` wires feed, history, scout, meeting, store, audit, position book, venue,
-  kill switch, notifier and event hub. Startup reconciliation: PENDING intents → ABORTED (never reached
-  the venue); SUBMITTING/UNCONFIRMED → reconcile required (trading halted until the operator resolves
-  it). Watchdog loop. Operator actions: kill, resume, panic, reconcile, adjust equity, manual meeting.
-* `dashboard/`: FastAPI app factory, bearer-token auth (`hmac.compare_digest`), Host allow-list,
-  security headers/CSP, auth-failure lockout, SSE via fetch streaming (no token in URLs), and a mobile-first
-  Among Us UI.
-* `cli.py`: `desk run | preflight | calibrate | test-order | backtest | kill | resume | status | audit-verify | init-config`.
-  The interactive login gate lives in `run`/`preflight` for demo/live.
-* `backtest.py`: same scout/charts/calendar/risk/position code on CSV or synthetic bars, fills at the
-  next bar open, report of trades, win rate, expectancy (R), profit factor, max drawdown.
+#### `crew.py` — the six crewmates
+
+```python
+@dataclass(frozen=True)
+class MeetingContext:
+    now: datetime
+    mode: Mode
+    instrument: InstrumentConfig
+    bars: Sequence[Bar]            # this symbol's history, oldest first, last = just-closed bar
+    quote: Quote | None
+    snapshot: RiskSnapshot
+    last_bar_end: datetime | None
+
+    @property
+    def spread_price(self) -> float  # quote.spread if a quote exists, else instrument.typical_spread_price
+
+class CyanScout:      def report(self, result: ScoutResult) -> CrewReport
+class LimeCharts:     def __init__(self, planner: ChartsPlanner); def assess(self, signal, ctx) -> tuple[CrewReport, TradePlan | None]
+class YellowNews:     def __init__(self, calendar: NewsCalendar); def assess(self, ctx) -> CrewReport
+class RedSkeptic:     def __init__(self, cfg: DeskConfig, gate: RiskGate); def assess(self, plan, ctx) -> tuple[CrewReport, SizingResult]
+class PinkSentiment:  def __init__(self, cfg: DeskConfig, reviewer: TradeReviewer); async def assess(self, signal, plan, ctx) -> CrewReport
+class BlackChief:     def decide(self, signal, reports: Sequence[CrewReport], sizing: SizingResult | None) -> tuple[FinalAction, list[str]]
+```
+Chief rule: EXECUTE only if Cyan, Lime, Yellow and Red all vote PROCEED, Pink does not vote EJECT (HOLD =
+LLM disabled is fine), and the sizing has lots. Any EJECT gives SKIP_ROUND with the EJECT summaries as
+reasons. `CrewReport.details` holds the numbers behind each vote (JSON-safe).
+
+#### `meeting.py`
+
+```python
+class EmergencyMeeting:
+    def __init__(self, cfg: DeskConfig, *, planner: ChartsPlanner, calendar: NewsCalendar, gate: RiskGate,
+                 reviewer: TradeReviewer) -> None
+    async def convene(self, signal: BreakoutSignal, ctx: MeetingContext, *, trigger: Literal["breakout", "manual"] = "breakout",
+                      scout_report: CrewReport | None = None) -> MeetingRecord
+    async def no_signal_round(self, symbol: str, ctx: MeetingContext, scout_result: ScoutResult) -> MeetingRecord
+        # manual meeting without a breakout: Cyan EJECT with the scout's reason, others HOLD, decision SKIP_ROUND
+```
+Order of evaluation: Cyan → Lime → Yellow → Red → (Pink only if all four said PROCEED) → Chief. Crewmates
+that don't run report HOLD with the summary "skipped: <earlier EJECT>", so Claude is never paid for a
+trade that is already dead. The transcript is chat-style and timestamped (UTC `HH:MM:SS`):
+`SYSTEM: 🚨 EMERGENCY MEETING — EURUSD 🚨`, `Cyan Scout: ...`, ..., `Black Chief: EXECUTE_BUY 0.12 lots` or
+`... SKIP_ROUND (Red Skeptic ejected: ...)`. Only computed facts go in it, no invented flavour text about
+the market.
+
+#### `engine.py`
+
+```python
+class OperatorActionError(Exception): ...    # message is shown to the operator verbatim
+
+class DeskEngine:
+    def __init__(self, cfg: DeskConfig, *, feed: MarketDataFeed, venue: ExecutionVenue, reviewer: TradeReviewer,
+                 store: Store, audit: AuditLog, notifier: Notifier, hub: EventHub, clock: Clock,
+                 killswitch: KillSwitch, calendar: NewsCalendar) -> None
+    async def start(self) -> None   # load positions/intents from the store, startup reconciliation, warmup, venue preflight
+    async def run(self) -> None     # consume feed.stream() + watchdog until stop() or the feed ends
+    async def stop(self) -> None
+    async def on_bar(self, bar: Bar) -> None
+    def state(self) -> dict[str, Any]                     # JSON-safe snapshot, shape below
+    async def kill(self, reason: str, *, by: str) -> None
+    async def resume(self, *, by: str) -> None            # OperatorActionError while reconcile items are pending
+    async def panic(self, *, by: str) -> ExecutionReport | None
+    async def reconcile(self, item_id: str, outcome: Literal["filled", "not_filled"], *, fill_price: float | None, by: str) -> None
+    async def set_equity(self, equity: float, *, by: str) -> None        # operator syncs with the terminal's balance
+    async def manual_meeting(self, symbol: str, *, by: str, force_side: Side | None = None) -> MeetingRecord
+        # force_side is accepted ONLY in paper mode (OperatorActionError otherwise)
+```
+* **Startup reconciliation.** PENDING intents become ABORTED (the venue was never called). SUBMITTING
+  and UNCONFIRMED intents stay as reconcile items: new trading halts until the operator answers
+  filled/not filled. Active positions are reloaded.
+* **on_bar.** Ignore bars for disabled or unknown symbols. Update the position book, which may return
+  exits (close via the venue; a software-managed exit uses close_position; a broker-protected STOP/TARGET
+  is marked closed at the level without clicking). Add the bar to history. Run the scout. On a signal,
+  build the MeetingContext and convene. On EXECUTE_*, build an OrderIntent, `store.add_intent` (PENDING),
+  then `venue.submit(intent, quote, on_before_click=<persist SUBMITTING + audit>)`. Then persist the
+  report. CONFIRMED / RECONCILED_FILLED becomes `PositionBook.add_open` (protective =
+  `venue.supports_protective_orders`). UNCONFIRMED becomes a reconcile item, a phone alert and a halt.
+  REJECTED/ABORTED are logged and alerted. `report.operator_abort` engages the kill switch.
+* **Daily loss.** When `RiskGate.daily_loss_breached` is true, notify once per day. With
+  `flatten_on_daily_loss`, also run the panic close.
+* **Watchdog** (every `execution.unitrader.health_interval_seconds`, or 30 s for paper). It runs
+  `venue.health()` and checks feed staleness (no bar for `feed.max_staleness_bars` × timeframe during an
+  enabled instrument's session). Failures go into `degraded` (which blocks new trades through the risk
+  gate) plus a deduplicated alert. A failure that means "window/badge missing" produces the alert
+  "UniTrader needs you: log in to your <DEMO|LIVE> account yourself". The desk never tries to log in.
+* **Everything** of consequence is written to the audit log (meetings, intents and every status change,
+  operator actions, kill/resume, health transitions) and published on the EventHub. Event types:
+  `meeting`, `intent`, `position`, `kill`, `resume`, `health`, `bar`, `alert`, `equity`.
+
+`state()` shape (all JSON-safe; datetimes ISO-8601 UTC; Decimals as strings):
+```json
+{
+  "mode": "paper|demo|live", "venue": "paper|unitrader", "dry_run": false,
+  "started_at": "…", "now": "…",
+  "kill_switch": {"engaged": false, "reason": null, "by": null, "at": null},
+  "reconcile": [{"id": "…", "kind": "intent|position", "symbol": "EURUSD", "side": "BUY", "lots": "0.10",
+                 "status": "UNCONFIRMED", "created_at": "…", "message": "…"}],
+  "degraded": ["…"],
+  "health": {"venue": {"venue": "…", "ok": true, "checked_at": "…", "checks": [{"name": "…", "ok": true, "detail": "…"}]} ,
+             "feed": {"…": "…"}},
+  "equity": {"estimate": 10000.0, "day_start": 10000.0, "realized_today": 0.0, "unrealized": 0.0, "currency": "USD"},
+  "limits": {"trades_today": 0, "max_trades_per_day": 4, "open_positions": 0, "max_open_positions": 1,
+             "daily_loss_pct": 0.0, "max_daily_loss_pct": 1.5},
+  "positions": [Position, …],
+  "crew": [{"id": "CYAN_SCOUT", "name": "Cyan Scout", "color": "#38fedc", "role": "…", "vote": "HOLD", "summary": "…", "at": null}],
+  "meetings": [MeetingRecord, … latest first, max 20],
+  "intents": [{"intent": OrderIntent, "status": "CONFIRMED", "report": ExecutionReport | null}, … max 20],
+  "instruments": [{"symbol": "EURUSD", "enabled": true, "specs_verified": true, "in_session": true,
+                   "last_bar": {"start": "…", "close": 1.0852} | null}],
+  "llm": {"enabled": false, "calls": 0, "…": "…"}
+}
+```
+
+#### `dashboard/server.py` + `dashboard/static/`
+
+`create_app(engine: DeskEngine, cfg: DeskConfig, token: str) -> FastAPI`.
+* `GET /` and `/static/*` are public (no data in them). `GET /api/health` is public and returns
+  `{"ok": true}` only.
+* Everything else under `/api` needs `Authorization: Bearer <token>`, compared with `hmac.compare_digest`.
+  After `max_auth_failures` failures inside `auth_failure_window_seconds` from one client IP, the API
+  returns 429.
+* The Host header must be in `dashboard.allowed_hosts` (port stripped), else 400 (DNS-rebinding guard).
+* Security headers on every response: `Content-Security-Policy: default-src 'self'; img-src 'self' data:;
+  style-src 'self'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none';
+  form-action 'none'`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`,
+  `X-Frame-Options: DENY`, `Cache-Control: no-store` on `/api`.
+* `GET /api/state` returns `engine.state()`.
+* `GET /api/events` is SSE (`text/event-stream`) of hub events (`event: <type>`, `data: <json>`) plus a
+  keep-alive comment every 15 s. Use `async with hub.subscribe() as sub:` and `await sub.next_within(15)`
+  (returns `None` on timeout, which is when to send the keep-alive). Leaving the `async with` releases the
+  subscription when the client disconnects. Clients read it with `fetch()` streaming so the token stays in a header,
+  never in a URL.
+* `POST /api/kill {"reason": str}`, `POST /api/resume {"confirm": "RESUME"}`,
+  `POST /api/panic {"confirm": "PANIC"}`, `POST /api/reconcile {"id": str, "outcome": "filled|not_filled",
+  "fill_price": float|null}`, `POST /api/equity {"equity": float}`, `POST /api/meeting {"symbol": str,
+  "force_side": "BUY|SELL|null"}` (only when `allow_manual_meetings`). `OperatorActionError` becomes 409
+  `{"error": msg}`. Validation errors are 422. All bodies use Pydantic models with `extra="forbid"`.
+* The UI (vanilla JS, no CDN, no inline scripts or styles so the CSP holds) is mobile-first and
+  Among Us-themed (space background, SVG crewmates in the role colours). It has a token prompt (stored in
+  `localStorage`), a status bar (mode badge PAPER/DEMO/LIVE, kill switch, health, equity estimate, trades
+  vs limit), the crew board (vote and summary per crewmate), the emergency-meeting chat transcript with an
+  "EMERGENCY MEETING" banner animation on new meetings, the positions table, recent orders, reconcile cards
+  (filled / not filled), kill/resume, a **hold-to-confirm** PANIC button (2 s press), manual meeting
+  (symbol picker; force side only in paper mode), and estimated values labelled "est." everywhere. Mark
+  the DEMO/LIVE mode badge loudly (LIVE in red).
+
+#### `cli.py`
+
+`desk run | preflight | calibrate | test-order | backtest | kill | resume | status | audit-verify | init-config`
+(argparse; `-c/--config` defaults to `config/desk.yaml`).
+* `run` builds every component from the config. It takes the single-instance lock, configures logging and
+  ensures the dashboard token (`DESK_DASHBOARD_TOKEN`, or one generated and saved to
+  `data_dir/dashboard_token` with 0600 permissions; printed once). For demo/live it runs the **login
+  gate**: run the preflight; if it fails, print the failing checks and the instruction "Open UniTrader and
+  log in to your DEMO account yourself (this tool never handles your password), then press Enter to
+  re-check, or type q to quit". Re-check until green. Without a TTY, poll every 30 s and send one alert.
+  Then it starts the engine and uvicorn in one event loop and shuts down cleanly on Ctrl+C.
+* `preflight` runs the config + layout + venue preflight (with the same interactive login gate when
+  `--wait-for-login` is passed) and exits non-zero on failure.
+* `calibrate` runs the wizard (Windows backend, or `--simulate` for the fake terminal).
+* `test-order --symbol EURUSD --side BUY [--lots 0.01] [--close]` places ONE order through the configured
+  venue after an explicit typed confirmation. It refuses in live mode unless `--i-know-this-is-live`.
+* `backtest --csv PATH | --synthetic N [--symbol S] [--json]`.
+* `kill [--reason]`, `resume`, `status` (summary from the store + kill file; works while the desk is
+  running) and `audit-verify`.
+* `init-config [--path config/desk.yaml]` copies the example config without overwriting anything.
+* Exit codes (`scripts/windows/run-desk.ps1` relies on them): 0 = clean exit, 1 = unexpected error,
+  2 = configuration error, 3 = another instance is already running, 4 = preflight failed or the operator
+  quit at the login gate, 130 = interrupted (Ctrl+C) before the engine started.
+
+
+#### `backtest.py`
+
+`run_backtest(cfg: DeskConfig, bars: Mapping[str, Sequence[Bar]]) -> BacktestReport` uses the real scout,
+planner, calendar, sizing and risk gate. The LLM is never called. A signal at a bar close fills at the
+**next bar's open**, plus or minus half the typical spread and slippage. Exits follow `PositionBook` rules
+(`protective_orders` decides stop-level vs bar-close exits, as in live). Uses a `ManualClock` driven by
+bar time. The report shows trades (list), count, win rate, average R, expectancy R, profit factor, max
+drawdown (account currency and %), total return %, signals seen, and skipped rounds by reason.
+`format_report(report) -> str` prints a plain-text table.

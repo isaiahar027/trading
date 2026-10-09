@@ -1,0 +1,14 @@
+.venv
+**/__pycache__
+.pytest_cache
+.mypy_cache
+.ruff_cache
+data
+.env
+.env.*
+!.env.example
+config/*.layout.yaml
+config/templates
+tests
+docs
+scripts

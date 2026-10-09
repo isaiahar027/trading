@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <meta name="referrer" content="no-referrer">
+  <title>Among Us Trading Desk</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <div class="stars" aria-hidden="true"></div>
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-icon" id="brand-icon" aria-hidden="true"></span>
+      <div>
+        <h1>Among Us Trading Desk</h1>
+        <p class="subtitle" id="subtitle">connecting…</p>
+      </div>
+    </div>
+    <div class="topbar-badges">
+      <span class="badge mode" id="mode-badge">—</span>
+      <span class="badge" id="kill-badge" hidden>KILL SWITCH</span>
+      <span class="conn" id="conn" title="live connection" aria-label="connection status"></span>
+    </div>
+  </header>
+
+  <main>
+    <section class="alerts" id="alerts" aria-live="polite"></section>
+
+    <section class="cards" aria-label="Key numbers">
+      <div class="card stat"><span class="label">Equity <small>est.</small></span><span class="value" id="stat-equity">—</span></div>
+      <div class="card stat"><span class="label">Today P&amp;L <small>est.</small></span><span class="value" id="stat-pnl">—</span></div>
+      <div class="card stat"><span class="label">Trades today</span><span class="value" id="stat-trades">—</span></div>
+      <div class="card stat"><span class="label">Open positions</span><span class="value" id="stat-positions">—</span></div>
+      <div class="card stat"><span class="label">Daily loss vs limit</span><span class="value" id="stat-loss">—</span></div>
+      <div class="card stat"><span class="label">Claude reviews today</span><span class="value" id="stat-llm">—</span></div>
+    </section>
+
+    <section class="panel" id="reconcile-panel" hidden>
+      <h2>⚠️ Check the terminal</h2>
+      <p class="hint">The desk clicked but could not prove what happened. Look at UniTrader, then answer. New trades stay halted until every card is resolved.</p>
+      <div id="reconcile-list" class="reconcile-list"></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Crew</h2>
+        <span class="hint" id="crew-hint"></span>
+      </div>
+      <div class="crew" id="crew"></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Emergency meeting</h2>
+        <label class="select-wrap">
+          <span class="sr-only">Meeting</span>
+          <select id="meeting-select" aria-label="Choose a meeting"></select>
+        </label>
+      </div>
+      <div class="meeting-summary" id="meeting-summary"></div>
+      <ol class="chat" id="chat" aria-live="polite"></ol>
+    </section>
+
+    <section class="panel">
+      <h2>Positions</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Symbol</th><th>Side</th><th>Lots</th><th>Entry</th><th>Stop</th><th>Target</th><th>Last</th><th>P&amp;L <small>est.</small></th><th>Status</th><th>Opened</th></tr></thead>
+          <tbody id="positions"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Recent orders</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Time</th><th>Purpose</th><th>Symbol</th><th>Side</th><th>Lots</th><th>Status</th><th>Detail</th></tr></thead>
+          <tbody id="intents"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel controls">
+      <h2>Controls</h2>
+      <div class="control-row">
+        <button class="btn warn" id="btn-kill" type="button">Kill switch</button>
+        <button class="btn" id="btn-resume" type="button">Resume</button>
+        <button class="btn danger hold" id="btn-panic" type="button" aria-describedby="panic-help">
+          <span class="hold-fill" aria-hidden="true"></span>
+          <span class="hold-label">Hold 2 s: PANIC close all</span>
+        </button>
+      </div>
+      <p class="hint" id="panic-help">Panic engages the kill switch and clicks the calibrated close-all button. Without one, close positions in UniTrader yourself.</p>
+
+      <form class="control-row" id="meeting-form">
+        <label>Symbol <select id="meeting-symbol"></select></label>
+        <label id="force-wrap" hidden>Force side (paper only)
+          <select id="meeting-force"><option value="">none</option><option>BUY</option><option>SELL</option></select>
+        </label>
+        <button class="btn" type="submit">🚨 Call emergency meeting</button>
+      </form>
+
+      <form class="control-row" id="equity-form">
+        <label>Sync equity with the terminal <input id="equity-input" type="number" step="0.01" min="0.01" inputmode="decimal" required></label>
+        <button class="btn" type="submit">Save</button>
+      </form>
+      <p class="toast" id="toast" role="status" aria-live="polite"></p>
+    </section>
+
+    <section class="panel">
+      <h2>Health</h2>
+      <ul class="health" id="health"></ul>
+      <h3>Instruments</h3>
+      <ul class="instruments" id="instruments"></ul>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <p>P&amp;L and equity are estimates: the desk can’t read the broker’s ledger. The desk never logs in to UniTrader. You do.</p>
+  </footer>
+
+  <div class="meeting-banner" id="meeting-banner" hidden>
+    <div class="meeting-banner-inner">
+      <span class="banner-crew" id="banner-crew" aria-hidden="true"></span>
+      <strong>EMERGENCY MEETING</strong>
+      <span id="banner-symbol"></span>
+    </div>
+  </div>
+
+  <dialog id="token-dialog">
+    <form method="dialog" id="token-form">
+      <h2>Dashboard token</h2>
+      <p>Paste the token printed when the desk started (or <code>DESK_DASHBOARD_TOKEN</code>). It is kept on this device only.</p>
+      <input id="token-input" type="password" autocomplete="off" required minlength="8" aria-label="Dashboard token">
+      <p class="error" id="token-error"></p>
+      <button class="btn" type="submit">Unlock</button>
+    </form>
+  </dialog>
+
+  <dialog id="confirm-dialog">
+    <form method="dialog" id="confirm-form">
+      <h2 id="confirm-title">Confirm</h2>
+      <p id="confirm-text"></p>
+      <label id="confirm-input-wrap" hidden><span id="confirm-input-label"></span><input id="confirm-input" autocomplete="off"></label>
+      <div class="control-row">
+        <button class="btn" value="cancel" type="submit">Cancel</button>
+        <button class="btn warn" value="ok" type="submit" id="confirm-ok">OK</button>
+      </div>
+    </form>
+  </dialog>
+</body>
+</html>
