@@ -123,6 +123,14 @@ class DeskEngine:
         return self._book
 
     @property
+    def hub(self) -> EventHub:
+        return self._hub
+
+    @property
+    def config(self) -> DeskConfig:
+        return self._cfg
+
+    @property
     def history(self) -> BarHistory:
         return self._history
 

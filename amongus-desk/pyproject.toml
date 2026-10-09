@@ -18,7 +18,6 @@ dependencies = [
   "httpx2>=2.0,<3",
   "fastapi>=0.115",
   "uvicorn>=0.30",
-  "sse-starlette>=2.1",
 ]
 
 [project.optional-dependencies]
@@ -73,5 +72,5 @@ packages = ["amongus_desk"]
 plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
-module = ["pyautogui", "pyautogui.*", "pytesseract", "sse_starlette.*"]
+module = ["pyautogui", "pyautogui.*", "pytesseract"]
 ignore_missing_imports = true
