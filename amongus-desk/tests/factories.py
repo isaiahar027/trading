@@ -57,8 +57,58 @@ def make_bar(
     tf: int = 5,
     start: datetime = T0,
 ) -> Bar:
-    return Bar(symbol=symbol, start=start + timedelta(minutes=tf * i), timeframe_minutes=tf, open=o, high=h, low=l, close=c)
+    return Bar(
+        symbol=symbol, start=start + timedelta(minutes=tf * i), timeframe_minutes=tf, open=o, high=h, low=l, close=c
+    )
 
 
 def lots(value: str) -> Decimal:
     return Decimal(value)
+
+
+# ----------------------------------------------------------------------------------- breakout scenarios
+
+SMALL_STRATEGY: dict[str, Any] = {
+    "donchian_lookback": 10,
+    "atr_period": 5,
+    "atr_slow_period": 20,
+    "squeeze_period": 10,
+    "squeeze_lookback": 20,
+    "trend_ema_period": 20,
+    "trend_slope_bars": 3,
+    "signal_cooldown_bars": 4,
+}
+
+
+def base_series(direction: int = 1, n_noisy: int = 25, n_quiet: int = 12, *, symbol: str = "EURUSD") -> list[Bar]:
+    """Noisy drift, then a tight squeeze drifting in ``direction``. Prices around 1.1000."""
+    bars: list[Bar] = []
+    price = 1.1000
+    for i in range(n_noisy):
+        o = price
+        c = price + direction * 0.00010 + (0.0004 if i % 2 else -0.0004)
+        bars.append(make_bar(i, o, max(o, c) + 0.0003, min(o, c) - 0.0003, c, symbol=symbol))
+        price = c
+    for j in range(n_quiet):
+        o = price
+        c = price + direction * 0.00002
+        bars.append(make_bar(n_noisy + j, o, max(o, c) + 0.0001, min(o, c) - 0.0001, c, symbol=symbol))
+        price = c
+    return bars
+
+
+def breakout_bar(bars: list[Bar], direction: int = 1, *, size: float = 0.0006, body: float = 0.8) -> Bar:
+    """A strong bar closing beyond the recent 10-bar channel."""
+    window = bars[-10:]
+    edge = max(b.high for b in window) if direction > 0 else min(b.low for b in window)
+    o = edge - direction * 0.00005
+    c = o + direction * size * body
+    hi = max(o, c) + size * (1 - body) / 2
+    lo = min(o, c) - size * (1 - body) / 2
+    return make_bar(len(bars), o, hi, lo, c, symbol=bars[-1].symbol)
+
+
+def breakout_series(direction: int = 1, *, symbol: str = "EURUSD") -> list[Bar]:
+    bars = base_series(direction, symbol=symbol)
+    bars.append(breakout_bar(bars, direction))
+    return bars

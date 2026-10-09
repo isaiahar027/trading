@@ -8,52 +8,13 @@ import pytest
 from amongus_desk.config import StrategyConfig
 from amongus_desk.domain import Bar, Side, Vote
 from amongus_desk.strategy import BarHistory, BreakoutScout, ChartsPlanner
-from factories import T0, make_bar, make_instrument
+from factories import SMALL_STRATEGY, T0, base_series, breakout_bar, make_bar, make_instrument
 
-SMALL: dict[str, Any] = {
-    "donchian_lookback": 10,
-    "atr_period": 5,
-    "atr_slow_period": 20,
-    "squeeze_period": 10,
-    "squeeze_lookback": 20,
-    "trend_ema_period": 20,
-    "trend_slope_bars": 3,
-    "signal_cooldown_bars": 4,
-}
+SMALL = SMALL_STRATEGY
 
 
 def scfg(**over: Any) -> StrategyConfig:
     return StrategyConfig.model_validate({**SMALL, **over})
-
-
-def base_series(direction: int = 1, n_noisy: int = 25, n_quiet: int = 12) -> list[Bar]:
-    """Noisy drift, then a tight squeeze drifting in ``direction``. Prices around 1.1000."""
-    bars: list[Bar] = []
-    price = 1.1000
-    for i in range(n_noisy):
-        o = price
-        c = price + direction * 0.00010 + (0.0004 if i % 2 else -0.0004)
-        hi, lo = max(o, c) + 0.0003, min(o, c) - 0.0003
-        bars.append(make_bar(i, o, hi, lo, c))
-        price = c
-    for j in range(n_quiet):
-        o = price
-        c = price + direction * 0.00002
-        bars.append(make_bar(n_noisy + j, o, max(o, c) + 0.0001, min(o, c) - 0.0001, c))
-        price = c
-    return bars
-
-
-def breakout_bar(bars: list[Bar], direction: int = 1, *, size: float = 0.0006, body: float = 0.8) -> Bar:
-    """A strong bar closing beyond the recent channel."""
-    i = len(bars)
-    window = bars[-10:]
-    edge = max(b.high for b in window) if direction > 0 else min(b.low for b in window)
-    o = edge - direction * 0.00005
-    c = o + direction * size * body
-    hi = max(o, c) + size * (1 - body) / 2
-    lo = min(o, c) - size * (1 - body) / 2
-    return make_bar(i, o, hi, lo, c)
 
 
 def test_long_breakout_signal() -> None:
