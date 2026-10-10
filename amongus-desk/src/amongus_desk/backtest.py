@@ -178,6 +178,7 @@ class _Pending:
     plan: TradePlan
     lots: Decimal
     meeting_id: str
+    decided_at: datetime
 
 
 def run_backtest(cfg: DeskConfig, bars: Mapping[str, Sequence[Bar]]) -> BacktestReport:
@@ -288,6 +289,16 @@ def run_backtest(cfg: DeskConfig, bars: Mapping[str, Sequence[Bar]]) -> Backtest
             continue
         report.signals += 1
         snapshot = book.snapshot(bar.end, kill_switch=False, kill_reason=None, reconcile_pending=[], degraded=[])
+        if pending:
+            # Live, an approved entry is filled before the next meeting runs; here it waits for the next
+            # open, so count it as a trade already taken (daily cap, spacing between trades).
+            last_decision = max(p.decided_at for p in pending.values())
+            snapshot = snapshot.model_copy(
+                update={
+                    "trades_today": snapshot.trades_today + len(pending),
+                    "last_trade_at": max(filter(None, (snapshot.last_trade_at, last_decision))),
+                }
+            )
         ctx = MeetingContext(
             now=bar.end,
             mode=Mode.PAPER,
@@ -304,7 +315,7 @@ def run_backtest(cfg: DeskConfig, bars: Mapping[str, Sequence[Bar]]) -> Backtest
         if len(book.active()) + len(pending) >= cfg.risk.max_open_positions or bar.symbol in pending:
             report.skipped["Red Skeptic: max_open_positions (pending entry)"] += 1
             continue
-        pending[bar.symbol] = _Pending(plan=record.plan, lots=record.lots, meeting_id=record.id)
+        pending[bar.symbol] = _Pending(plan=record.plan, lots=record.lots, meeting_id=record.id, decided_at=bar.end)
 
     for pos in book.active():
         last = last_close.get(pos.symbol)

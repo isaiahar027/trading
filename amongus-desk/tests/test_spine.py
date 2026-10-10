@@ -108,13 +108,42 @@ def test_live_requires_ack_and_protection() -> None:
         DeskConfig.model_validate({**raw, "secrets": Secrets()})
     with pytest.raises(ValueError, match="protective_orders"):
         DeskConfig.model_validate({**raw, "secrets": Secrets(live_ack=LIVE_ACK_PHRASE)})
+    protected = _raw(mode="live", execution={"venue": "unitrader", "unitrader": {"protective_orders": "panel_fields"}})
+    with pytest.raises(ValueError, match="needs real market data"):
+        DeskConfig.model_validate({**protected, "secrets": Secrets(live_ack=LIVE_ACK_PHRASE)})
     ok = DeskConfig.model_validate(
-        {
-            **_raw(mode="live", execution={"venue": "unitrader", "unitrader": {"protective_orders": "panel_fields"}}),
-            "secrets": Secrets(live_ack=LIVE_ACK_PHRASE),
-        }
+        {**protected, "feed": {"kind": "twelvedata"}, "secrets": Secrets(live_ack=LIVE_ACK_PHRASE)}
     )
     assert ok.mode is Mode.LIVE
+
+
+def test_demo_on_the_real_terminal_needs_real_market_data() -> None:
+    real = {"mode": "demo", "execution": {"venue": "unitrader", "unitrader": {"backend": "win32"}}}
+    for kind in ("synthetic", "csv"):
+        feed = {"kind": kind, "csv": {"path": "bars.csv"}} if kind == "csv" else {"kind": kind}
+        with pytest.raises(ValueError, match="needs real market data"):
+            DeskConfig.model_validate({**_raw(**real), "feed": feed, "secrets": Secrets()})
+    assert DeskConfig.model_validate({**_raw(**real), "feed": {"kind": "twelvedata"}, "secrets": Secrets()})
+    # The built-in simulated terminal may run on synthetic prices.
+    simulated = {"mode": "demo", "execution": {"venue": "unitrader", "unitrader": {"backend": "fake"}}}
+    assert DeskConfig.model_validate({**_raw(**simulated), "secrets": Secrets()})
+
+
+def test_dotenv_loader_never_overrides_and_skips_blanks(tmp_path: Path) -> None:
+    from amongus_desk.config import load_dotenv, project_root
+
+    (tmp_path / ".env").write_text(
+        "# comment\nANTHROPIC_API_KEY=\nTWELVEDATA_API_KEY='abc'\n"
+        'export DESK_NTFY_TOPIC="t o p"\nX=keep\nnot a line\n',
+        encoding="utf-8",
+    )
+    env = {"X": "already"}
+    assert load_dotenv(tmp_path / ".env", env) == ["TWELVEDATA_API_KEY", "DESK_NTFY_TOPIC"]
+    assert env == {"X": "already", "TWELVEDATA_API_KEY": "abc", "DESK_NTFY_TOPIC": "t o p"}
+    assert load_dotenv(tmp_path / "missing.env", env) == []
+    (tmp_path / "config").mkdir()
+    assert project_root(tmp_path / "config" / "desk.yaml") == tmp_path.resolve()
+    assert project_root(tmp_path / "desk.yaml") == tmp_path.resolve()
 
 
 @pytest.mark.parametrize(

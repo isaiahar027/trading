@@ -200,7 +200,10 @@ class FakeTerminal:
       covering a client rectangle), ``refuse_focus``, ``steal_focus_after_actions``;
     * looks: ``badge_text`` (alias ``badge``; "DEMO"/"LIVE"/anything), ``one_click_enabled``, ``swap_panels``,
       ``indicator_flicker``;
-    * fields: ``lot_field_ignores_select_all``, ``clipboard_copy_broken``, ``lot_field_transform``;
+    * fields: ``lot_field_ignores_select_all``, ``clipboard_copy_broken``, ``lot_field_transform`` (applied while
+      typing into the lot field), ``commit_transform`` (applied to any field when it commits: tab/enter, or the
+      focus leaving it for another field or a button), ``empty_copy_keeps_clipboard`` (ctrl+c in an empty field
+      copies nothing);
     * orders: ``fill_enabled``, ``fill_delay_seconds``, ``order_confirm_dialog``,
       ``close_all_confirm_dialog``, ``order_error``, ``netting``;
     * operator fail-safe: ``failsafe_after_actions`` (input actions allowed before the fail-safe
@@ -258,6 +261,8 @@ class FakeTerminal:
         self.lot_field_ignores_select_all = False
         self.clipboard_copy_broken = False
         self.lot_field_transform: Callable[[str], str] | None = None
+        self.commit_transform: Callable[[FieldKind, str], str] | None = None
+        self.empty_copy_keeps_clipboard = False
         # orders
         self.fill_enabled = True
         self.fill_delay_seconds = 0.0
@@ -577,12 +582,21 @@ class FakeTerminal:
         if self.has_close_all and geo.close_all.contains(cx, cy):
             self._close_all_click()
             return
-        self._focused = None
-        self._selected_all = False
+        self._commit_focused()
 
     def _focus(self, symbol: str, kind: FieldKind) -> None:
+        if self._focused != (symbol, kind):
+            self._commit_focused()  # the previously focused field loses the focus
         self._focused = (symbol, kind)
         self._selected_all = False  # a click puts the caret at the end, nothing selected
+
+    def _commit_focused(self) -> None:
+        """The focused field commits its text (tab/enter or the focus moving away) and loses the focus."""
+        target = self._focused
+        if target is not None and self.commit_transform is not None:
+            self._fields[target] = self.commit_transform(target[1], self._fields[target])
+        self._focused = None
+        self._selected_all = False
 
     def _keyboard_target(self) -> tuple[str, FieldKind] | None:
         if self.locked or self.foreground != HANDLE_TERMINAL or self._dialog is not None:
@@ -615,9 +629,12 @@ class FakeTerminal:
                     self._selected_all = True
                 return None
             if norm == ("ctrl", "c"):
-                if self._selected_all and not self.clipboard_copy_broken:
-                    return self._fields[target]
-                return None
+                text = self._fields[target]
+                if not self._selected_all or self.clipboard_copy_broken:
+                    return None
+                if not text and self.empty_copy_keeps_clipboard:
+                    return None  # an empty selection copies nothing
+                return text
             return None
 
     def press(self, key: str) -> None:
@@ -635,8 +652,7 @@ class FakeTerminal:
             if target is None:
                 return
             if key in ("tab", "enter", "return"):
-                self._focused = None
-                self._selected_all = False
+                self._commit_focused()
             elif key in ("backspace", "delete"):
                 if self._selected_all:
                     self._fields[target] = ""
@@ -650,8 +666,7 @@ class FakeTerminal:
         self.order_clicks.append((symbol, side))
         if self.failsafe_after_order_click:
             self._failsafe_armed = True
-        self._focused = None
-        self._selected_all = False
+        self._commit_focused()  # the button takes the focus: the field commits before the order reads it
         if not self.one_click_enabled:
             return
         if self.order_confirm_dialog:
@@ -693,6 +708,7 @@ class FakeTerminal:
 
     def _close_all_click(self) -> None:
         self.close_all_clicks += 1
+        self._commit_focused()
         if self.close_all_confirm_dialog:
             self._dialog = _Dialog("close_all_confirm")
             return

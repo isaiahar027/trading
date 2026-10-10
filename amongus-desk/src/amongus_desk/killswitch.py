@@ -2,20 +2,24 @@
 
 * :meth:`KillSwitch.engaged` is ``True`` whenever an entry named ``KILL`` exists, whatever it contains.
   Operators may create it by hand (an empty file is fine, e.g. from the VPS desktop) and the CLI
-  (``desk kill`` / ``desk resume``) may write it from another process.
+  (``desk kill`` / ``desk resume``) may write it from another process. Any case and any extension count
+  too (``kill``, ``KILL.txt``): Windows Explorer's "New > Text Document" renamed to KILL is really
+  ``KILL.txt`` while file extensions are hidden.
 * :meth:`KillSwitch.engage` writes JSON ``{"reason", "by", "at"}`` atomically: a temporary file in the
   same directory is fsynced and then renamed over ``KILL``, so readers never see a partial file.
 * Fails closed: if the flag's state cannot be determined (permission errors, a ``KILL`` directory, ...)
   it counts as engaged, and if :meth:`engage` cannot persist the file at all this process stays halted
   in memory until :meth:`release`.
 
-Thread-safe. :meth:`engaged` is lock-free and costs one ``lstat`` call, because the GUI worker thread
-calls it right before clicking; writers are serialized by a lock.
+Thread-safe. :meth:`engaged` is lock-free and costs one ``lstat`` (plus a scan of the data folder when
+``KILL`` itself is absent), because the GUI worker thread calls it right before clicking; writers are
+serialized by a lock.
 """
 
 from __future__ import annotations
 
 import contextlib
+import functools
 import json
 import logging
 import os
@@ -90,11 +94,27 @@ class KillSwitch:
         try:
             os.lstat(self._path)
         except FileNotFoundError:
-            return False
+            return bool(self._variants())
         except OSError as exc:
             self._note_error(f"cannot check {self._path}: {exc}; treating the kill switch as engaged")
             return True
         return True
+
+    def _variants(self) -> list[Path]:
+        """Other entries that also count as the flag (``kill``, ``KILL.txt``, ...). Fails closed."""
+        found: list[Path] = []
+        try:
+            with os.scandir(self._dir) as entries:
+                for entry in entries:
+                    name = entry.name.upper()
+                    if entry.name != KILL_FILE_NAME and (name == KILL_FILE_NAME or name.startswith("KILL.")):
+                        found.append(Path(entry.path))
+        except FileNotFoundError:
+            return []
+        except OSError as exc:
+            self._note_error(f"cannot list {self._dir}: {exc}; treating the kill switch as engaged")
+            return [self._path]
+        return sorted(found)
 
     def reason(self) -> str | None:
         """Why the switch is engaged (tolerant of hand-written or garbage content); ``None`` if released."""
@@ -116,8 +136,16 @@ class KillSwitch:
 
     def _read(self) -> _KillInfo:
         latched = self._latched_info if self._latched.is_set() else None
+        target = self._path
         try:
-            entry = os.lstat(self._path)
+            try:
+                entry = os.lstat(target)
+            except FileNotFoundError:
+                variants = self._variants()
+                if not variants:
+                    raise
+                target = variants[0]
+                entry = os.lstat(target)
         except FileNotFoundError:
             if latched is not None:
                 reason, by, at = latched
@@ -130,9 +158,9 @@ class KillSwitch:
         if not stat.S_ISREG(entry.st_mode):
             if latched is not None:
                 return _KillInfo(True, latched[0], latched[1], latched[2], "file")
-            return _KillInfo(True, f"{KILL_FILE_NAME} entry present (not a regular file)", None, None, "file")
+            return _KillInfo(True, f"{target.name} entry present (not a regular file)", None, None, "file")
         try:
-            raw = _retry_on_windows(lambda: _read_regular_file(self._path))
+            raw = _retry_on_windows(lambda: _read_regular_file(target))
         except OSError as exc:
             return _KillInfo(True, f"kill file present but unreadable ({exc.strerror or exc})", None, None, "file")
         parsed_reason, parsed_by, parsed_at = _parse_kill_file(raw)
@@ -174,15 +202,16 @@ class KillSwitch:
         clean_by = _clean(by, MAX_BY_CHARS) or "unknown"
         with self._lock:
             previous = self._read()
-            try:
-                _retry_on_windows(lambda: os.remove(self._path))
-            except FileNotFoundError:
-                pass
-            except OSError as exc:
-                message = f"could not remove the kill switch file {self._path}: {exc}; delete it by hand to resume"
-                self._last_error = message
-                log.error("%s", message)
-                raise KillSwitchError(message) from exc
+            for path in [self._path, *self._variants()]:
+                try:
+                    _retry_on_windows(functools.partial(os.remove, path))
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    message = f"could not remove the kill switch file {path}: {exc}; delete it by hand to resume"
+                    self._last_error = message
+                    log.error("%s", message)
+                    raise KillSwitchError(message) from exc
             self._latched.clear()
             self._latched_info = None
             self._last_error = None

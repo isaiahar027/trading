@@ -12,9 +12,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
+import os
 import sys
+import threading
 from collections.abc import Awaitable, Callable, Sequence
 from decimal import Decimal, InvalidOperation
 from importlib import resources
@@ -22,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
-from .config import ConfigError, DeskConfig, load_config
+from .config import ConfigError, DeskConfig, load_config, load_dotenv, project_root
 from .domain import IntentStatus, Mode, OrderIntent, PositionStatus, Side, VenueHealth, utc_now
 from .runtime import AlreadyRunningError, SingleInstanceLock, configure_logging
 
@@ -62,8 +65,14 @@ async def login_gate(
     on_wait: Callable[[str], Awaitable[None]] | None = None,
     max_polls: int | None = None,
 ) -> bool:
-    """Wait until the terminal passes preflight. The operator logs in; this only looks and asks."""
+    """Wait until the terminal passes preflight. The operator logs in; this only looks and asks.
+
+    It re-checks on its own every ``poll_seconds`` and sends ``on_wait`` (the phone alert) on the first
+    failure, interactive or not: a desk restarted unattended in a console must not sit silently at a
+    prompt. Interactively, Enter re-checks at once and ``q`` quits.
+    """
     polls = 0
+    answer: asyncio.Future[str] | None = None
     while True:
         health = await preflight()
         if health.ok:
@@ -77,18 +86,55 @@ async def login_gate(
             "stores or types your password — and open the one-click panels you calibrated."
         )
         say(message)
+        if on_wait is not None and polls == 0:
+            await on_wait(message)
+        polls += 1
+        if max_polls is not None and polls >= max_polls:
+            return False
         if interactive:
-            answer = await asyncio.to_thread(prompt, "Press Enter to re-check, or type q to quit: ")
-            if answer.strip().lower() in {"q", "quit", "exit"}:
-                return False
+            if answer is None:
+                say(f"Re-checking every {poll_seconds:.0f} s. Press Enter to re-check now, or type q to quit.")
+                answer = _ask_in_background(prompt, "> ")
+            done, _ = await asyncio.wait({answer}, timeout=poll_seconds)
+            if answer in done:
+                try:
+                    text = answer.result()
+                except EOFError:  # no console after all: keep polling unattended
+                    interactive = False
+                    continue
+                finally:
+                    answer = None
+                if text.strip().lower() in {"q", "quit", "exit"}:
+                    return False
         else:
-            if on_wait is not None and polls == 0:
-                await on_wait(message)
-            polls += 1
-            if max_polls is not None and polls >= max_polls:
-                return False
             say(f"(not interactive: re-checking in {poll_seconds:.0f} s)")
             await asyncio.sleep(poll_seconds)
+
+
+def _ask_in_background(prompt: Prompt, text: str) -> asyncio.Future[str]:
+    """Run a blocking prompt in a daemon thread, so an unanswered prompt never keeps the process alive."""
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[str] = loop.create_future()
+
+    def deliver(result: str | None, error: BaseException | None) -> None:
+        if future.done():
+            return
+        if error is not None:
+            future.set_exception(error)
+        else:
+            future.set_result(result or "")
+
+    def worker() -> None:
+        try:
+            result: str | None = prompt(text)
+            error: BaseException | None = None
+        except BaseException as exc:  # noqa: BLE001 - handed to the waiting coroutine
+            result, error = None, exc
+        with contextlib.suppress(RuntimeError):  # the loop may be gone if the gate passed meanwhile
+            loop.call_soon_threadsafe(deliver, result, error)
+
+    threading.Thread(target=worker, name="login-gate-prompt", daemon=True).start()
+    return future
 
 
 def _config_warnings(cfg: DeskConfig) -> list[str]:
@@ -102,11 +148,12 @@ def _config_warnings(cfg: DeskConfig) -> list[str]:
                 )
         if cfg.execution.dry_run:
             warnings.append("execution.dry_run is true: every check runs, nothing is typed or clicked")
-    if cfg.llm.enabled:
-        import os  # noqa: PLC0415
-
-        if not (os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")):
-            warnings.append("llm.enabled but ANTHROPIC_API_KEY is not set (Pink will follow failure_policy)")
+    has_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")
+    if cfg.llm.enabled and not has_key:
+        warnings.append(
+            f"llm.enabled but ANTHROPIC_API_KEY is not set: every Claude review will fail and Pink will "
+            f"{'veto' if cfg.llm.failure_policy == 'veto' else 'abstain'} (failure_policy)"
+        )
     if not (cfg.secrets.ntfy_topic or (cfg.secrets.telegram_bot_token and cfg.secrets.telegram_chat_id)):
         warnings.append("no phone alerts configured (DESK_NTFY_TOPIC or DESK_TELEGRAM_*)")
     return warnings
@@ -185,13 +232,38 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def cmd_kill(args: argparse.Namespace) -> int:
+    """Engage the kill switch. This must work even when the config does not validate (e.g. a secret is
+    missing in this shell), so it falls back to reading only ``data_dir`` from the YAML."""
     from .killswitch import KillSwitch  # noqa: PLC0415
     from .wiring import data_dir  # noqa: PLC0415
 
-    cfg = _load(args)
-    KillSwitch(data_dir(cfg)).engage(args.reason or "cli", by="cli")
+    try:
+        root = data_dir(_load(args))
+    except ConfigError as exc:
+        fallback = _raw_data_dir(Path(args.config))
+        if fallback is None:
+            raise
+        print(f"! the config does not validate ({exc}); engaging the kill switch in {fallback} anyway")
+        fallback.mkdir(parents=True, exist_ok=True)
+        root = fallback
+    KillSwitch(root).engage(args.reason or "cli", by="cli")
     print("kill switch ENGAGED: no new trades (open positions keep their stops). `desk resume` to continue.")
     return EXIT_OK
+
+
+def _raw_data_dir(config_path: Path) -> Path | None:
+    """``data_dir`` straight from the YAML (no validation), resolved like :func:`load_config` does."""
+    import yaml  # noqa: PLC0415
+
+    try:
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError):
+        return None
+    value = raw.get("data_dir", "data") if isinstance(raw, dict) else None
+    if not isinstance(value, str) or not value.strip():
+        return None
+    path = Path(value)
+    return path if path.is_absolute() else project_root(config_path) / path
 
 
 def cmd_resume(args: argparse.Namespace) -> int:
@@ -331,6 +403,17 @@ def cmd_test_order(args: argparse.Namespace) -> int:
     except KeyError:
         print(f"{args.symbol} is not in the config")
         return EXIT_CONFIG
+    if cfg.mode in (Mode.DEMO, Mode.LIVE) and not inst.specs_verified:
+        print(
+            f"refusing: {inst.symbol} has specs_verified: false. Copy contract size, lot step and min lot from "
+            "UniTrader's symbol specification into the config and set specs_verified: true first."
+        )
+        return EXIT_CONFIG
+    if not inst.enabled:
+        print(f"refusing: {inst.symbol} is disabled in the config")
+        return EXIT_CONFIG
+    for warning in _config_warnings(cfg):
+        print(f"! {warning}")
     try:
         lots = Decimal(args.lots) if args.lots else inst.min_lot
     except InvalidOperation:
@@ -359,24 +442,39 @@ def cmd_test_order(args: argparse.Namespace) -> int:
 
 
 async def _test_order(cfg: DeskConfig, symbol: str, side: Side, lots: Decimal, *, assume_yes: bool) -> int:
-    """Round trip: open ONE position, then close it with the calibrated close method when you press Enter.
+    """Round trip: open ONE position, then close it with the configured exit method when you press Enter.
 
-    Anything that can't be confirmed is recorded so the desk asks you to reconcile it on its next run.
+    Refused while the desk has anything open or unresolved (a close-all would flatten it behind the desk's
+    back). Anything that can't be confirmed is recorded so the desk asks you to reconcile it on its next run.
     """
+    from .domain import ExitReason  # noqa: PLC0415
     from .positions import PositionBook  # noqa: PLC0415
     from .wiring import build_desk  # noqa: PLC0415
 
     desk = build_desk(cfg)
     try:
+        if desk.killswitch.engaged():
+            print(f"refusing: the kill switch is engaged ({desk.killswitch.reason()}); `desk resume` first")
+            return EXIT_PREFLIGHT
+        active = desk.store.active_positions()
+        unresolved = desk.store.intents_with_status(IntentStatus.SUBMITTING, IntentStatus.UNCONFIRMED)
+        if active or unresolved:
+            print(
+                f"refusing: the desk has {len(active)} active position(s) and {len(unresolved)} unresolved "
+                "order(s). Close or reconcile them first (see `desk status`)."
+            )
+            return EXIT_PREFLIGHT
         health = await desk.venue.preflight()
         _print_health(health, print)
         if not health.ok:
             print(f"preflight failed: log in to UniTrader ({_account(cfg)} account) yourself and retry")
             return EXIT_PREFLIGHT
-        last = None
         warm = await desk.feed.warmup([symbol], 1)
-        if warm.get(symbol):
-            last = warm[symbol][-1].close
+        quote = desk.feed.latest_quote(symbol)
+        last = warm[symbol][-1].close if warm.get(symbol) else (quote.mid if quote is not None else None)
+        if last is None:
+            print("refusing: no market data for a reference price right now; retry when the feed is up")
+            return EXIT_PREFLIGHT
         intent = OrderIntent(
             meeting_id=None,
             symbol=symbol,
@@ -394,34 +492,37 @@ async def _test_order(cfg: DeskConfig, symbol: str, side: Side, lots: Decimal, *
         def before_click() -> None:
             desk.store.set_intent_status(intent.id, IntentStatus.SUBMITTING)
 
-        report = await desk.venue.submit(intent, desk.feed.latest_quote(symbol), before_click)
-        desk.store.set_intent_status(intent.id, report.status, report)
+        report = await desk.venue.submit(intent, quote, before_click)
         print(f"result: {report.status.value} — {report.message}")
+        book = PositionBook(cfg)
         if report.status is not IntentStatus.CONFIRMED:
+            desk.store.set_intent_status(intent.id, report.status, report)
             if report.status is IntentStatus.UNCONFIRMED:
                 print("UNCONFIRMED: check UniTrader; the desk will ask you to reconcile this order on the next run")
             return EXIT_OK if report.status in (IntentStatus.DRY_RUN, IntentStatus.ABORTED) else EXIT_ERROR
-        # A test order is a real position with no stop/target: until it is closed it is recorded as RECONCILE,
-        # so a desk started meanwhile halts and asks about it instead of managing it.
-        book = PositionBook(cfg)
-        ref = report.fill_price or last or 0.0
-        recorded = intent.model_copy(update={"stop_price": ref, "target_price": ref})
-        pos = book.add_open(recorded, report, protective=False, at=report.clicked_at or desk.clock.now())
-        pos = book.set_status(pos.id, PositionStatus.RECONCILE)
-        desk.store.upsert_position(pos)
+        # A test order is a real position with no stop/target: it is recorded as RECONCILE (the desk tracks
+        # it but never manages it), in the same transaction as the fill, so a desk started meanwhile halts
+        # and asks about it.
+        pos = book.add_unmanaged(
+            intent, report, at=report.clicked_at or desk.clock.now(), note="a test order (desk test-order)"
+        )
+        desk.store.resolve_intent(intent.id, IntentStatus.CONFIRMED, report, [pos])
+        close_all = cfg.execution.venue == "unitrader" and cfg.execution.unitrader.exit_method == "close_all"
+        method = "the close-all button (it closes EVERY position in the terminal)" if close_all else "an opposite order"
         if not assume_yes:
             try:
-                await asyncio.to_thread(input, "Press Enter to close it with the calibrated close method: ")
+                await asyncio.to_thread(input, f"Press Enter to close it with {method}: ")
             except (KeyboardInterrupt, EOFError):
                 print("left open: close it in UniTrader yourself, then mark it closed on the dashboard")
                 return EXIT_OK
         close_intent = OrderIntent(
-            purpose="close_all",
+            purpose="close_all" if close_all else "close",
             meeting_id=None,
-            symbol="*",
-            side=None,
-            lots=None,
-            entry_ref=None,
+            position_id=None if close_all else pos.id,
+            symbol="*" if close_all else symbol,
+            side=None if close_all else side.opposite,
+            lots=None if close_all else lots,
+            entry_ref=None if close_all else pos.entry_price,
             stop_price=None,
             target_price=None,
             mode=cfg.mode,
@@ -434,18 +535,23 @@ async def _test_order(cfg: DeskConfig, symbol: str, side: Side, lots: Decimal, *
         def before_close() -> None:
             desk.store.set_intent_status(close_intent.id, IntentStatus.SUBMITTING)
 
-        closed_report = await desk.venue.close_all(close_intent, before_close)
-        desk.store.set_intent_status(close_intent.id, closed_report.status, closed_report)
+        if close_all:
+            closed_report = await desk.venue.close_all(close_intent, before_close)
+        else:
+            quote = desk.feed.latest_quote(symbol)
+            closed_report = await desk.venue.close_position(closing, close_intent, quote, before_close)
         print(f"close: {closed_report.status.value} — {closed_report.message}")
         if closed_report.status is IntentStatus.CONFIRMED:
-            from .domain import ExitReason  # noqa: PLC0415
-
-            price = closed_report.fill_price or ref
-            desk.store.upsert_position(
-                book.close(pos.id, price=price, source="feed_estimate", reason=ExitReason.MANUAL, at=desk.clock.now())
+            price = closed_report.fill_price or pos.entry_price
+            closed = book.close(
+                pos.id, price=price, source="feed_estimate", reason=ExitReason.MANUAL, at=desk.clock.now()
             )
+            desk.store.resolve_intent(close_intent.id, closed_report.status, closed_report, [closed])
         else:
-            desk.store.upsert_position(book.set_status(pos.id, PositionStatus.RECONCILE))
+            desk.store.set_intent_status(close_intent.id, closed_report.status, closed_report)
+            desk.store.upsert_position(
+                book.set_status(pos.id, PositionStatus.RECONCILE, note="the test order's close was not confirmed")
+            )
             print("could not confirm the close: check UniTrader, close it yourself if needed, then reconcile")
         return EXIT_OK
     finally:
@@ -580,6 +686,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        if getattr(args, "config", None):
+            # Same .env the Windows run script loads, so every command sees the same secrets. Variables
+            # already set in the environment win.
+            load_dotenv(project_root(args.config) / ".env", os.environ)
         code: int = args.func(args)
         return code
     except ConfigError as exc:

@@ -16,6 +16,7 @@
     refreshTimer: null,
     streamAbort: null,
     streamBackoff: 1000,
+    reconcileShown: null,
   };
 
   // ------------------------------------------------------------------------------------------ utils
@@ -35,6 +36,17 @@
       else localStorage.removeItem(TOKEN_KEY);
     } catch {
       /* private mode: keep it in memory only */
+    }
+  }
+
+  // Forget a token the server rejected. Storage is cleared only if it still holds that token (another tab may
+  // already have saved the right one).
+  function forgetToken(token) {
+    state.token = "";
+    try {
+      if (localStorage.getItem(TOKEN_KEY) === token) localStorage.removeItem(TOKEN_KEY);
+    } catch {
+      /* private mode */
     }
   }
 
@@ -126,9 +138,31 @@
 
   // ------------------------------------------------------------------------------------------ API
 
+  class TokenRejected extends Error {}
+
+  // 401, or 429 (too many wrong tokens from this address): drop the token and stop polling and streaming until
+  // a new one is pasted, so a stale tab or a typo can't keep sending a wrong token. The server always accepts
+  // the right token, even after a 429. A late answer to an older token is ignored.
+  function rejectToken(token, status) {
+    if (token === state.token) {
+      if (state.streamAbort) state.streamAbort.abort();
+      forgetToken(token);
+      setConn(false, "token rejected");
+      $("subtitle").textContent = "token rejected - paste the token again";
+      const box = $("alerts");
+      clear(box);
+      box.append(el("div", { class: "alert bad", text: "Token rejected - paste the token again. Nothing on this page updates until you do." }));
+      const why = status === 429 ? " (too many wrong tokens from this address)" : "";
+      $("token-input").value = "";
+      askForToken(`Token rejected${why} - paste the token again.`);
+    }
+    return new TokenRejected("token rejected - paste the token again");
+  }
+
   async function api(path, { method = "GET", body } = {}) {
+    const token = state.token;
     const headers = { Accept: "application/json" };
-    if (state.token) headers.Authorization = `Bearer ${state.token}`;
+    if (token) headers.Authorization = `Bearer ${token}`;
     if (body !== undefined) headers["Content-Type"] = "application/json";
     const response = await fetch(path, {
       method,
@@ -137,11 +171,7 @@
       cache: "no-store",
       credentials: "omit",
     });
-    if (response.status === 401) {
-      askForToken("That token was not accepted.");
-      throw new Error("unauthorized");
-    }
-    if (response.status === 429) throw new Error("Too many failed logins from this device; wait a few minutes.");
+    if (response.status === 401 || response.status === 429) throw rejectToken(token, response.status);
     let payload = null;
     try {
       payload = await response.json();
@@ -162,7 +192,7 @@
       state.data = data;
       render(data);
     } catch (err) {
-      if (err.message !== "unauthorized") setConn(false, err.message);
+      if (!(err instanceof TokenRejected)) setConn(false, err.message);
     }
   }
 
@@ -173,18 +203,22 @@
 
   // SSE over fetch() so the token stays in a header (EventSource can't send headers).
   async function stream() {
-    if (!state.token) return;
+    const token = state.token;
+    if (!token) return;
     if (state.streamAbort) state.streamAbort.abort();
     const controller = new AbortController();
     state.streamAbort = controller;
     try {
       const response = await fetch("/api/events", {
-        headers: { Authorization: `Bearer ${state.token}`, Accept: "text/event-stream" },
+        headers: { Authorization: `Bearer ${token}`, Accept: "text/event-stream" },
         signal: controller.signal,
         cache: "no-store",
         credentials: "omit",
       });
-      if (response.status === 401) return askForToken("That token was not accepted.");
+      if (response.status === 401 || response.status === 429) {
+        rejectToken(token, response.status);
+        return;
+      }
       if (!response.ok || !response.body) throw new Error(`stream HTTP ${response.status}`);
       setConn(true);
       state.streamBackoff = 1000;
@@ -289,36 +323,71 @@
     $("stat-llm").textContent = llm.enabled ? `${llm.calls ?? 0}${llm.max_calls_per_day ? " / " + llm.max_calls_per_day : ""}` : "off";
   }
 
+  // Used only when the server sends no "question" / "options" for an item. For a position, outcome "filled"
+  // means "it is closed at the broker", so its buttons must say so rather than "It filled".
+  const RECONCILE_FALLBACK = {
+    intent: {
+      question: "",
+      options: [
+        { outcome: "filled", label: "It filled", needs_price: true },
+        { outcome: "not_filled", label: "Nothing happened", needs_price: false },
+      ],
+    },
+    position: {
+      question: "Is this position still open in UniTrader?",
+      options: [
+        { outcome: "filled", label: "No, it is closed", needs_price: true },
+        { outcome: "not_filled", label: "Yes, it is still open", needs_price: false },
+      ],
+    },
+  };
+
+  function reconcileChoices(item) {
+    const fallback = RECONCILE_FALLBACK[item.kind === "position" ? "position" : "intent"];
+    const options = (Array.isArray(item.options) ? item.options : []).filter(
+      (o) => o && (o.outcome === "filled" || o.outcome === "not_filled") && typeof o.label === "string" && o.label,
+    );
+    return {
+      question: typeof item.question === "string" && item.question ? item.question : fallback.question,
+      options: options.length ? options : fallback.options,
+    };
+  }
+
   function renderReconcile(items) {
     const panel = $("reconcile-panel");
     const list = $("reconcile-list");
     panel.hidden = items.length === 0;
+    // Re-render only when the cards change, so a price being typed (and its focus) survives the refreshes.
+    const shown = JSON.stringify(items);
+    if (shown === state.reconcileShown) return;
+    state.reconcileShown = shown;
     clear(list);
     for (const item of items) {
-      const priceInput = el("input", { type: "number", step: "any", min: "0", inputmode: "decimal", placeholder: "fill price (optional)", "aria-label": "Fill price" });
+      const { question, options } = reconcileChoices(item);
+      const priceInput = options.some((o) => o.needs_price === true)
+        ? el("input", { type: "number", step: "any", min: "0", inputmode: "decimal", placeholder: "fill price (optional)", "aria-label": "Fill price" })
+        : null;
+      const context = item.message && String(item.message).toLowerCase() !== question.toLowerCase() ? item.message : null;
       list.append(
         el(
           "div",
           { class: "reconcile-card" },
           el("strong", { text: `${item.symbol || ""} ${item.side || ""} ${item.lots || ""} lots · ${item.status}` }),
           el("span", { text: `${item.kind} ${item.id} · ${fmtTime(item.created_at)}` }),
-          item.message ? el("span", { class: "hint", text: item.message }) : null,
+          context ? el("span", { class: "hint", text: context }) : null,
+          question ? el("span", { class: "question", text: question }) : null,
           el(
             "div",
             { class: "control-row" },
             priceInput,
-            el("button", {
-              class: "btn",
-              type: "button",
-              text: "It filled",
-              onclick: () => reconcile(item.id, "filled", priceInput.value),
-            }),
-            el("button", {
-              class: "btn warn",
-              type: "button",
-              text: "Nothing happened",
-              onclick: () => reconcile(item.id, "not_filled", ""),
-            }),
+            ...options.map((option) =>
+              el("button", {
+                class: "btn",
+                type: "button",
+                text: option.label,
+                onclick: () => reconcile(item.id, question, option, option.needs_price === true && priceInput ? priceInput.value : ""),
+              }),
+            ),
           ),
         ),
       );
@@ -507,10 +576,12 @@
 
   function askForToken(message = "") {
     const dialog = $("token-dialog");
-    $("token-error").textContent = message;
+    if (message) $("token-error").textContent = message; // a bare re-prompt keeps the "rejected" note
     if (!dialog.open) dialog.showModal();
   }
 
+  // OK is the form's only submit button, so Enter (or "Go" on a phone keyboard) confirms. Cancel is a plain
+  // button: as a submit button placed first it would be the default one, and Enter would cancel instead.
   function confirmDialog({ title, text, inputLabel = null, okLabel = "OK", expect = null }) {
     return new Promise((resolve) => {
       const dialog = $("confirm-dialog");
@@ -523,22 +594,27 @@
       $("confirm-input-label").textContent = inputLabel || "";
       input.value = "";
       const form = $("confirm-form");
+      const cancel = $("confirm-cancel");
+      let result = null;
       const onSubmit = (event) => {
         event.preventDefault();
-        const ok = event.submitter && event.submitter.value === "ok";
-        if (ok && expect !== null && input.value.trim() !== expect) {
+        if (expect !== null && input.value.trim() !== expect) {
           $("confirm-text").textContent = `${text} (type ${expect} exactly)`;
           return;
         }
-        form.removeEventListener("submit", onSubmit);
+        result = input.value.trim() || true;
         dialog.close();
-        resolve(ok ? input.value.trim() || true : null);
+      };
+      const onCancel = () => dialog.close();
+      // every way out (OK, Cancel, Escape) ends here
+      const onClose = () => {
+        form.removeEventListener("submit", onSubmit);
+        cancel.removeEventListener("click", onCancel);
+        resolve(result);
       };
       form.addEventListener("submit", onSubmit);
-      dialog.addEventListener("cancel", () => {
-        form.removeEventListener("submit", onSubmit);
-        resolve(null);
-      }, { once: true });
+      cancel.addEventListener("click", onCancel);
+      dialog.addEventListener("close", onClose, { once: true });
       dialog.showModal();
       if (inputLabel !== null) input.focus();
     });
@@ -555,24 +631,27 @@
     }
   }
 
-  async function reconcile(id, outcome, price) {
-    const words = outcome === "filled" ? "it FILLED" : "NOTHING happened";
-    const ok = await confirmDialog({ title: "Reconcile order", text: `You checked UniTrader and ${words}?`, okLabel: "Yes" });
-    if (!ok) return;
+  async function reconcile(id, question, option, price) {
     const fill = price === "" ? null : Number(price);
-    await act("Reconcile", () => api("/api/reconcile", { method: "POST", body: { id, outcome, fill_price: Number.isFinite(fill) ? fill : null } }));
+    if (fill !== null && !(Number.isFinite(fill) && fill > 0)) return toast("Reconcile: the price must be a positive number.", true);
+    const text = `${question ? `${question} ` : ""}Your answer after checking UniTrader: "${option.label}".`;
+    const ok = await confirmDialog({ title: "Reconcile", text, okLabel: "Confirm" });
+    if (!ok) return;
+    await act("Reconcile", () => api("/api/reconcile", { method: "POST", body: { id, outcome: option.outcome, fill_price: fill } }));
   }
 
   function bindControls() {
     $("token-form").addEventListener("submit", (event) => {
       event.preventDefault();
       const token = $("token-input").value.trim();
-      if (token.length < 8) {
+      if (token.length < 16) {
         $("token-error").textContent = "That looks too short.";
         return;
       }
       saveToken(token);
+      $("token-error").textContent = "";
       $("token-dialog").close();
+      state.streamBackoff = 1000;
       refresh();
       stream();
     });
@@ -584,7 +663,7 @@
 
     $("btn-kill").addEventListener("click", async () => {
       const reason = await confirmDialog({ title: "Engage kill switch", text: "No new trades until you resume. Open positions keep their stops.", inputLabel: "Reason", okLabel: "Engage" });
-      if (reason === null) return;
+      if (reason === null) return toast("Kill switch: cancelled, NOT engaged.", true);
       await act("Kill switch", () => api("/api/kill", { method: "POST", body: { reason: reason === true ? "dashboard" : reason } }));
     });
 

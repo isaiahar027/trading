@@ -6,7 +6,8 @@ covers setting that up and keeping it running for a week.
 
 > The desk never logs in for you. You log in to Windows and to UniTrader yourself. If UniTrader logs out,
 > crashes or shows a different account, the desk stops trading and sends you an alert. You log back in
-> yourself and the desk carries on.
+> yourself and the desk carries on: it re-checks the terminal on its own every 30 s, also when it was
+> restarted unattended in a console window (the alert goes out on the first failed check).
 
 ## 1. One-time setup
 
@@ -49,23 +50,44 @@ Re-calibrate whenever UniTrader updates its look, you rearrange panels, or the r
 ## 4. Preflight, then a shadow day
 
 ```powershell
-# config\desk.yaml: mode: demo, execution.venue: unitrader, execution.dry_run: true
+# config\desk.yaml: mode: demo, execution.venue: unitrader, execution.dry_run: true,
+#                   feed.kind: twelvedata   (and TWELVEDATA_API_KEY in .env)
 .\.venv\Scripts\desk.exe preflight -c config\desk.yaml --wait-for-login
-powershell -File scripts\windows\run-desk.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\windows\run-desk.ps1
 ```
 
+Demo and live mode refuse to start on the `synthetic` or `csv` feed: the desk would click real orders
+on made-up prices. Every `desk` command reads `.env` from the project folder (variables already set in
+the environment win), so `desk kill`, `desk status` and `desk preflight` see the same keys as the run
+script.
+
 `preflight` checks the window, client size, DPI, the account badge and every panel label without typing
-or clicking anything. If the window or badge is missing it tells you to log in, waits for you to press
-Enter, and re-checks. With `dry_run: true` the desk runs every pre-click check on real signals but never
-types or clicks. Run it like that for a day before letting it trade.
+or clicking anything. If the window or badge is missing it tells you to log in and re-checks every 30 s
+(press Enter to re-check at once, `q` to quit). With `dry_run: true` the desk runs every pre-click
+check on real signals, up to the re-verification right before the click (no dialog left open, nothing
+covering the lot field or the BUY/SELL/close-all button), but never types or clicks, so the lot read-back
+is the one check it cannot exercise. Run it like that for a day before letting it trade.
+
+During an order the desk reads the lot field back through the clipboard: it overwrites whatever is on the
+VPS clipboard and leaves it empty afterwards (it never reads or restores it), so do not keep anything there
+you need. With `protective_orders: none` it also empties the panel's stop-loss/take-profit fields before
+every order if you recorded them in `desk calibrate`; if you did not, keep them empty yourself (preflight
+reminds you).
 
 `desk test-order --symbol EURUSD --side BUY --lots 0.01` is a round trip: it places exactly one order
 (after you type a confirmation), lets you watch the full click sequence, then closes the position with
-the calibrated close method when you press Enter.
+the configured exit method when you press Enter: the close-all button with `exit_method: close_all`
+(which closes **every** position in the terminal, including any you opened by hand), or an opposite
+order with `exit_method: opposite_order`. It refuses to run while the kill switch is engaged, while the
+desk has any active position or unresolved order, for an instrument with `specs_verified: false`, or
+when there is no market data for a reference price.
 
 ## 5. Running unattended
 
-* `scripts\windows\register-task.ps1` registers a Task Scheduler task that starts the desk when **you**
+* Register the task once:
+  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\windows\register-task.ps1`
+  (if Windows denies access, run that prompt as administrator).
+  It registers a Task Scheduler task that starts the desk when **you**
   log on. It runs in your interactive session; a task that runs "whether the user is logged on or not"
   has no desktop and could not see UniTrader.
 * **Closing Remote Desktop normally locks the session.** To disconnect without locking, run
@@ -75,8 +97,10 @@ the calibrated close method when you press Enter.
 * **Stop trading from anywhere:**
   * the dashboard **Kill** button;
   * `desk kill` on the VPS;
-  * create an empty file named `KILL` in the `data` folder. Delete it, or press Resume on the
-    dashboard, to continue.
+  * create a file named `KILL` in the `data` folder, e.g. `type nul > data\KILL` in a command prompt.
+    A file made in Explorer with *New > Text Document* is really `KILL.txt` while extensions are hidden;
+    the desk counts that too (any `KILL.*`, any case). `desk resume` or Resume on the dashboard removes
+    them all. Resume is refused while orders or positions still need reconciling.
 * **Panic** (dashboard, hold for 2 s) engages the kill switch and clicks the calibrated close-all button.
   If you did not calibrate one, it only engages the kill switch and tells you to close positions by hand.
 
@@ -89,8 +113,10 @@ The dashboard listens on `127.0.0.1:8765` only. Don't open that port to the inte
 * **Tailscale** on the VPS and the phone: set `dashboard.host` to the VPS's Tailscale IP, add that IP to
   `dashboard.allowed_hosts`, and set `DESK_DASHBOARD_TOKEN` (24+ random characters).
 
-The page asks for the dashboard token once and keeps it on that device. Phone alerts go through ntfy or
-Telegram (`.env`).
+The page asks for the dashboard token once and keeps it on that device. If the desk rejects it, the page
+forgets it and stops polling until you paste the right one; wrong tokens never lock out the right one.
+The generated token in `data\dashboard_token` is restricted to your Windows account (`icacls`); if that
+fails the desk logs a warning. Phone alerts go through ntfy or Telegram (`.env`).
 
 ## 7. Every evening of the test
 

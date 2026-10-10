@@ -304,6 +304,11 @@ class Position(Record):
     exit_reason: ExitReason | None = None
     pnl: float | None = None  # realized, estimated, account currency
     close_intent_id: str | None = None
+    last_marked_bar_end: datetime | None = None  # newest bar already applied (exit rules, bars_held)
+    # Why the operator is being asked about this position, and the exit the feed suggested (if any).
+    reconcile_note: str | None = None
+    suggested_exit_reason: ExitReason | None = None
+    suggested_exit_price: float | None = None
 
 
 class RiskSnapshot(Record):

@@ -463,7 +463,7 @@ def test_unknown_symbol_fails_before_any_question(tmp_path: Path) -> None:
 
 def test_live_account_must_be_confirmed_and_warns_on_mode_mismatch(tmp_path: Path) -> None:
     run = make_run(tmp_path, happy(kind="live"))
-    cfg = make_config(mode="demo", execution={"venue": "unitrader"})
+    cfg = make_config(mode="demo", execution={"venue": "unitrader", "unitrader": {"backend": "fake"}})
     result = calibrate(run, cfg)
     assert_consumed(run)
     assert result.layout_file.layout.account_kind == "live"
@@ -522,6 +522,17 @@ def test_sl_tp_fields_optional_question(tmp_path: Path) -> None:
     assert_consumed(run)
     assert eur.sl_input is not None and (eur.sl_input.x, eur.sl_input.y) == SLTP["EURUSD"][0]
     assert eur.tp_input is not None and (eur.tp_input.x, eur.tp_input.y) == SLTP["EURUSD"][1]
+
+
+def test_sl_tp_question_explains_that_the_desk_empties_them(tmp_path: Path) -> None:
+    # With protective_orders: none an order carries whatever the panel's SL/TP fields hold, so the wizard asks for
+    # them anyway (the venue empties the recorded ones) and tells the operator to keep unrecorded ones empty.
+    run = make_run(tmp_path, happy())  # answers "n" to the SL/TP question
+    calibrate(run)
+    assert_consumed(run)
+    question = next(q for q in run.prompt.asked if "stop-loss and take-profit" in q)
+    assert "desk empties them" in question
+    assert "keep them EMPTY yourself" in run.text
 
 
 def test_sl_tp_fields_required_with_panel_fields_protection(tmp_path: Path) -> None:

@@ -38,7 +38,9 @@ consistent when you do.
 4. **The LLM can only veto.** Direction, size, stop and target are deterministic. Claude's structured
    output has no fields for them.
 5. **Demo first.** `mode: paper` is the default. `demo` needs the calibrated DEMO badge on screen
-   before every click. `live` needs `DESK_LIVE_ACK` plus a layout calibrated on the live account.
+   before every click. `live` needs `DESK_LIVE_ACK` plus a layout calibrated on the live account. Demo
+   and live on the real terminal need real market data (`feed.kind: twelvedata`); only the built-in
+   simulated terminal (`backend: fake`) may run on synthetic prices.
 6. **No network in tests. No real GUI in tests.** Use `FakeGuiBackend`, `httpx2.MockTransport` and fake
    Anthropic clients. Tests are deterministic (seeded, `ManualClock`).
 
@@ -167,10 +169,11 @@ to the minimum. Gate violations (each a readable string): kill switch, reconcile
 class KillSwitch:
     def __init__(self, data_dir: Path) -> None   # flag file: data_dir / "KILL"
     def engaged(self) -> bool                    # True if the file exists, whatever it contains (operators may
-                                                 # create it by hand, e.g. from the VPS desktop)
+                                                 # create it by hand, e.g. from the VPS desktop); any case and
+                                                 # any extension count too (KILL.txt from Windows Explorer)
     def reason(self) -> str | None
     def engage(self, reason: str, by: str) -> None    # atomic write of JSON {reason, by, at}
-    def release(self, by: str) -> None
+    def release(self, by: str) -> None           # removes KILL and every variant
     def state(self) -> dict[str, Any]
 ```
 Thread-safe (the GUI worker thread calls `engaged()` right before clicking). Cheap: one `stat` call.
@@ -259,8 +262,13 @@ class PositionBook:
     def get(self, position_id: str) -> Position | None
     def history(self) -> list[Position]                     # closed positions, oldest close first
     def add_open(self, intent: OrderIntent, report: ExecutionReport, *, protective: bool, at: datetime) -> Position
-    def mark_bar(self, bar: Bar) -> list[ExitDue]           # updates last_price/bars_held; never closes by itself
-    def set_status(self, position_id: str, status: PositionStatus, *, close_intent_id: str | None = None) -> Position
+    def add_unmanaged(self, intent: OrderIntent, report: ExecutionReport, *, at: datetime, note: str) -> Position
+        # a broker position the desk tracks but never manages (test order, recovered fill): status RECONCILE
+    def mark_bar(self, bar: Bar) -> list[ExitDue]           # updates last_price/bars_held; never closes by itself;
+                                                            # idempotent per bar (Position.last_marked_bar_end)
+    def set_status(self, position_id: str, status: PositionStatus, *, close_intent_id: str | None = None,
+                   note: str | None = None, suggested_exit: ExitDue | None = None) -> Position
+    def restore(self, position: Position) -> None           # undo a status change that did not happen
     def close(self, position_id: str, *, price: float, source: PriceSource, reason: ExitReason, at: datetime) -> Position
     def remove(self, position_id: str) -> Position          # reconciled "never filled"
     def set_equity_base(self, equity: float, at: datetime) -> None   # operator re-sync from the terminal balance
@@ -274,8 +282,9 @@ Exit price: with `protective_at_broker`, the stop/target level (or the bar open 
 Software-managed positions use the bar close, because the desk only acts at bar close. P&L comes from
 `money.estimate_pnl`. Equity = starting equity + all realized estimates + operator adjustments. Unrealized
 uses `last_price`. `trades_today` counts positions opened since `trading_day_start`. A bar affects a
-position when `bar.end > position.opened_at` (the bar during which it opened counts). The engine should load
-history since `min(equity_base_at, now - 30 days)` so streaks and today's P&L are complete.
+position when `bar.end > position.opened_at` (the bar during which it opened counts). The engine loads
+history since `min(equity_base_at, now - 30 days)` so streaks and today's P&L are complete, and ALL closed
+history when there is no operator equity sync (equity = starting equity + every realized estimate).
 
 ### `execution/unitrader/vision.py`
 
@@ -317,30 +326,50 @@ dedicated worker thread (`ThreadPoolExecutor(max_workers=1)`) behind a `threadin
    (`demo`↔DEMO, `live`↔LIVE) → else ABORTED "wrong account / not logged in". Optional one-click indicator.
 6. Panel label template for the symbol must match → else ABORTED (protects against reordered/covered panels).
 7. Positions-indicator baseline captured twice ~0.3 s apart; if `stability_check` and they differ → ABORTED.
-8. `dry_run` → DRY_RUN (nothing typed).
+8. Input guard, before the first click into the panel: same window geometry, still the foreground, no
+   calibrated dialog or error template showing (a stale confirmation's button may sit right over a field),
+   `root_window_at(point)` is our window for every field point, and the panel label still matches. The same
+   guard runs again right before every click into a field and every key press (commit key, backspace).
+   `dry_run` → run the read-only step 10 too (close-all flows as well), then DRY_RUN (nothing typed or
+   clicked, so only the read-backs are not exercised).
 9. Lot entry: click field, ctrl+a, type `format_lots`, then readback through the clipboard. Put a sentinel
    on the clipboard first; after click/ctrl+a/ctrl+c the field text must parse to the same Decimal. A
    sentinel left behind means the readback did not work: treat it as a mismatch. Then commit_key. With
-   `protective_orders: panel_fields` also fill the SL/TP fields (same readback).
-10. Re-verify foreground + panel label, and check that `root_window_at(button)` is our window (nothing on top).
-    Check `is_halted()` again.
+   `protective_orders: panel_fields` also fill the SL/TP fields (same readback). With `protective_orders:
+   none` every *calibrated* SL/TP input is emptied instead, because an order carries whatever those fields
+   hold: type a probe and read it back (an empty field copies nothing, exactly like a broken copy, so this
+   proves the field takes keys and copies), backspace, and require that it now copies nothing. Inputs that are
+   not calibrated cannot be emptied; preflight warns the operator to keep them empty.
+   After every field was committed, read each one back once more (fresh sentinel) and ABORT on any difference:
+   the terminal may round, clamp or re-parse a value when it commits the edit, and the order goes out with the
+   committed value. Then commit_key again. `lot_readback: clipboard` needs `commit_key: tab|enter`, and
+   `commit_key: enter` needs the readback (Enter goes to whatever has the focus): config validation, preflight
+   (`field_entry`) and the venue refuse the other combinations.
+   The desk never reads or restores the operator's clipboard (it may hold the password they pasted into the
+   login, and writing it back would drop a password manager's clipboard-history exclusion): the sentinel
+   overwrites it and the flow ends with an empty clipboard. Only numeric read-backs are ever logged.
+10. Re-verify foreground + panel label, no calibrated dialog showing, positions indicator unchanged since the
+    baseline, and check that `root_window_at(button)` is our window (nothing on top). Check `is_halted()` again.
 11. `on_before_click()` (write-ahead), click BUY/SELL, then record `clicked_at`. From here on, never ABORTED.
 12. Optional order dialog: if its template appears within `dialog_timeout_seconds`, click confirm.
     Error templates appearing → REJECTED (press esc).
 13. Poll the positions indicator until `changed_fraction >= change_threshold` (CONFIRMED) or
     `fill_timeout_seconds` passes (UNCONFIRMED). Fill price = feed quote/entry_ref,
     `fill_price_source="feed_estimate"`.
-14. Park the mouse at `park_point`. Save before/after evidence PNGs under `evidence_dir/<intent_id>/` when
-    `save_evidence`.
+14. Park the mouse at `park_point`. Empty the clipboard if the readback used it. Save before/after evidence
+    PNGs under `evidence_dir/<intent_id>/` when `save_evidence`.
 
 `OperatorAbortError` before the click → ABORTED with `operator_abort=True`. After the click it gives
 UNCONFIRMED with `operator_abort=True`. Any other exception before the click → ABORTED. After the click →
 UNCONFIRMED. A whole flow is bounded by `max_order_seconds`. `close_position` uses `exit_method`
 (`close_all` button + optional dialog + indicator change, or an `opposite_order` panel order).
 `close_all` clicks the close-all button (no button calibrated → ABORTED, "close manually").
+An `opposite_order` close empties the calibrated SL/TP inputs like an opening order with
+`protective_orders: none`.
 `preflight()` and `health()` run steps 1-6 for every calibrated panel without typing or clicking. They
 report one `HealthCheck` per item, with remediation text, e.g. "UniTrader window not found: open UniTrader
-and log in to your DEMO account yourself, then retry."
+and log in to your DEMO account yourself, then retry." Warnings that need no fix to trade (e.g. SL/TP inputs
+not calibrated with `protective_orders: none`) are `ok` checks with `data={"warning": true}`.
 
 ### `execution/unitrader/win32_backend.py` and `calibrate.py`
 
@@ -373,13 +402,17 @@ output_config={"effort": cfg.effort, "format": {"type": "json_schema", "schema":
 additionalProperties false, no numeric/length constraints>}}, betas=["server-side-fallback-2026-07-01"],
 fallbacks="default")` (drop `betas`/`fallbacks` when `server_fallback` is false). There is no
 `temperature`: current models reject sampling parameters. Client:
-`AsyncAnthropic(timeout=cfg.timeout_seconds, max_retries=cfg.max_retries)`. Handle `stop_reason ==
+`AsyncAnthropic(timeout=cfg.timeout_seconds, max_retries=cfg.max_retries)`, and the whole call (SDK retries
+included) runs under `asyncio.timeout(cfg.timeout_seconds)`, so one review never takes longer than that.
+Cancellation (the engine abandoning a meeting on kill/panic) propagates. Handle `stop_reason ==
 "refusal"` and `"max_tokens"`. Parse the first text block as JSON and validate with `ReviewVerdict`
 (`concerns` truncated to 5, `summary` to 600 chars, client side). Typed SDK errors are caught most-specific
 first (`AuthenticationError`, `PermissionDeniedError`, `NotFoundError`, `BadRequestError`, `RateLimitError`,
-`APIStatusError`, `APITimeoutError`, `APIConnectionError`). Any failure → `failure_policy` (`veto` → EJECT,
-`abstain` → HOLD) with `error` set. The daily call cap (`max_calls_per_day`, UTC day) gives the policy
-outcome without calling. Log `_request_id` and usage. The system prompt states that the data is untrusted
+`APIStatusError`, `APITimeoutError`, `APIConnectionError`), then any other `Exception` (e.g. the SDK's
+`TypeError` when no credentials are set). Any failure → `failure_policy` (`veto` → EJECT, `abstain` →
+HOLD) with `error` set. The daily call cap (`max_calls_per_day`, UTC day) gives the policy outcome
+without calling; its counters are kept in the store's kv table (`llm_usage`) so a restart does not reset
+them. Log `_request_id` and usage. The system prompt states that the data is untrusted
 numeric JSON, that the reviewer can only APPROVE or VETO, and when to veto.
 
 ### Wave 2/3 (built on top of the above)
@@ -451,19 +484,39 @@ class DeskEngine:
     async def manual_meeting(self, symbol: str, *, by: str, force_side: Side | None = None) -> MeetingRecord
         # force_side is accepted ONLY in paper mode (OperatorActionError otherwise)
 ```
-* **Startup reconciliation.** PENDING intents become ABORTED (the venue was never called). SUBMITTING
-  and UNCONFIRMED intents stay as reconcile items: new trading halts until the operator answers
-  filled/not filled. Active positions are reloaded.
-* **on_bar.** Ignore bars for disabled or unknown symbols. Update the position book, which may return
-  exits (close via the venue; a software-managed exit uses close_position; a broker-protected STOP/TARGET
-  is marked closed at the level without clicking). Add the bar to history. Run the scout. On a signal,
-  build the MeetingContext and convene. On EXECUTE_*, build an OrderIntent, `store.add_intent` (PENDING),
-  then `venue.submit(intent, quote, on_before_click=<persist SUBMITTING + audit>)`. Then persist the
-  report. CONFIRMED / RECONCILED_FILLED becomes `PositionBook.add_open` (protective =
-  `venue.supports_protective_orders`). UNCONFIRMED becomes a reconcile item, a phone alert and a halt.
-  REJECTED/ABORTED are logged and alerted. `report.operator_abort` engages the kill switch.
-* **Daily loss.** When `RiskGate.daily_loss_breached` is true, notify once per day. With
-  `flatten_on_daily_loss`, also run the panic close.
+* **Startup reconciliation.** Active positions are reloaded (a position on an instrument missing from the
+  config refuses the start with a ConfigError). PENDING intents become ABORTED (the venue was never
+  called). SUBMITTING and UNCONFIRMED intents stay as reconcile items: new trading halts until the
+  operator answers. A CLOSING position whose close is CONFIRMED/RECONCILED_FILLED is closed (estimated
+  price, reason RECONCILED); one whose close was REJECTED goes to RECONCILE; otherwise it is OPEN again. A
+  CONFIRMED/RECONCILED_FILLED open intent with no position row (crash between the two writes) becomes a
+  RECONCILE position plus an urgent alert. Then the warmup bars that closed after each position's
+  `last_marked_bar_end` are applied (catch-up): a broker-side SL/TP crossed meanwhile goes to the
+  operator, a software exit that became due is sent on the first live bar.
+* **Instruments.** The feed, warmup and staleness watchdog cover the enabled instruments plus any
+  instrument with an active position; `enabled: false` only stops new entries.
+* **on_bar.** Ignore bars for unknown symbols, and for disabled ones without a position. Update the
+  position book, which may return exits: a software-managed exit uses close_position; a broker-protected
+  STOP/TARGET reached on the feed is **not** booked (the feed is not the broker's price): the position goes
+  to RECONCILE with the suggested exit and an urgent "is it still open?" alert (paper mode books it, since
+  its simulated broker fills on that feed). Only an ABORTED/DRY_RUN close is sent again on the next bar; a
+  REJECTED close (it was clicked) goes to RECONCILE. Add the bar to history. A bar older than one
+  timeframe (a newer one has closed: feed catch-up) is not traded. Run the scout. On a signal, convene the
+  meeting as a task that `kill()`/`panic()` cancel; if the decision comes after the next bar has closed,
+  the plan is stale and not sent. On EXECUTE_*, build an OrderIntent, `store.add_intent` (PENDING), then
+  `venue.submit(intent, quote, on_before_click=<persist SUBMITTING + audit>)`. Then persist the report.
+  CONFIRMED becomes `PositionBook.add_open` (protective = `venue.supports_protective_orders`).
+  UNCONFIRMED becomes a reconcile item, a phone alert and a halt. REJECTED/ABORTED are logged and
+  alerted. `report.operator_abort` engages the kill switch.
+* **Reconcile.** Only SUBMITTING/UNCONFIRMED intents and RECONCILE positions can be answered. The intent
+  status and the positions it affects are written in one transaction (`Store.resolve_intent`). An open
+  answered "filled" without stop/target (a test order) becomes an unmanaged RECONCILE position; without
+  any known price the answer is refused until the operator types the fill price. "not filled" for a close
+  only reopens positions still linked to that close. A failed PANIC restores every position exactly as it
+  was (keeping links to unresolved closes).
+* **Daily loss.** When `RiskGate.daily_loss_breached` is true, notify once per trading day
+  (`risk.day_rollover_utc`). With `flatten_on_daily_loss`, also run the panic close, again on later bars
+  until something was clicked (CONFIRMED/UNCONFIRMED).
 * **Watchdog** (every `execution.unitrader.health_interval_seconds`, or 30 s for paper). It runs
   `venue.health()` and checks feed staleness (no bar for `feed.max_staleness_bars` × timeframe during an
   enabled instrument's session). Failures go into `degraded` (which blocks new trades through the risk
@@ -480,7 +533,10 @@ class DeskEngine:
   "started_at": "…", "now": "…",
   "kill_switch": {"engaged": false, "reason": null, "by": null, "at": null},
   "reconcile": [{"id": "…", "kind": "intent|position", "symbol": "EURUSD", "side": "BUY", "lots": "0.10",
-                 "status": "UNCONFIRMED", "created_at": "…", "message": "…"}],
+                 "status": "UNCONFIRMED", "created_at": "…", "message": "…",
+                 "question": "Did this BUY 0.10 EURUSD order open a position in UniTrader?",
+                 "options": [{"outcome": "filled", "label": "Yes, a position opened", "needs_price": true},
+                             {"outcome": "not_filled", "label": "No, nothing opened", "needs_price": false}]}],
   "degraded": ["…"],
   "health": {"venue": {"venue": "…", "ok": true, "checked_at": "…", "checks": [{"name": "…", "ok": true, "detail": "…"}]} ,
              "feed": {"…": "…"}},
@@ -503,8 +559,14 @@ class DeskEngine:
 * `GET /` and `/static/*` are public (no data in them). `GET /api/health` is public and returns
   `{"ok": true}` only.
 * Everything else under `/api` needs `Authorization: Bearer <token>`, compared with `hmac.compare_digest`.
-  After `max_auth_failures` failures inside `auth_failure_window_seconds` from one client IP, the API
-  returns 429.
+  The right token is **always** accepted. Only a wrong Bearer token counts as a failure (a request without
+  one guessed nothing). After `max_auth_failures` failures inside `auth_failure_window_seconds` from one
+  client IP, further wrong tokens get 429 with `Retry-After`. Every client behind the SSH tunnel is
+  127.0.0.1, so a lockout that also refused the right token would let any web page or local process keep the
+  operator away from kill/panic. Brute force is stopped by the token's entropy, not by the lockout.
+* The token file `data_dir/dashboard_token` (`wiring.ensure_dashboard_token`) is readable by the desk's user
+  only, also when it already exists: mode 0600 on POSIX; on Windows, where that mode does nothing, `icacls`
+  removes the inherited ACL entries and grants only the current user. A failure there is logged as a warning.
 * The Host header must be in `dashboard.allowed_hosts` (port stripped), else 400 (DNS-rebinding guard).
 * Security headers on every response: `Content-Security-Policy: default-src 'self'; img-src 'self' data:;
   style-src 'self'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none';
@@ -520,15 +582,25 @@ class DeskEngine:
   `POST /api/panic {"confirm": "PANIC"}`, `POST /api/reconcile {"id": str, "outcome": "filled|not_filled",
   "fill_price": float|null}`, `POST /api/equity {"equity": float}`, `POST /api/meeting {"symbol": str,
   "force_side": "BUY|SELL|null"}` (only when `allow_manual_meetings`). `OperatorActionError` becomes 409
-  `{"error": msg}`. Validation errors are 422. All bodies use Pydantic models with `extra="forbid"`.
+  `{"error": msg}`. Validation errors are 422. All bodies use Pydantic models with `extra="forbid"` and
+  `allow_inf_nan=False`, parsed by a JSON parser that refuses `NaN`, `Infinity` and numbers that overflow to
+  infinity (`1e400`), so a non-finite number is a 422 and never reaches the engine. `fill_price` must be
+  `> 0` and `< 1e9`.
 * The UI (vanilla JS, no CDN, no inline scripts or styles so the CSP holds) is mobile-first and
   Among Us-themed (space background, SVG crewmates in the role colours). It has a token prompt (stored in
   `localStorage`), a status bar (mode badge PAPER/DEMO/LIVE, kill switch, health, equity estimate, trades
   vs limit), the crew board (vote and summary per crewmate), the emergency-meeting chat transcript with an
   "EMERGENCY MEETING" banner animation on new meetings, the positions table, recent orders, reconcile cards
-  (filled / not filled), kill/resume, a **hold-to-confirm** PANIC button (2 s press), manual meeting
+  (each shows the item's `question` and one button per entry of its `options`, with the price field only
+  when an option has `needs_price`; without them, a position card asks "still open?", never "filled?"),
+  kill/resume, a **hold-to-confirm** PANIC button (2 s press), manual meeting
   (symbol picker; force side only in paper mode), and estimated values labelled "est." everywhere. Mark
   the DEMO/LIVE mode badge loudly (LIVE in red).
+* Every form has exactly one submit button, its action: Enter in a field submits through the first submit
+  button, so the confirm dialog's Cancel is a plain button and Enter in the kill Reason field engages the
+  kill switch. Cancelling the kill dialog says so in a toast.
+* On 401 or 429 the page drops the token (memory and `localStorage`), stops polling and the event stream,
+  and asks for the token again ("token rejected"), so a stale tab can't keep sending a wrong token.
 
 #### `cli.py`
 
@@ -538,15 +610,21 @@ class DeskEngine:
   ensures the dashboard token (`DESK_DASHBOARD_TOKEN`, or one generated and saved to
   `data_dir/dashboard_token` with 0600 permissions; printed once). For demo/live it runs the **login
   gate**: run the preflight; if it fails, print the failing checks and the instruction "Open UniTrader and
-  log in to your DEMO account yourself (this tool never handles your password), then press Enter to
-  re-check, or type q to quit". Re-check until green. Without a TTY, poll every 30 s and send one alert.
+  log in to your DEMO account yourself (this tool never handles your password)". It re-checks every 30 s
+  on its own and sends one alert on the first failure, with or without a TTY (a restarted desk in a
+  console must not wait silently); with a TTY, Enter re-checks at once and q quits.
   Then it starts the engine and uvicorn in one event loop and shuts down cleanly on Ctrl+C.
 * `preflight` runs the config + layout + venue preflight (with the same interactive login gate when
   `--wait-for-login` is passed) and exits non-zero on failure.
 * `calibrate` runs the wizard (Windows backend, or `--simulate` for the fake terminal).
 * `test-order --symbol EURUSD --side BUY [--lots 0.01]` is a round trip: it opens ONE position after a typed
-  confirmation, then closes it with the calibrated close method when you press Enter. Anything unconfirmed
-  is recorded for reconciliation. It refuses in live mode unless `--i-know-this-is-live`.
+  confirmation, then closes it with the configured exit method (close-all button, or an opposite order)
+  when you press Enter. The fill and its unmanaged RECONCILE position are written in one transaction;
+  anything unconfirmed is recorded for reconciliation. It refuses in live mode unless
+  `--i-know-this-is-live`, and always while the kill switch is engaged, while the desk has any active
+  position or unresolved order, for `specs_verified: false` (demo/live), or without a reference price.
+* Every command loads `<project root>/.env` first (existing environment variables win). `kill` works even
+  when the config does not validate: it falls back to `data_dir` from the raw YAML.
 * `backtest --csv PATH | --synthetic N [--symbol S] [--json]`.
 * `kill [--reason]`, `resume`, `status` (summary from the store + kill file; works while the desk is
   running) and `audit-verify`.

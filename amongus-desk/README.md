@@ -90,7 +90,7 @@ Follow [`docs/WINDOWS_VPS.md`](docs/WINDOWS_VPS.md):
 2. log in to UniTrader yourself;
 3. copy the instrument specs from UniTrader;
 4. `desk calibrate`;
-5. `desk preflight`;
+5. set `feed.kind: twelvedata` (demo/live refuse made-up prices) and `desk preflight`;
 6. a shadow day with `dry_run: true`;
 7. then demo trading at minimum size.
 
@@ -116,9 +116,9 @@ Unsafe combinations are rejected at start-up, for example:
 | `desk run` | Engine + dashboard (login gate first in demo/live) |
 | `desk preflight [--wait-for-login]` | Checks config, layout, window, badge and panels. Never clicks |
 | `desk calibrate [--simulate]` | Interactive layout wizard (hover, don't click) |
-| `desk test-order --symbol S --side BUY [--lots L]` | Round trip: one order after a typed confirmation, then close on Enter |
+| `desk test-order --symbol S --side BUY [--lots L]` | Round trip: one order after a typed confirmation, then close on Enter (refused while the desk holds anything) |
 | `desk backtest --csv F \| --synthetic N` | Same strategy and risk code on historical bars |
-| `desk kill [--reason]` / `desk resume` | Persistent kill switch (also: create `data/KILL`) |
+| `desk kill [--reason]` / `desk resume` | Persistent kill switch (also: create `data/KILL`; `KILL.txt` counts too) |
 | `desk status` | Positions, orders, reconcile items, kill state |
 | `desk audit-verify` | Verifies the hash-chained audit journal |
 

@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import ipaddress
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, MutableMapping
 from datetime import datetime, time, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -294,6 +294,28 @@ class UniTraderConfig(_Model):
             )
         return self
 
+    @model_validator(mode="after")
+    def _field_entry(self) -> Self:
+        problem = self.field_entry_problem()
+        if problem is not None:
+            raise ValueError(problem)
+        return self
+
+    def field_entry_problem(self) -> str | None:
+        """Why ``lot_readback`` + ``commit_key`` cannot be verified safely, or None (the venue re-checks it)."""
+        if self.lot_readback == "clipboard" and self.commit_key == "none":
+            return (
+                "lot_readback: clipboard needs commit_key: tab or enter. The desk reads every field back after "
+                "the terminal committed it; without a commit key the value is only committed when the BUY/SELL "
+                "click leaves the field, and nothing could verify it"
+            )
+        if self.lot_readback == "none" and self.commit_key == "enter":
+            return (
+                "commit_key: enter needs lot_readback: clipboard. Enter goes to whatever has the keyboard focus "
+                "(e.g. the default button of a dialog) and without the read-back nothing proves the lot field had it"
+            )
+        return None
+
 
 class ExecutionConfig(_Model):
     venue: Literal["paper", "unitrader"] = "paper"
@@ -396,6 +418,12 @@ class DeskConfig(_Model):
                 )
 
         ut = self.execution.unitrader
+        simulated = self.mode is Mode.DEMO and ut.backend == "fake"
+        if self.mode in (Mode.DEMO, Mode.LIVE) and self.feed.kind != "twelvedata" and not simulated:
+            problems.append(
+                f"mode '{self.mode}' clicks a real terminal and needs real market data: set feed.kind: twelvedata "
+                f"(and TWELVEDATA_API_KEY), not '{self.feed.kind}'"
+            )
         if self.execution.venue == "unitrader":
             if ut.exit_method == "close_all" and self.risk.max_open_positions != 1:
                 problems.append("exit_method 'close_all' can only target one position: set risk.max_open_positions: 1")
@@ -476,10 +504,42 @@ def load_config(path: Path | str, env: Mapping[str, str] | None = None) -> DeskC
         cfg = DeskConfig.model_validate(raw)
     except ValidationError as exc:
         raise ConfigError(_format_validation_error(path, exc)) from exc
-    # Relative paths resolve against the project root: the parent of a ``config/`` directory, otherwise
-    # the directory that holds the config file.
-    folder = path.resolve().parent
-    return cfg.with_root(folder.parent if folder.name == "config" else folder)
+    return cfg.with_root(project_root(path))
+
+
+def project_root(config_path: Path | str) -> Path:
+    """Where relative paths (and ``.env``) live: the parent of a ``config/`` directory holding the config
+    file, otherwise the config file's own directory."""
+    folder = Path(config_path).resolve().parent
+    return folder.parent if folder.name == "config" else folder
+
+
+def load_dotenv(path: Path, env: MutableMapping[str, str]) -> list[str]:
+    """Load ``KEY=VALUE`` lines from ``path`` into ``env`` without overriding variables already set.
+
+    Blank values, ``#`` comments and lines without ``=`` are skipped; one pair of surrounding quotes is
+    removed. Returns the names that were set (never the values).
+    """
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        raise ConfigError(f"cannot read {path}: {exc}") from exc
+    loaded: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        name, _, value = stripped.removeprefix("export ").partition("=")
+        name, value = name.strip(), value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if not name or not value or name in env:
+            continue
+        env[name] = value
+        loaded.append(name)
+    return loaded
 
 
 def _format_validation_error(path: Path, exc: ValidationError) -> str:

@@ -257,6 +257,54 @@ def test_lot_field_transform() -> None:
     assert term.field_text("EURUSD") == "0.2"
 
 
+def test_commit_transform_runs_when_the_field_commits() -> None:
+    term, be = rig()
+    seen: list[tuple[str, str]] = []
+
+    def clamp(kind: str, text: str) -> str:
+        seen.append((kind, text))
+        return "0.05" if kind == "lot" else text
+
+    term.commit_transform = clamp
+    type_lot(be, term, "EURUSD", "0.25")
+    click_rect(be, term, term.geometry().panels["EURUSD"].lot_field)  # clicking the focused field again: no commit
+    be.hotkey("ctrl", "a")
+    be.hotkey("ctrl", "c")
+    assert be.get_clipboard_text() == "0.25" and seen == []  # typed, not committed yet
+    be.press("tab")
+    assert term.field_text("EURUSD") == "0.05" and seen == [("lot", "0.25")]
+    assert term.focused_field is None
+
+
+def test_commit_transform_runs_when_the_focus_leaves_the_field() -> None:
+    term, be = rig(protective_fields=True)
+    term.commit_transform = lambda kind, text: f"{text}0" if kind == "lot" else text.strip()
+    panel = term.geometry().panels["EURUSD"]
+    type_lot(be, term, "EURUSD", "0.1")
+    click_rect(be, term, panel.sl_field)  # the lot field loses the focus to another field
+    assert term.field_text("EURUSD") == "0.10"
+    be.type_text(" 1.09800 ")
+    click_rect(be, term, panel.buy_button)  # ...and the SL field to the button, before the order reads it
+    assert [(o.lot_text, o.sl_text) for o in term.orders] == [("0.10", "1.09800")]
+
+
+def test_empty_field_copies_nothing_when_asked() -> None:
+    term, be = rig()
+    click_rect(be, term, term.geometry().panels["EURUSD"].lot_field)
+    be.hotkey("ctrl", "a")
+    be.press("backspace")
+    assert term.field_text("EURUSD") == ""
+    be.set_clipboard_text("sentinel")
+    be.hotkey("ctrl", "a")
+    be.hotkey("ctrl", "c")
+    assert be.get_clipboard_text() == ""  # default: the empty text is copied
+    term.empty_copy_keeps_clipboard = True
+    be.set_clipboard_text("sentinel")
+    be.hotkey("ctrl", "a")
+    be.hotkey("ctrl", "c")
+    assert be.get_clipboard_text() == "sentinel"
+
+
 def test_keyboard_input_needs_the_foreground() -> None:
     term, be = rig()
     click_rect(be, term, term.geometry().panels["EURUSD"].lot_field)

@@ -11,7 +11,7 @@ import json
 import logging
 import sqlite3
 import threading
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -171,24 +171,40 @@ class Store:
     def set_intent_status(self, intent_id: str, status: IntentStatus, report: ExecutionReport | None = None) -> None:
         """Move an intent to ``status``; raises ``ValueError`` for unknown ids or illegal transitions."""
         with self._tx() as conn:
-            row = conn.execute("SELECT status FROM intents WHERE id = ?", (intent_id,)).fetchone()
-            if row is None:
-                raise ValueError(f"unknown intent {intent_id}")
-            current = IntentStatus(row["status"])
-            if status not in _TRANSITIONS.get(current, frozenset()):
-                raise ValueError(f"illegal intent transition {current} -> {status} for {intent_id}")
-            if report is not None and report.intent_id != intent_id:
-                raise ValueError("report belongs to a different intent")
-            if report is None:
-                conn.execute(
-                    "UPDATE intents SET status = ?, updated_at = ? WHERE id = ?",
-                    (status.value, _ts(utc_now()), intent_id),
-                )
-            else:
-                conn.execute(
-                    "UPDATE intents SET status = ?, updated_at = ?, report_json = ? WHERE id = ?",
-                    (status.value, _ts(utc_now()), report.model_dump_json(), intent_id),
-                )
+            self._set_intent_status(conn, intent_id, status, report)
+
+    def resolve_intent(
+        self, intent_id: str, status: IntentStatus, report: ExecutionReport | None, positions: Iterable[Position]
+    ) -> None:
+        """Set an intent's status and write the positions it affects in ONE transaction, so a crash can't
+        leave a recorded fill without its position (or the reverse)."""
+        with self._tx() as conn:
+            self._set_intent_status(conn, intent_id, status, report)
+            for position in positions:
+                self._upsert_position(conn, position)
+
+    @staticmethod
+    def _set_intent_status(
+        conn: sqlite3.Connection, intent_id: str, status: IntentStatus, report: ExecutionReport | None
+    ) -> None:
+        row = conn.execute("SELECT status FROM intents WHERE id = ?", (intent_id,)).fetchone()
+        if row is None:
+            raise ValueError(f"unknown intent {intent_id}")
+        current = IntentStatus(row["status"])
+        if status not in _TRANSITIONS.get(current, frozenset()):
+            raise ValueError(f"illegal intent transition {current} -> {status} for {intent_id}")
+        if report is not None and report.intent_id != intent_id:
+            raise ValueError("report belongs to a different intent")
+        if report is None:
+            conn.execute(
+                "UPDATE intents SET status = ?, updated_at = ? WHERE id = ?",
+                (status.value, _ts(utc_now()), intent_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE intents SET status = ?, updated_at = ?, report_json = ? WHERE id = ?",
+                (status.value, _ts(utc_now()), report.model_dump_json(), intent_id),
+            )
 
     def get_intent(self, intent_id: str) -> IntentRow | None:
         with self._lock:
@@ -227,21 +243,31 @@ class Store:
 
     def upsert_position(self, position: Position) -> None:
         with self._tx() as conn:
-            conn.execute(
-                "INSERT INTO positions (id, symbol, status, opened_at, closed_at, updated_at, position_json)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?)"
-                " ON CONFLICT(id) DO UPDATE SET status = excluded.status, closed_at = excluded.closed_at,"
-                " updated_at = excluded.updated_at, position_json = excluded.position_json",
-                (
-                    position.id,
-                    position.symbol,
-                    position.status.value,
-                    _ts(position.opened_at),
-                    _ts(position.closed_at) if position.closed_at else None,
-                    _ts(utc_now()),
-                    position.model_dump_json(),
-                ),
-            )
+            self._upsert_position(conn, position)
+
+    @staticmethod
+    def _upsert_position(conn: sqlite3.Connection, position: Position) -> None:
+        conn.execute(
+            "INSERT INTO positions (id, symbol, status, opened_at, closed_at, updated_at, position_json)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)"
+            " ON CONFLICT(id) DO UPDATE SET status = excluded.status, closed_at = excluded.closed_at,"
+            " updated_at = excluded.updated_at, position_json = excluded.position_json",
+            (
+                position.id,
+                position.symbol,
+                position.status.value,
+                _ts(position.opened_at),
+                _ts(position.closed_at) if position.closed_at else None,
+                _ts(utc_now()),
+                position.model_dump_json(),
+            ),
+        )
+
+    def position_intent_ids(self) -> set[str]:
+        """Ids of every opening intent that has a position row (open or closed)."""
+        with self._lock:
+            rows = self._conn.execute("SELECT json_extract(position_json, '$.intent_id') AS iid FROM positions")
+            return {r["iid"] for r in rows.fetchall() if r["iid"]}
 
     def get_position(self, position_id: str) -> Position | None:
         with self._lock:

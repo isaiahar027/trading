@@ -166,11 +166,12 @@ execution:
     layout_path: config/unitrader.layout.yaml   # written by `desk calibrate`
     backend: win32                              # win32 on the VPS; fake = built-in simulator for demos/tests
     template_threshold: 0.92
-    lot_readback: clipboard
-    commit_key: tab
+    lot_readback: clipboard   # every field is read back after typing and after commit_key (clipboard left empty)
+    commit_key: tab           # tab or enter with lot_readback: clipboard; never enter without the read-back
     decimal_separator: "."
     fill_timeout_seconds: 8
-    protective_orders: none   # panel_fields only if YOUR one-click panel has SL/TP inputs (calibrate them)
+    protective_orders: none   # panel_fields only if YOUR one-click panel has SL/TP inputs (calibrate them);
+                              # with none, calibrated SL/TP inputs are emptied before every order
     exit_method: close_all    # opposite_order only on a netting account (set netting_account_confirmed)
     save_evidence: true
     health_interval_seconds: 30

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
@@ -18,14 +19,15 @@ from amongus_desk.domain import ExecutionReport, IntentStatus, Mode, OrderIntent
 from amongus_desk.execution.unitrader.backend import BackendError
 from amongus_desk.execution.unitrader.fake import FakeGuiBackend, FakeTerminal, Rect, calibrate_fake
 from amongus_desk.execution.unitrader.layout import LayoutFile, Point
-from amongus_desk.execution.unitrader.venue import UniTraderVenue
+from amongus_desk.execution.unitrader.venue import CLEAR_PROBE, UniTraderVenue
 from factories import T0, make_instrument
 
 QUOTE = Quote("EURUSD", 1.09990, 1.10010, T0)
 PRE_CLICK_FAILURE_STAGES = {
     "halted", "input_desktop", "account_kind", "locate_window", "client_geometry", "focus", "account_badge",
-    "one_click_indicator", "verify_panel_label", "stability", "lot_entry", "protective_fields", "pre_click_verify",
-    "write_ahead", "deadline", "validate", "operator_abort", "watchdog_timeout", "closed", "error", "abandoned",
+    "one_click_indicator", "verify_panel_label", "stability", "pre_input_verify", "lot_entry", "protective_fields",
+    "pre_click_verify", "write_ahead", "deadline", "validate", "operator_abort", "watchdog_timeout", "closed", "error",
+    "abandoned",
 }  # fmt: skip
 
 
@@ -259,6 +261,7 @@ def rigs(tmp_path: Path) -> Iterator[Callable[..., Rig]]:
         dry_run: bool = False,
         cfg: dict[str, Any] | None = None,
         terminal: dict[str, Any] | None = None,
+        terminal_cls: type[FakeTerminal] = FakeTerminal,
         calibrate: dict[str, Any] | None = None,
         halt: Halt | None = None,
         backend_cls: type[FakeGuiBackend] = FakeGuiBackend,
@@ -267,7 +270,7 @@ def rigs(tmp_path: Path) -> Iterator[Callable[..., Rig]]:
         layout_hook: Callable[[LayoutFile], LayoutFile] | None = None,
     ) -> Rig:
         base = tmp_path / f"rig{len(created)}"
-        term = FakeTerminal(symbols, **(terminal or {}))
+        term = terminal_cls(symbols, **(terminal or {}))
         layout = calibrate_fake(term, base / "cal", calibrated_at=T0, **(calibrate or {}))
         if layout_hook is not None:
             layout = layout_hook(layout)
@@ -368,13 +371,13 @@ async def test_order_is_confirmed(rigs: Callable[..., Rig], side: Side) -> None:
     names = step_names(report)
     expected = [
         "halted", "input_desktop", "account_kind", "window", "client_size", "dpi", "focus", "account_badge",
-        "one_click_indicator", "panel:EURUSD", "stability", "lots_typed", "lots_readback", "pre_click_verify",
-        "write_ahead", "click", "fill_check", "park_mouse",
+        "one_click_indicator", "panel:EURUSD", "stability", "pre_input_verify", "lots_typed", "lots_readback",
+        "lots_committed", "pre_click_verify", "write_ahead", "click", "fill_check", "park_mouse", "clipboard",
     ]  # fmt: skip
     positions = [names.index(n) for n in expected]
     assert positions == sorted(positions), names
     assert report.evidence["fill_check"]["changed"] is True
-    # the clipboard holds the operator's content again (here: nothing was there, so the sentinel is not restored)
+    assert rig.terminal.clipboard == ""  # the read-back's sentinel and lot text are not left behind
     report.model_dump_json()  # JSON-safe
 
 
@@ -423,11 +426,30 @@ async def test_minimized_window_is_restored_not_resized(rigs: Callable[..., Rig]
 
 
 @pytest.mark.anyio
-async def test_operator_clipboard_is_restored(rigs: Callable[..., Rig]) -> None:
+@pytest.mark.parametrize("lots", ["0.10", "0.07"])  # confirmed / aborted at the read-back
+async def test_operator_clipboard_is_never_read_or_restored(rigs: Callable[..., Rig], lots: str) -> None:
+    # It may hold the password the operator pasted into UniTrader's login. Reading it and writing it back later
+    # would keep it around (and drop a password manager's "keep out of clipboard history" marks): the desk
+    # overwrites it with its sentinel and leaves the clipboard empty.
     rig = rigs()
+    rig.terminal.clipboard = "hunter2-Secret!"
+    rig.terminal.lot_field_transform = lambda text: "0.10" if text == "0.07" else text
+    report = await rig.venue.submit(intent(lots=lots), QUOTE, rig.write_ahead())
+    assert report.status is (IntentStatus.CONFIRMED if lots == "0.10" else IntentStatus.ABORTED), report.message
+    clipboard = [a for a in rig.backend.actions if a.name in ("get_clipboard_text", "set_clipboard_text")]
+    assert clipboard[0].name == "set_clipboard_text" and str(clipboard[0].args[0]).startswith("amongus-desk-readback-")
+    assert clipboard[-1].name == "set_clipboard_text" and clipboard[-1].args == ("",)
+    assert rig.terminal.clipboard == ""
+    assert "hunter2" not in report.model_dump_json()
+
+
+@pytest.mark.anyio
+async def test_clipboard_is_left_alone_without_readback(rigs: Callable[..., Rig]) -> None:
+    rig = rigs(cfg={"lot_readback": "none"})
     rig.terminal.clipboard = "operator's notes"
     report = await rig.venue.submit(intent(), QUOTE, rig.write_ahead())
-    assert report.status is IntentStatus.CONFIRMED
+    assert report.status is IntentStatus.CONFIRMED, report.message
+    assert not any(a.name in ("get_clipboard_text", "set_clipboard_text") for a in rig.backend.actions)
     assert rig.terminal.clipboard == "operator's notes"
 
 
@@ -735,6 +757,138 @@ async def test_clipboard_sentinel_unchanged(rigs: Callable[..., Rig]) -> None:
     assert "sentinel" in report.message
 
 
+def clamp_on_commit(kind: str, text: str) -> str:
+    """A simulated lot field that clamps to 0.05 when the edit is committed (e.g. a terminal-side maximum)."""
+    return "0.05" if kind == "lot" and Decimal(text) > Decimal("0.05") else text
+
+
+def thousands_dot_on_commit(kind: str, text: str) -> str:
+    """A simulated lot field that reads '.' as a thousands separator when it commits (decimal_separator is wrong)."""
+    if kind != "lot":
+        return text
+    return format(Decimal(text.replace(".", "").replace(",", ".")).quantize(Decimal("0.01")), "f")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(("transform", "shown"), [(clamp_on_commit, "0.05"), (thousands_dot_on_commit, "10.00")])
+async def test_value_changed_by_the_commit_aborts(
+    rigs: Callable[..., Rig], transform: Callable[[str, str], str], shown: str
+) -> None:
+    # The first read-back only proves the keystrokes arrived. The order goes out with whatever the field holds once
+    # the terminal committed the edit, so that is read back too, still before the click.
+    rig = rigs()
+    rig.terminal.commit_transform = transform
+    wa = rig.write_ahead()
+    report = await rig.venue.submit(intent(), QUOTE, wa)
+    assert_aborted_without_click(rig, report, wa, "lot_entry")
+    assert f"after tab committed it: typed '0.10' but the field shows {shown!r}" in report.message
+    assert "lot_step" in report.message and "decimal_separator" in report.message
+    assert "lots_readback" in step_names(report)  # the keystrokes did arrive
+    assert rig.terminal.field_text("EURUSD") == shown
+
+
+@pytest.mark.anyio
+async def test_protective_field_changed_by_the_commit_aborts(rigs: Callable[..., Rig]) -> None:
+    rig = rigs(terminal={"protective_fields": True}, cfg={"protective_orders": "panel_fields"})
+    rig.terminal.commit_transform = lambda kind, text: "1.09900" if kind == "sl" else text  # e.g. a minimum distance
+    wa = rig.write_ahead()
+    report = await rig.venue.submit(intent(), QUOTE, wa)
+    assert_aborted_without_click(rig, report, wa, "protective_fields")
+    assert "stop_loss read-back mismatch after tab committed it" in report.message
+
+
+def test_unverifiable_field_entry_settings_are_rejected() -> None:
+    assert UniTraderConfig().field_entry_problem() is None  # the defaults: clipboard read-back + tab
+    UniTraderConfig(lot_readback="none", commit_key="none")
+    UniTraderConfig(commit_key="enter")
+    # Without a commit key the field only commits when the BUY click leaves it, after the last read-back.
+    with pytest.raises(ValueError, match="needs commit_key: tab or enter"):
+        UniTraderConfig(commit_key="none")
+    # Enter goes to whatever has the focus (a dialog's default button) and nothing would notice.
+    with pytest.raises(ValueError, match="needs lot_readback: clipboard"):
+        UniTraderConfig(lot_readback="none", commit_key="enter")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(("readback", "key"), [("clipboard", "none"), ("none", "enter")])
+async def test_unverifiable_field_entry_settings_never_touch_the_gui(
+    rigs: Callable[..., Rig], readback: str, key: str
+) -> None:
+    rig = rigs(cfg={"lot_readback": readback, "commit_key": key})  # bypasses the config validator
+    report = await rig.venue.submit(intent(), QUOTE, rig.write_ahead())
+    assert report.status is IntentStatus.ABORTED and report.stage == "validate"
+    assert rig.backend.actions == []
+    health = await rig.venue.preflight()
+    assert not next(c for c in health.checks if c.name == "field_entry").ok
+
+
+class DialogOverTheLotField(FakeTerminal):
+    """Simulated terminal whose (simulated) confirmation dialog is a small box with its OK button exactly where the
+    EURUSD lot field is, clear of the panel label and the positions indicator (calibration allows that: dialog
+    buttons may sit over the terminal's own controls)."""
+
+    def geometry(self, *, calibration: bool = True) -> Any:
+        geo = super().geometry(calibration=calibration)
+        lot = geo.panels["EURUSD"].lot_field
+        box = Rect(lot.x - 10, lot.y - 4, 230, 90)
+        return dataclasses.replace(
+            geo,
+            dialog=box,
+            dialog_header=Rect(box.x, box.y + 40, 230, 20),
+            dialog_ok=Rect(lot.x, lot.y, lot.w, lot.h),
+            dialog_cancel=Rect(box.x + 130, box.y + 64, 90, 22),
+        )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("readback", ["clipboard", "none"])
+async def test_stale_dialog_over_a_field_is_never_clicked(rigs: Callable[..., Rig], readback: str) -> None:
+    # Left open by an earlier flow: the first click into the lot field would confirm THAT order, and this flow
+    # would still end ABORTED "nothing was clicked".
+    rig = rigs(
+        terminal_cls=DialogOverTheLotField, terminal={"order_confirm_dialog": True}, cfg={"lot_readback": readback}
+    )
+    rig.terminal.show_dialog("order_confirm", ("EURUSD", "SELL"))
+    wa = rig.write_ahead()
+    report = await rig.venue.submit(intent(), QUOTE, wa)
+    assert_aborted_without_click(rig, report, wa, "pre_input_verify")
+    assert "order confirmation dialog is already showing" in report.message
+    assert rig.backend.input_actions() == [] and rig.terminal.dialog_confirms == 0
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("readback", ["clipboard", "none"])
+async def test_window_covering_a_field_gets_no_input(rigs: Callable[..., Rig], readback: str) -> None:
+    rig = rigs(cfg={"lot_readback": readback})
+    lot = rig.terminal.geometry().panels["EURUSD"].lot_field
+    rig.terminal.popup = Rect(lot.x + 30, lot.y, 60, lot.h)  # over the field's centre only
+    wa = rig.write_ahead()
+    report = await rig.venue.submit(intent(), QUOTE, wa)
+    assert_aborted_without_click(rig, report, wa, "pre_input_verify")
+    assert "on top of the lots field of the EURUSD panel" in report.message
+    assert rig.backend.input_actions() == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("readback", ["clipboard", "none"])
+async def test_dialog_appearing_while_typing_gets_no_further_input(rigs: Callable[..., Rig], readback: str) -> None:
+    # e.g. the terminal objects to the value: the next click (read-back) or key (commit) would go to that dialog
+    rig = rigs(cfg={"lot_readback": readback})
+
+    def hook(term: FakeTerminal, name: str) -> None:
+        if name == "type_text":
+            term.show_dialog("error")
+
+    rig.terminal.on_action = hook
+    wa = rig.write_ahead()
+    report = await rig.venue.submit(intent(), QUOTE, wa)
+    assert_aborted_without_click(rig, report, wa, "lot_entry")
+    assert "error message (error_templates[0]) is already showing" in report.message
+    lot = rig.screen(rig.layout.layout.panels["EURUSD"].lot_input)
+    assert rig.backend.clicks().count(lot) == 1
+    assert not any(a.name == "press" for a in rig.backend.actions)
+
+
 @pytest.mark.anyio
 async def test_halted_right_before_the_click(rigs: Callable[..., Rig]) -> None:
     rig = rigs(halt=Halt(from_call=2))  # 1st check (step 1) passes, 2nd check (step 10) is engaged
@@ -767,48 +921,68 @@ async def test_kill_switch_errors_count_as_engaged(rigs: Callable[..., Rig]) -> 
     assert_aborted_without_click(rig, report, wa, "halted")
 
 
-@pytest.mark.anyio
-async def test_focus_stolen_after_typing(rigs: Callable[..., Rig]) -> None:
-    rig = rigs()
+def on_nth_press(n: int, change: Callable[[FakeTerminal], None]) -> Callable[[FakeTerminal, str], None]:
+    """``on_action`` hook: apply ``change`` right after the n-th key press (1: the lot's commit key; 2: the commit
+    key after the post-commit read-back, i.e. the last input before the click)."""
+    presses: list[str] = []
 
     def hook(term: FakeTerminal, name: str) -> None:
-        if name == "press":  # the commit key after the lot entry
-            term.steal_focus()
+        if name == "press":
+            presses.append(name)
+            if len(presses) == n:
+                change(term)
 
-    rig.terminal.on_action = hook
+    return hook
+
+
+# A change after the first commit is caught by the guard in front of the next input (the post-commit read-back);
+# a change after the last input by the re-verification right before the click.
+AFTER_TYPING = pytest.mark.parametrize(("press", "stage"), [(1, "lot_entry"), (2, "pre_click_verify")])
+
+
+@pytest.mark.anyio
+@AFTER_TYPING
+async def test_focus_stolen_after_typing(rigs: Callable[..., Rig], press: int, stage: str) -> None:
+    rig = rigs()
+    rig.terminal.on_action = on_nth_press(press, FakeTerminal.steal_focus)
     wa = rig.write_ahead()
     report = await rig.venue.submit(intent(), QUOTE, wa)
-    assert_aborted_without_click(rig, report, wa, "pre_click_verify")
+    assert_aborted_without_click(rig, report, wa, stage)
     assert "lost the foreground" in report.message
 
 
 @pytest.mark.anyio
-async def test_window_moved_after_the_checks(rigs: Callable[..., Rig]) -> None:
+@AFTER_TYPING
+async def test_window_moved_after_the_checks(rigs: Callable[..., Rig], press: int, stage: str) -> None:
     rig = rigs()
 
-    def hook(term: FakeTerminal, name: str) -> None:
-        if name == "press":
-            term.client_origin = (term.client_origin[0] + 15, term.client_origin[1])
+    def move(term: FakeTerminal) -> None:
+        term.client_origin = (term.client_origin[0] + 15, term.client_origin[1])
 
-    rig.terminal.on_action = hook
+    rig.terminal.on_action = on_nth_press(press, move)
     wa = rig.write_ahead()
+    clicks_before = len(rig.backend.clicks())
     report = await rig.venue.submit(intent(), QUOTE, wa)
-    assert_aborted_without_click(rig, report, wa, "pre_click_verify")
+    assert_aborted_without_click(rig, report, wa, stage)
     assert "moved" in report.message
+    # field click + read-back click (+ the post-commit read-back click): none after the window moved
+    assert len(rig.backend.clicks()) - clicks_before == press + 1
 
 
 @pytest.mark.anyio
-async def test_panel_swapped_after_typing(rigs: Callable[..., Rig]) -> None:
+@AFTER_TYPING
+async def test_panel_swapped_after_typing(rigs: Callable[..., Rig], press: int, stage: str) -> None:
     rig = rigs(symbols=("EURUSD", "GBPUSD"))
 
-    def hook(term: FakeTerminal, name: str) -> None:
-        if name == "press":
-            term.swap_panels = True
+    def swap(term: FakeTerminal) -> None:
+        term.swap_panels = True
 
-    rig.terminal.on_action = hook
+    rig.terminal.on_action = on_nth_press(press, swap)
     wa = rig.write_ahead()
     report = await rig.venue.submit(intent(), QUOTE, wa)
-    assert_aborted_without_click(rig, report, wa, "pre_click_verify")
+    assert_aborted_without_click(rig, report, wa, stage)
+    assert "EURUSD panel label does not match" in report.message
+    assert rig.terminal.field_text("GBPUSD") == "0.01"  # never typed into (or read from) the wrong panel
 
 
 @pytest.mark.anyio
@@ -840,11 +1014,10 @@ async def test_stale_confirmation_dialog_is_never_confirmed(rigs: Callable[..., 
     rig.terminal.show_dialog("order_confirm", ("EURUSD", "BUY"))
     wa = rig.write_ahead()
     report = await rig.venue.submit(intent(), QUOTE, wa)
-    assert_aborted_without_click(rig, report, wa, "pre_click_verify")
+    assert_aborted_without_click(rig, report, wa, "pre_input_verify")
     assert "order confirmation dialog is already showing" in report.message
     assert rig.terminal.dialog == "order_confirm" and rig.terminal.dialog_confirms == 0
-    buy = rig.screen(rig.layout.layout.panels["EURUSD"].buy_button)
-    assert buy not in rig.backend.clicks()
+    assert rig.backend.input_actions() == []  # found before the first click into the panel
 
 
 @pytest.mark.anyio
@@ -854,8 +1027,9 @@ async def test_stale_error_message_aborts_before_the_click(rigs: Callable[..., R
     rig.terminal.show_dialog("error")
     wa = rig.write_ahead()
     report = await rig.venue.submit(intent(), QUOTE, wa)
-    assert_aborted_without_click(rig, report, wa, "pre_click_verify")
+    assert_aborted_without_click(rig, report, wa, "pre_input_verify")
     assert "error message" in report.message
+    assert rig.backend.input_actions() == []
     assert not any(a.name == "press" and a.args == ("esc",) for a in rig.backend.actions)  # never dismissed
 
 
@@ -1008,8 +1182,48 @@ async def test_dry_run_types_nothing_and_clicks_nothing(rigs: Callable[..., Rig]
     assert rig.terminal.field_text("EURUSD") == "0.01"
     assert wa.calls == 0 and rig.no_trade_click()
     assert report.clicked_at is None
-    assert "panel:EURUSD" in step_names(report) and "stability" in step_names(report)
+    for name in ("panel:EURUSD", "stability", "pre_input_verify", "pre_click_verify"):
+        assert name in step_names(report)
+    assert "re-verification right before the click" in report.message
     assert rig.venue.dry_run
+
+
+def cover_the_buy_button(rig: Rig) -> None:
+    buy = rig.terminal.geometry().panels["EURUSD"].buy_button
+    rig.terminal.popup = Rect(buy.x + 20, buy.y + 5, 60, 30)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("setup", "stage", "fragment"),
+    [
+        (cover_the_buy_button, "pre_click_verify", "on top of the BUY button"),
+        (lambda rig: rig.terminal.show_dialog("error"), "pre_input_verify", "error message"),
+        (lambda rig: setattr(rig.halt, "from_call", 2), "halted", "kill switch engaged before the click"),
+    ],
+)
+async def test_dry_run_runs_the_checks_a_real_order_runs_before_its_click(
+    rigs: Callable[..., Rig], setup: Callable[[Rig], None], stage: str, fragment: str
+) -> None:
+    # The shadow day must surface what would block the first real order (a covered button, a stuck dialog).
+    rig = rigs(dry_run=True)
+    setup(rig)
+    report = await rig.venue.submit(intent(), QUOTE, rig.write_ahead())
+    assert report.status is IntentStatus.ABORTED and report.stage == stage, report.message
+    assert fragment in report.message
+    assert rig.backend.input_actions() == []
+
+
+@pytest.mark.anyio
+async def test_close_all_dry_run_checks_that_nothing_covers_the_button(rigs: Callable[..., Rig]) -> None:
+    rig = rigs(dry_run=True)
+    rig.terminal.open_position("EURUSD", "BUY", Decimal("0.10"))
+    button = rig.terminal.geometry().close_all
+    rig.terminal.popup = Rect(button.x + 40, button.y + 5, 60, 30)
+    report = await rig.venue.close_all(close_all_intent(), rig.write_ahead())
+    assert report.status is IntentStatus.ABORTED and report.stage == "pre_click_verify", report.message
+    assert "close-all button" in report.message
+    assert rig.backend.input_actions() == [] and len(rig.terminal.positions) == 1
 
 
 @pytest.mark.anyio
@@ -1300,7 +1514,7 @@ async def test_max_order_seconds_before_the_click(rigs: Callable[..., Rig]) -> N
 @pytest.mark.anyio
 async def test_no_click_without_enough_time_left_to_confirm(rigs: Callable[..., Rig]) -> None:
     rig = rigs(cfg={"max_order_seconds": 10.0, "fill_timeout_seconds": 8.0})
-    rig.backend.capture_hook = lambda *_: rig.clock.advance(0.5)
+    rig.backend.capture_hook = lambda *_: rig.clock.advance(0.2)
     wa = rig.write_ahead()
     report = await rig.venue.submit(intent(), QUOTE, wa)
     assert_aborted_without_click(rig, report, wa, "deadline")
@@ -1545,6 +1759,103 @@ async def test_inconsistent_protective_prices(rigs: Callable[..., Rig], override
 
 
 # ============================================================================================ closing
+def stale_sl_tp(term: FakeTerminal) -> None:
+    """SL/TP values left in the panel, e.g. by a manual test trade or an earlier protective_orders: panel_fields run."""
+    term.set_field_text("EURUSD", "sl", "1.10150")
+    term.set_field_text("EURUSD", "tp", "1.09500")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("empty_copy_keeps_clipboard", [False, True])
+async def test_stale_sl_tp_are_emptied_with_protective_orders_none(
+    rigs: Callable[..., Rig], empty_copy_keeps_clipboard: bool
+) -> None:
+    # The order would carry them: the broker could close the position at a level the desk knows nothing about.
+    rig = rigs(terminal={"protective_fields": True})
+    assert not rig.venue.supports_protective_orders
+    rig.terminal.empty_copy_keeps_clipboard = empty_copy_keeps_clipboard  # many text boxes copy nothing when empty
+    stale_sl_tp(rig.terminal)
+    report = await rig.venue.submit(intent(), QUOTE, rig.write_ahead())
+    assert report.status is IntentStatus.CONFIRMED, report.message
+    assert [(o.lots, o.sl_text, o.tp_text) for o in rig.terminal.orders] == [(Decimal("0.10"), None, None)]
+    # each field first takes (and copies) the probe, so "copies nothing" afterwards really means "empty"
+    assert rig.typed() == ["0.10", CLEAR_PROBE, CLEAR_PROBE]
+    names = step_names(report)
+    for name in ("stop_loss_cleared", "take_profit_cleared", "stop_loss_committed", "take_profit_committed"):
+        assert name in names
+    assert names.index("take_profit_committed") < names.index("pre_click_verify")
+
+
+@pytest.mark.anyio
+async def test_sl_field_that_does_not_stay_empty_aborts(rigs: Callable[..., Rig]) -> None:
+    rig = rigs(terminal={"protective_fields": True})
+    stale_sl_tp(rig.terminal)
+    rig.terminal.commit_transform = lambda kind, text: (text or "1.10150") if kind == "sl" else text  # reverts
+    wa = rig.write_ahead()
+    report = await rig.venue.submit(intent(), QUOTE, wa)
+    assert_aborted_without_click(rig, report, wa, "protective_fields")
+    assert "stop_loss field is not empty after tab committed it: it reads back as '1.10150'" in report.message
+
+
+class SlFieldIgnoresSelectAll(FakeTerminal):
+    """Simulated SL field in which ctrl+a selects nothing (the lot field behaves normally)."""
+
+    def hotkey(self, keys: Sequence[str]) -> str | None:
+        if tuple(k.lower() for k in keys) == ("ctrl", "a") and self.focused_field == ("EURUSD", "sl"):
+            return None
+        return super().hotkey(keys)
+
+
+@pytest.mark.anyio
+async def test_sl_field_that_cannot_be_proven_empty_aborts(rigs: Callable[..., Rig]) -> None:
+    # backspace then deletes one character only, and an empty selection copies nothing: without the probe the
+    # field would look empty while it still holds most of the stale stop
+    rig = rigs(terminal_cls=SlFieldIgnoresSelectAll, terminal={"protective_fields": True})
+    rig.terminal.empty_copy_keeps_clipboard = True
+    stale_sl_tp(rig.terminal)
+    wa = rig.write_ahead()
+    report = await rig.venue.submit(intent(), QUOTE, wa)
+    assert_aborted_without_click(rig, report, wa, "protective_fields")
+    assert "stop_loss field could not be emptied safely" in report.message
+
+
+@pytest.mark.anyio
+async def test_stale_sl_tp_are_emptied_without_readback_too(rigs: Callable[..., Rig]) -> None:
+    rig = rigs(terminal={"protective_fields": True}, cfg={"lot_readback": "none"})
+    stale_sl_tp(rig.terminal)
+    report = await rig.venue.submit(intent(), QUOTE, rig.write_ahead())
+    assert report.status is IntentStatus.CONFIRMED, report.message
+    assert [(o.sl_text, o.tp_text) for o in rig.terminal.orders] == [(None, None)]
+    assert rig.typed() == ["0.10"]
+    cleared = next(s for s in report.evidence["steps"] if s["step"] == "stop_loss_cleared")
+    assert "not verified" in cleared["detail"]
+
+
+@pytest.mark.anyio
+async def test_opposite_order_close_empties_stale_sl_tp(rigs: Callable[..., Rig]) -> None:
+    rig = rigs(
+        terminal={"protective_fields": True}, cfg={"exit_method": "opposite_order", "netting_account_confirmed": True}
+    )
+    pos = position(Side.SELL, lots="0.20")
+    rig.terminal.open_position("EURUSD", "SELL", pos.lots)
+    stale_sl_tp(rig.terminal)
+    report = await rig.venue.close_position(pos, close_intent(pos), None, rig.write_ahead())
+    assert report.status is IntentStatus.CONFIRMED, report.message
+    assert [(o.side, o.sl_text, o.tp_text) for o in rig.terminal.orders] == [("BUY", None, None)]
+    assert rig.terminal.positions == []
+
+
+@pytest.mark.anyio
+async def test_preflight_explains_the_sl_tp_fields_with_protective_orders_none(rigs: Callable[..., Rig]) -> None:
+    rig = rigs()  # panels without calibrated SL/TP inputs: the desk cannot empty them
+    check = next(c for c in (await rig.venue.preflight()).checks if c.name == "instrument:EURUSD")
+    assert check.ok and check.data == {"warning": True}
+    assert "WARNING" in check.detail and "keep them EMPTY" in check.detail
+    rig2 = rigs(terminal={"protective_fields": True})
+    check2 = next(c for c in (await rig2.venue.preflight()).checks if c.name == "instrument:EURUSD")
+    assert check2.ok and "emptied and verified empty before every order" in check2.detail
+
+
 @pytest.mark.anyio
 async def test_close_all_clicks_the_button_even_when_halted(rigs: Callable[..., Rig]) -> None:
     rig = rigs(halt=Halt(engaged=True))

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import timedelta
 from types import SimpleNamespace
@@ -242,3 +243,90 @@ async def test_usage_accounting_and_close() -> None:
     assert usage["enabled"] is True and usage["model"] == "claude-opus-5-5"
     await rev.aclose()
     assert client.closed
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        TypeError("Could not resolve authentication method. Expected either api_key or auth_token to be set."),
+        json.JSONDecodeError("Expecting value", "", 0),
+        RuntimeError("unexpected"),
+    ],
+)
+@pytest.mark.anyio
+async def test_any_other_error_still_follows_the_failure_policy(exc: BaseException) -> None:
+    rev, _, _ = reviewer(exc, failure_policy="abstain")
+    out = await rev.review(SIGNAL, PLAN, CONTEXT)
+    assert out.vote is Vote.HOLD and type(exc).__name__ in (out.error or "")
+    usage = rev.usage_today()
+    assert usage["failures"] == 1 and usage["last_error"] == out.error
+
+
+@pytest.mark.anyio
+async def test_missing_content_is_a_failure_not_a_crash() -> None:
+    resp = response(verdict=APPROVE)
+    resp.content = None
+    rev, _, _ = reviewer(resp)
+    out = await rev.review(SIGNAL, PLAN, CONTEXT)
+    assert out.vote is Vote.EJECT and "no text block" in (out.error or "")
+
+
+class SlowMessages(FakeMessages):
+    async def create(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        await asyncio.sleep(10)  # e.g. the SDK retrying a stalled request
+        return self.result
+
+
+@pytest.mark.anyio
+async def test_total_review_time_is_bounded_including_retries() -> None:
+    rev, client, _ = reviewer(response(verdict=APPROVE), timeout_seconds=0.05)
+    client.messages = client.beta.messages = SlowMessages(response(verdict=APPROVE))  # type: ignore[assignment]
+    started = asyncio.get_running_loop().time()
+    out = await rev.review(SIGNAL, PLAN, CONTEXT)
+    assert asyncio.get_running_loop().time() - started < 2
+    assert out.vote is Vote.EJECT and "took longer than" in (out.error or "")
+
+
+@pytest.mark.anyio
+async def test_cancelling_a_review_propagates() -> None:
+    rev, client, _ = reviewer(response(verdict=APPROVE), timeout_seconds=30)
+    client.messages = client.beta.messages = SlowMessages(response(verdict=APPROVE))  # type: ignore[assignment]
+    task = asyncio.create_task(rev.review(SIGNAL, PLAN, CONTEXT))
+    await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+class KV:
+    def __init__(self) -> None:
+        self.data: dict[str, Any] = {}
+
+    def get_kv(self, key: str) -> Any | None:
+        return self.data.get(key)
+
+    def set_kv(self, key: str, value: Any) -> None:
+        self.data[key] = json.loads(json.dumps(value))
+
+
+@pytest.mark.anyio
+async def test_daily_cap_survives_a_restart() -> None:
+    kv = KV()
+    clock = ManualClock(T0)
+    first = ClaudeReviewer(
+        LlmConfig(enabled=True, max_calls_per_day=2),
+        clock,
+        client=FakeClient(response(verdict=VETO)),
+        state=kv,  # type: ignore[arg-type]
+    )
+    await first.review(SIGNAL, PLAN, CONTEXT)
+    await first.review(SIGNAL, PLAN, CONTEXT)
+    client = FakeClient(response(verdict=APPROVE))
+    restarted = ClaudeReviewer(LlmConfig(enabled=True, max_calls_per_day=2), clock, client=client, state=kv)  # type: ignore[arg-type]
+    out = await restarted.review(SIGNAL, PLAN, CONTEXT)
+    assert "cap reached" in (out.error or "") and client.messages.calls == []
+    usage = restarted.usage_today()
+    assert usage["calls"] == 2 and usage["vetoes"] == 2 and usage["input_tokens"] == 1800
+    clock.advance(timedelta(days=1).total_seconds())
+    assert (await restarted.review(SIGNAL, PLAN, CONTEXT)).vote is Vote.PROCEED

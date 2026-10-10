@@ -5,9 +5,12 @@ Safety properties the engine maintains:
 * Every order is persisted as PENDING before the venue is called, and as SUBMITTING (write-ahead) right
   before the irreversible click. On restart PENDING becomes ABORTED (never reached the venue) and
   SUBMITTING/UNCONFIRMED become *reconcile items*. New trades stay blocked until the operator answers them.
-* Orders are never retried automatically. A failed *close* is retried on the next bar (an ABORTED close
-  provably did nothing), and the operator is alerted every time.
-* The kill switch blocks new entries only; exits and PANIC still run.
+* Orders are never retried automatically. Only a close that provably did nothing (ABORTED before the
+  click) is sent again on the next bar; a close that was clicked and not confirmed goes to the operator.
+* The desk never infers a fill: when the feed reaches a broker-side SL/TP, the position is put to the
+  operator ("is it still open?") instead of being booked as closed.
+* The kill switch blocks new entries only; exits and PANIC still run. Engaging it abandons a crew meeting
+  that is still waiting for Claude, so PANIC never queues behind a slow review.
 * The desk never logs in to the broker. When the venue reports the terminal missing or the wrong account,
   trading halts and the operator is asked to log in themselves.
 """
@@ -17,17 +20,19 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
 from collections.abc import Callable
-from datetime import date, datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 from .audit import AuditLog
 from .clock import Clock
-from .config import DeskConfig
+from .config import ConfigError, DeskConfig, InstrumentConfig
 from .crew import MeetingContext
 from .domain import (
     CREW_DISPLAY,
     Bar,
+    BreakoutSignal,
     CrewId,
     ExecutionReport,
     ExitReason,
@@ -48,7 +53,7 @@ from .killswitch import KillSwitch
 from .llm.base import TradeReviewer
 from .marketdata.base import MarketDataFeed
 from .meeting import EmergencyMeeting, build_forced_signal
-from .money import estimate_pnl
+from .money import estimate_pnl, trading_day_start
 from .news import NewsCalendar
 from .notify import Notifier, Priority
 from .positions import ExitDue, PositionBook
@@ -61,6 +66,8 @@ log = logging.getLogger(__name__)
 EQUITY_KV = "equity_base"
 HISTORY_DAYS = 30
 _RECONCILE_STATUSES = (IntentStatus.SUBMITTING, IntentStatus.UNCONFIRMED)
+_FILLED_STATUSES = (IntentStatus.CONFIRMED, IntentStatus.RECONCILED_FILLED)
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 
 class OperatorActionError(Exception):
@@ -109,11 +116,15 @@ class DeskEngine:
         self._degraded: dict[str, str] = {}
         self._venue_health: VenueHealth | None = None
         self._in_flight: set[str] = set()
-        self._exit_retry: dict[str, ExitReason] = {}
+        # Exits that are due but not sent yet: a close that ABORTED before its click, or an exit that became
+        # due while the desk was down. Sent on the next bar of the symbol.
+        self._pending_exits: dict[str, ExitReason] = {}
+        self._meeting_task: asyncio.Task[MeetingRecord] | None = None
         self._crew: dict[CrewId, dict[str, Any]] = {
             c: {"vote": Vote.HOLD.value, "summary": "", "at": None} for c in CrewId
         }
-        self._daily_loss_alerted: date | None = None
+        self._daily_loss_alerted: datetime | None = None  # trading day of the last daily-loss alert
+        self._daily_loss_flattened: datetime | None = None  # trading day the daily-loss flatten went out
         self._last_kill_state: bool | None = None
 
     # ====================================================================================== lifecycle
@@ -134,12 +145,26 @@ class DeskEngine:
     def history(self) -> BarHistory:
         return self._history
 
+    def managed_instruments(self) -> list[InstrumentConfig]:
+        """Instruments the desk needs bars for: the enabled ones plus any with an active position.
+
+        ``enabled: false`` means "no new entries"; an open position on such an instrument keeps its exits.
+        """
+        held = {p.symbol for p in self._book.active()}
+        return [i for i in self._cfg.instruments if i.enabled or i.symbol in held]
+
     async def start(self) -> None:
         now = self._clock.now()
         self._started_at = now
         self._load_book(now)
-        self._startup_reconciliation()
-        symbols = [i.symbol for i in self._cfg.enabled_instruments]
+        unknown = sorted({p.symbol for p in self._book.active()} - set(self._instruments))
+        if unknown:
+            raise ConfigError(
+                f"the desk has active positions on {', '.join(unknown)}, which are not in the config; add the "
+                "instrument(s) back (enabled: false is enough) so their exits keep running"
+            )
+        await self._startup_reconciliation()
+        symbols = [i.symbol for i in self.managed_instruments()]
         try:
             warm = await self._feed.warmup(symbols, self._history_size())
         except Exception as exc:
@@ -149,6 +174,7 @@ class DeskEngine:
         for bars in warm.values():
             for bar in bars:
                 self._history.add(bar)
+        await self._catch_up(warm)
         await self._check_venue(preflight=True)
         self._last_kill_state = self._killswitch.engaged()
         self._audit.append(
@@ -202,34 +228,97 @@ class DeskEngine:
             except (TypeError, ValueError):
                 log.error("ignoring malformed equity base in the store: %r", base)
                 base_equity, base_at = None, None
-        since = now - timedelta(days=HISTORY_DAYS)
-        if base_at is not None and base_at < since:
-            since = base_at
+        # Without an operator equity sync, equity is starting equity + ALL realized P&L, so load everything.
+        since = _EPOCH if base_at is None else min(base_at, now - timedelta(days=HISTORY_DAYS))
         history = self._store.closed_positions_since(since)
         self._book = PositionBook(
             self._cfg, self._store.active_positions(), history, equity_base=base_equity, equity_base_at=base_at
         )
 
-    def _startup_reconciliation(self) -> None:
+    async def _startup_reconciliation(self) -> None:
+        """Repair what a crash between two writes can leave behind, never guessing in the risky direction."""
         for row in self._store.intents_with_status(IntentStatus.PENDING):
             self._store.set_intent_status(row.intent.id, IntentStatus.ABORTED)
             self._audit.append(
                 "intent.status", {"id": row.intent.id, "status": "ABORTED", "why": "restart: never sent"}
             )
         unresolved = {row.intent.id for row in self._store.intents_with_status(*_RECONCILE_STATUSES)}
+        now = self._clock.now()
         for pos in self._book.active():
-            if pos.status is PositionStatus.CLOSING and pos.close_intent_id not in unresolved:
-                # The close never reached the venue (or finished): the position is still open.
-                updated = self._book.set_status(pos.id, PositionStatus.OPEN)
-                self._store.upsert_position(updated)
+            if pos.status is not PositionStatus.CLOSING or pos.close_intent_id in unresolved:
+                continue  # an unresolved close stays CLOSING: its order is a reconcile item
+            close_row = self._store.get_intent(pos.close_intent_id) if pos.close_intent_id else None
+            status = close_row.status if close_row else None
+            if status in _FILLED_STATUSES:
+                # The close was confirmed but the desk stopped before it recorded the position as closed.
+                price = pos.last_price or pos.entry_price
+                closed = self._book.close(
+                    pos.id, price=price, source="feed_estimate", reason=ExitReason.RECONCILED, at=now
+                )
+                await self._closed(closed, note="its close was confirmed before the restart; exit price estimated")
+            elif status is IntentStatus.REJECTED:
+                note = "its close was clicked before the restart and the terminal showed an error"
+                await self._ask_operator(pos, note)
+            else:  # the close never reached the venue: the position is still open
+                self._store.upsert_position(self._book.set_status(pos.id, PositionStatus.OPEN))
+        known = self._store.position_intent_ids()
+        for row in self._store.intents_with_status(*_FILLED_STATUSES):
+            if row.intent.purpose != "open" or row.intent.id in known or row.report is None:
+                continue
+            # A fill was recorded but the desk stopped before it recorded the position.
+            try:
+                pos = self._book.add_unmanaged(
+                    row.intent,
+                    row.report,
+                    at=row.report.clicked_at or row.updated_at,
+                    note="this order filled just before the desk stopped and its position was never recorded",
+                )
+            except ValueError as exc:
+                log.critical("cannot rebuild the position of filled order %s: %s", row.intent.id, exc)
+                self._set_degraded(f"orphan:{row.intent.id}", f"order {row.intent.id} filled but has no position")
+                await self._alert(
+                    f"Unrecorded position: {row.intent.symbol}",
+                    f"order {row.intent.id} filled but the desk has no record of its position ({exc}). Check "
+                    "UniTrader and close it yourself if it is still open.",
+                    "urgent",
+                )
+                continue
+            self._store.upsert_position(pos)
+            self._audit.append("position.recovered", pos.model_dump(mode="json"))
+            await self._alert(
+                f"Check {pos.symbol}: position recovered after a restart",
+                f"{pos.reconcile_note}. Is it still open in UniTrader? Answer on the dashboard.",
+                "urgent",
+                dedup_key=f"check:{pos.id}",
+            )
         if unresolved:
             log.warning("%d order(s) need reconciliation after restart: %s", len(unresolved), sorted(unresolved))
+
+    async def _catch_up(self, warm: dict[str, list[Bar]]) -> None:
+        """Apply bars that closed while the desk was down to the open positions.
+
+        Broker-side SL/TP levels crossed meanwhile are put to the operator; software exits that became due
+        are sent on the first live bar (at the price then, not at a stale one).
+        """
+        bars = sorted((b for series in warm.values() for b in series), key=lambda b: (b.end, b.symbol))
+        for bar in bars:
+            for due in self._book.mark_bar(bar):
+                if due.position.protective_at_broker and due.reason in (ExitReason.STOP, ExitReason.TARGET):
+                    await self._protective_level_reached(due, while_down=True)
+                else:
+                    self._pending_exits.setdefault(due.position.id, due.reason)
+        for pos in self._book.active():
+            self._store.upsert_position(pos)
+        if self._pending_exits:
+            log.warning("exits due from bars that closed while the desk was down: %s", self._pending_exits)
 
     # ====================================================================================== bars
 
     async def on_bar(self, bar: Bar) -> None:
         inst = self._instruments.get(bar.symbol)
-        if inst is None or not inst.enabled:
+        if inst is None:
+            return
+        if not inst.enabled and not any(p.symbol == bar.symbol for p in self._book.active()):
             return
         if not self._history.add(bar):
             return
@@ -238,6 +327,18 @@ class DeskEngine:
         async with self._lock:
             await self._process_exits(bar)
             await self._check_daily_loss()
+            if not inst.enabled:
+                return  # exits only: a disabled instrument takes no new entries
+            age = self._clock.now() - bar.end
+            if age >= self._timeframe():
+                # A newer bar has already closed (feed catch-up): trading this one would size the plan on an
+                # old close and send it at today's price.
+                self._crew[CrewId.CYAN_SCOUT] = {
+                    "vote": Vote.HOLD.value,
+                    "summary": f"{bar.symbol}: bar closed {age.total_seconds() / 60:.0f} min ago; not trading on it",
+                    "at": self._clock.now().isoformat(),
+                }
+                return
             result = self._scout.evaluate(self._history.bars(bar.symbol))
             self._crew[CrewId.CYAN_SCOUT] = {
                 "vote": Vote.PROCEED.value if result.signal else Vote.HOLD.value,
@@ -246,8 +347,37 @@ class DeskEngine:
             }
             if result.signal is None:
                 return
-            meeting = await self._meeting.convene(result.signal, self._context(bar.symbol))
-            await self._after_meeting(meeting)
+            meeting = await self._convene(result.signal, bar.symbol)
+            if meeting is not None:
+                await self._after_meeting(meeting, signal_bar_end=bar.end)
+
+    def _timeframe(self) -> timedelta:
+        return timedelta(minutes=self._cfg.strategy.timeframe_minutes)
+
+    async def _convene(
+        self, signal: BreakoutSignal, symbol: str, *, trigger: Literal["breakout", "manual"] = "breakout"
+    ) -> MeetingRecord | None:
+        """Hold the meeting as a task that kill/panic can cancel; ``None`` if it was abandoned."""
+        task = asyncio.create_task(
+            self._meeting.convene(signal, self._context(symbol), trigger=trigger), name=f"meeting-{symbol}"
+        )
+        self._meeting_task = task
+        try:
+            await asyncio.wait({task})
+        finally:
+            self._meeting_task = None
+            if not task.done():  # we are being cancelled ourselves (shutdown)
+                task.cancel()
+        if task.cancelled():
+            log.warning("%s meeting abandoned: the kill switch was engaged during the review", symbol)
+            self._audit.append("meeting.abandoned", {"symbol": symbol, "why": "kill switch engaged during the review"})
+            return None
+        return task.result()
+
+    def _abandon_meeting(self) -> None:
+        task = self._meeting_task
+        if task is not None and not task.done():
+            task.cancel()
 
     def _context(self, symbol: str) -> MeetingContext:
         now = self._clock.now()
@@ -271,7 +401,7 @@ class DeskEngine:
             degraded=list(self._degraded.values()),
         )
 
-    async def _after_meeting(self, meeting: MeetingRecord) -> None:
+    async def _after_meeting(self, meeting: MeetingRecord, *, signal_bar_end: datetime | None = None) -> None:
         self._store.add_meeting(meeting)
         self._audit.append(
             "meeting",
@@ -291,8 +421,20 @@ class DeskEngine:
         for report in meeting.reports:
             self._crew[report.crew_id] = {"vote": report.vote.value, "summary": report.summary, "at": at}
         self._hub.publish("meeting", {"id": meeting.id, "symbol": meeting.symbol, "decision": meeting.decision.value})
-        if meeting.decision is not FinalAction.SKIP_ROUND:
-            await self._execute_open(meeting)
+        if meeting.decision is FinalAction.SKIP_ROUND:
+            return
+        if signal_bar_end is not None:
+            age = self._clock.now() - signal_bar_end
+            if age >= self._timeframe():
+                # The review took so long that the next bar has closed: the plan's entry and stop are stale.
+                self._audit.append("meeting.stale", {"id": meeting.id, "age_seconds": age.total_seconds()})
+                await self._alert(
+                    f"Skipped {meeting.symbol}: the plan went stale",
+                    f"the crew decided {age.total_seconds():.0f} s after the bar closed; not sending an old plan",
+                    "default",
+                )
+                return
+        await self._execute_open(meeting)
 
     # ====================================================================================== orders
 
@@ -431,13 +573,13 @@ class DeskEngine:
             if active.symbol == bar.symbol:
                 self._store.upsert_position(active)
         due_ids = {d.position.id for d in dues}
-        for pos_id, reason in list(self._exit_retry.items()):
-            retry = self._book.get(pos_id)
-            if retry is None or retry.symbol != bar.symbol or retry.status is not PositionStatus.OPEN:
-                self._exit_retry.pop(pos_id, None)
+        for pos_id, reason in list(self._pending_exits.items()):
+            pending = self._book.get(pos_id)
+            if pending is None or pending.status is not PositionStatus.OPEN:
+                self._pending_exits.pop(pos_id, None)
                 continue
-            if pos_id not in due_ids:
-                dues.append(ExitDue(retry, reason, bar.close))
+            if pending.symbol == bar.symbol and pos_id not in due_ids:
+                dues.append(ExitDue(pending, reason, bar.close))
         for due in dues:
             await self._exit(due, bar)
 
@@ -446,9 +588,7 @@ class DeskEngine:
         if pos is None or pos.status is not PositionStatus.OPEN:
             return
         if pos.protective_at_broker and due.reason in (ExitReason.STOP, ExitReason.TARGET):
-            closed = self._book.close(pos.id, price=due.price, source="feed_estimate", reason=due.reason, at=bar.end)
-            self._exit_retry.pop(pos.id, None)
-            await self._closed(closed, note="broker-side stop/target assumed filled; confirm in UniTrader")
+            await self._protective_level_reached(due, while_down=False)
             return
         intent = self._new_intent(
             purpose="close",
@@ -469,6 +609,40 @@ class DeskEngine:
         )
         await self._apply_close(pos.id, intent, report, due.reason, due.price)
 
+    async def _protective_level_reached(self, due: ExitDue, *, while_down: bool) -> None:
+        """The feed reached a broker-side SL/TP. The feed is not the broker's price, so don't book it: ask.
+
+        In paper mode the simulated broker fills on this same feed, so there the level IS the fill.
+        """
+        pos = due.position
+        if self._cfg.execution.venue == "paper":
+            at = self._clock.now() if while_down else (pos.last_marked_bar_end or self._clock.now())
+            closed = self._book.close(pos.id, price=due.price, source="feed_estimate", reason=due.reason, at=at)
+            self._pending_exits.pop(pos.id, None)
+            await self._closed(closed, note="simulated broker-side stop/target")
+            return
+        level = pos.stop_price if due.reason is ExitReason.STOP else pos.target_price
+        when = " while the desk was down" if while_down else ""
+        note = (
+            f"the feed reached its {'stop' if due.reason is ExitReason.STOP else 'target'} {level}{when}; the "
+            "broker's SL/TP has probably closed it, but the desk can't see UniTrader"
+        )
+        self._pending_exits.pop(pos.id, None)
+        await self._ask_operator(pos, note, suggested_exit=due)
+
+    async def _ask_operator(self, pos: Position, note: str, *, suggested_exit: ExitDue | None = None) -> None:
+        """Put a position to the operator: it keeps counting as exposure and new entries wait for the answer."""
+        updated = self._book.set_status(pos.id, PositionStatus.RECONCILE, note=note, suggested_exit=suggested_exit)
+        self._store.upsert_position(updated)
+        self._audit.append("position.check", {"id": pos.id, "note": note})
+        self._hub.publish("position", {"id": pos.id, "status": updated.status.value})
+        await self._alert(
+            f"Check {pos.symbol} {pos.side.value} {pos.lots} in UniTrader",
+            f"{note}. Is it still open? Answer on the dashboard; new trades wait for your answer.",
+            "urgent",
+            dedup_key=f"check:{pos.id}",
+        )
+
     async def _apply_close(
         self, position_id: str, intent: OrderIntent, report: ExecutionReport, reason: ExitReason, est_price: float
     ) -> None:
@@ -477,28 +651,40 @@ class DeskEngine:
             price = report.fill_price if report.fill_price is not None else est_price
             source = report.fill_price_source if report.fill_price is not None else "feed_estimate"
             closed = self._book.close(position_id, price=price, source=source, reason=reason, at=self._clock.now())
-            self._exit_retry.pop(position_id, None)
+            self._pending_exits.pop(position_id, None)
             await self._closed(closed)
         elif status is IntentStatus.UNCONFIRMED:
-            pos = self._book.set_status(position_id, PositionStatus.RECONCILE)
+            pos = self._book.set_status(
+                position_id, PositionStatus.RECONCILE, note=f"its {reason.value} close could not be confirmed"
+            )
             self._store.upsert_position(pos)
-            self._exit_retry.pop(position_id, None)
+            self._pending_exits.pop(position_id, None)
             await self._alert(
                 f"Close UNCONFIRMED: {pos.symbol}",
                 f"{report.message}. Check UniTrader: is the position closed? Answer on the dashboard.",
                 "urgent",
                 dedup_key=f"unconfirmed:{intent.id}",
             )
-        else:
+        elif status in (IntentStatus.ABORTED, IntentStatus.DRY_RUN):
+            # Nothing was clicked, so sending the close again on the next bar is safe.
             pos = self._book.set_status(position_id, PositionStatus.OPEN)
             self._store.upsert_position(pos)
-            self._exit_retry[position_id] = reason
+            self._pending_exits[position_id] = reason
             await self._alert(
                 f"Could not close {pos.symbol} ({reason.value})",
                 f"{report.message}. The desk retries at the next bar; close it in UniTrader yourself if needed.",
                 "urgent",
                 dedup_key=f"close-failed:{position_id}",
             )
+        else:
+            # REJECTED: the close WAS clicked and the terminal showed an error. Clicking again could open a
+            # reverse position on a netting account, so the operator decides.
+            self._pending_exits.pop(position_id, None)
+            current = self._book.get(position_id)
+            if current is not None:
+                await self._ask_operator(
+                    current, f"its {reason.value} close was clicked and the terminal showed an error"
+                )
 
     async def _closed(self, closed: Position, note: str = "") -> None:
         self._store.upsert_position(closed)
@@ -517,18 +703,21 @@ class DeskEngine:
         snap = self._snapshot(now)
         if not self._gate.daily_loss_breached(snap):
             return
-        if self._daily_loss_alerted == now.date():
-            return
-        self._daily_loss_alerted = now.date()
-        day_pnl = snap.realized_pnl_today + snap.unrealized_pnl
-        await self._alert(
-            "Daily loss limit reached",
-            f"today's P&L est. {day_pnl:+.2f} {self._cfg.risk.account_currency}; no new trades today",
-            "high",
-        )
-        self._audit.append("risk.daily_loss", {"pnl": day_pnl})
-        if self._cfg.risk.flatten_on_daily_loss and self._book.active():
-            await self._panic_locked(by="daily-loss", reason=ExitReason.DAILY_LOSS)
+        day = trading_day_start(now, self._cfg.risk.day_rollover_utc)
+        if self._daily_loss_alerted != day:
+            self._daily_loss_alerted = day
+            day_pnl = snap.realized_pnl_today + snap.unrealized_pnl
+            await self._alert(
+                "Daily loss limit reached",
+                f"today's P&L est. {day_pnl:+.2f} {self._cfg.risk.account_currency}; no new trades today",
+                "high",
+            )
+            self._audit.append("risk.daily_loss", {"pnl": day_pnl})
+        flattenable = [p for p in self._book.active() if p.status in (PositionStatus.OPEN, PositionStatus.CLOSING)]
+        if self._cfg.risk.flatten_on_daily_loss and flattenable and self._daily_loss_flattened != day:
+            report = await self._panic_locked(by="daily-loss", reason=ExitReason.DAILY_LOSS)
+            if report.status in (IntentStatus.CONFIRMED, IntentStatus.UNCONFIRMED):
+                self._daily_loss_flattened = day  # otherwise (nothing was clicked) try again on the next bar
 
     # ====================================================================================== watchdog
 
@@ -549,7 +738,7 @@ class DeskEngine:
         now = self._clock.now()
         tf = timedelta(minutes=self._cfg.strategy.timeframe_minutes)
         limit = tf * self._cfg.feed.max_staleness_bars
-        for inst in self._cfg.enabled_instruments:
+        for inst in self.managed_instruments():
             key = f"feed:{inst.symbol}"
             if not inst.in_session(now) or not self._calendar.check(inst, now).ok:
                 self._degraded.pop(key, None)
@@ -620,6 +809,7 @@ class DeskEngine:
 
     async def kill(self, reason: str, *, by: str) -> None:
         self._killswitch.engage(reason or "operator", by=by)
+        self._abandon_meeting()
         self._last_kill_state = True
         self._audit.append("operator.kill", {"by": by, "reason": reason})
         self._hub.publish("kill", {"reason": reason, "by": by})
@@ -639,6 +829,7 @@ class DeskEngine:
 
     async def panic(self, *, by: str) -> ExecutionReport | None:
         self._killswitch.engage(f"PANIC by {by}", by=by)
+        self._abandon_meeting()  # don't wait for a Claude review to finish before closing everything
         self._last_kill_state = True
         self._hub.publish("kill", {"reason": "panic", "by": by})
         async with self._lock:
@@ -664,28 +855,39 @@ class DeskEngine:
         report = await self._submit(intent, lambda: self._venue.close_all(intent, self._write_ahead(intent)))
         now = self._clock.now()
         if report.status is IntentStatus.CONFIRMED:
-            for pos in targets:
+            closed_positions = []
+            for pos in targets:  # record every close before any (slow) alert goes out
                 current = self._book.get(pos.id)
                 price = current.last_price if current and current.last_price else pos.entry_price
                 closed = self._book.close(pos.id, price=price, source="feed_estimate", reason=reason, at=now)
-                self._exit_retry.pop(pos.id, None)
+                self._pending_exits.pop(pos.id, None)
+                self._store.upsert_position(closed)
+                closed_positions.append(closed)
+            for closed in closed_positions:
                 await self._closed(closed, note="closed by close-all; exit price is an estimate")
             await self._alert("PANIC: close-all sent", report.message, "urgent")
         elif report.status is IntentStatus.UNCONFIRMED:
             for pos in targets:
-                self._store.upsert_position(self._book.set_status(pos.id, PositionStatus.RECONCILE))
+                self._store.upsert_position(
+                    self._book.set_status(pos.id, PositionStatus.RECONCILE, note="close-all could not be confirmed")
+                )
             await self._alert(
                 "PANIC close-all UNCONFIRMED",
                 f"{report.message}. Check UniTrader and close anything still open yourself, then reconcile.",
                 "urgent",
             )
         else:
+            # Nothing was clicked: put every position back exactly as it was (a CLOSING position keeps the link
+            # to its own unresolved close order, so reconciling that order still finds it).
             for pos in targets:
-                self._store.upsert_position(self._book.set_status(pos.id, PositionStatus.OPEN))
+                self._book.restore(pos)
+                self._store.upsert_position(pos)
+            halted = " The kill switch is engaged." if self._killswitch.engaged() else ""
             await self._alert(
                 "PANIC could not close positions",
-                f"{report.message}. Close open positions in UniTrader yourself. Kill switch is engaged.",
+                f"{report.message}. Close open positions in UniTrader yourself.{halted}",
                 "urgent",
+                dedup_key="panic-failed",
             )
         return report
 
@@ -697,8 +899,8 @@ class DeskEngine:
         fill_price: float | None,
         by: str,
     ) -> None:
-        if fill_price is not None and not fill_price > 0:
-            raise OperatorActionError("fill price must be positive")
+        if fill_price is not None and not (math.isfinite(fill_price) and fill_price > 0):
+            raise OperatorActionError("fill price must be a positive number")
         async with self._lock:
             row = self._store.get_intent(item_id)
             if row is not None:
@@ -709,6 +911,10 @@ class DeskEngine:
                 pos = self._book.get(item_id)
                 if pos is None:
                     raise OperatorActionError(f"nothing to reconcile with id {item_id}")
+                if pos.status is not PositionStatus.RECONCILE:
+                    raise OperatorActionError(
+                        f"position {item_id} is {pos.status.value}, not waiting for a reconcile answer"
+                    )
                 await self._reconcile_position(pos, outcome, fill_price)
             self._audit.append(
                 "operator.reconcile", {"id": item_id, "outcome": outcome, "fill_price": fill_price, "by": by}
@@ -737,43 +943,69 @@ class DeskEngine:
                 "fill_price_source": "operator" if fill_price is not None else base.fill_price_source,
             }
         )
-        self._store.set_intent_status(intent.id, status, resolved)
-        self._audit.append("intent.status", {"id": intent.id, "status": status.value, "by": "operator"})
-
-        affected = [p for p in self._book.active() if p.close_intent_id == intent.id]
         if intent.purpose == "open":
-            if filled:
+            if not filled:
+                self._store.set_intent_status(intent.id, status, resolved)
+                self._audit.append("intent.status", {"id": intent.id, "status": status.value, "by": "operator"})
+                return
+            if resolved.fill_price is None and intent.entry_ref is None:
+                raise OperatorActionError("the desk has no price for this order: enter the fill price from UniTrader")
+            if intent.stop_price is not None and intent.target_price is not None:
                 pos = self._book.add_open(intent, resolved, protective=self._venue.supports_protective_orders, at=now)
-                self._store.upsert_position(pos)
-                self._audit.append("position.opened", pos.model_dump(mode="json"))
-        elif filled:
-            for pos in affected:
-                price = fill_price or pos.last_price or pos.entry_price
-                source: Literal["operator", "feed_estimate"] = "operator" if fill_price else "feed_estimate"
-                closed = self._book.close(pos.id, price=price, source=source, reason=ExitReason.RECONCILED, at=now)
-                await self._closed(closed, note="confirmed by the operator")
-        else:
-            for pos in affected:
-                self._store.upsert_position(self._book.set_status(pos.id, PositionStatus.OPEN))
+            else:  # a test order: no stop/target, so the desk only tracks it and keeps asking about it
+                pos = self._book.add_unmanaged(
+                    intent, resolved, at=now, note="a test order you confirmed as filled; close it in UniTrader"
+                )
+            try:
+                self._store.resolve_intent(intent.id, status, resolved, [pos])
+            except Exception:
+                self._book.remove(pos.id)
+                raise
+            self._audit.append("intent.status", {"id": intent.id, "status": status.value, "by": "operator"})
+            self._audit.append("position.opened", pos.model_dump(mode="json"))
+            self._hub.publish("position", {"id": pos.id, "status": pos.status.value})
+            return
+
+        linked = [p for p in self._book.active() if p.close_intent_id == intent.id]
+        if not filled:
+            # Only positions still linked to THIS close go back to OPEN (a later close-all may own them now).
+            reopened = [self._book.set_status(p.id, PositionStatus.OPEN) for p in linked]
+            self._store.resolve_intent(intent.id, status, resolved, reopened)
+            self._audit.append("intent.status", {"id": intent.id, "status": status.value, "by": "operator"})
+            return
+        affected = linked + [
+            p for p in self._book.active() if p.id == intent.position_id and p.close_intent_id != intent.id
+        ]
+        closed_positions = []
+        for pos in affected:
+            price = fill_price or pos.last_price or pos.entry_price
+            source: Literal["operator", "feed_estimate"] = "operator" if fill_price else "feed_estimate"
+            closed_positions.append(
+                self._book.close(pos.id, price=price, source=source, reason=ExitReason.RECONCILED, at=now)
+            )
+            self._pending_exits.pop(pos.id, None)
+        self._store.resolve_intent(intent.id, status, resolved, closed_positions)
+        self._audit.append("intent.status", {"id": intent.id, "status": status.value, "by": "operator"})
+        for closed in closed_positions:
+            await self._closed(closed, note="confirmed by the operator")
 
     async def _reconcile_position(
         self, pos: Position, outcome: Literal["filled", "not_filled"], fill_price: float | None
     ) -> None:
         """For a position: 'filled' means 'it is closed at the broker', 'not_filled' means 'still open'."""
         if outcome == "filled":
-            price = fill_price or pos.last_price or pos.entry_price
+            price = fill_price or pos.suggested_exit_price or pos.last_price or pos.entry_price
             source: Literal["operator", "feed_estimate"] = "operator" if fill_price else "feed_estimate"
-            closed = self._book.close(
-                pos.id, price=price, source=source, reason=ExitReason.MANUAL, at=self._clock.now()
-            )
-            self._exit_retry.pop(pos.id, None)
+            reason = pos.suggested_exit_reason or ExitReason.MANUAL
+            closed = self._book.close(pos.id, price=price, source=source, reason=reason, at=self._clock.now())
+            self._pending_exits.pop(pos.id, None)
             await self._closed(closed, note="marked closed by the operator")
         else:
             self._store.upsert_position(self._book.set_status(pos.id, PositionStatus.OPEN))
 
     async def set_equity(self, equity: float, *, by: str) -> None:
-        if not equity > 0:
-            raise OperatorActionError("equity must be positive")
+        if not (math.isfinite(equity) and equity > 0):
+            raise OperatorActionError("equity must be a positive number")
         now = self._clock.now()
         self._book.set_equity_base(equity, now)
         self._store.set_kv(EQUITY_KV, {"equity": equity, "at": now.isoformat(), "by": by})
@@ -798,24 +1030,38 @@ class DeskEngine:
                     signal = build_forced_signal(bars, force_side, self._cfg.strategy)
                 except ValueError as exc:
                     raise OperatorActionError(str(exc)) from exc
-                meeting = await self._meeting.convene(signal, self._context(symbol), trigger="manual")
+                held: MeetingRecord | None = await self._convene(signal, symbol, trigger="manual")
             else:
                 result = self._scout.evaluate(bars)
                 if result.signal is not None:
-                    meeting = await self._meeting.convene(result.signal, self._context(symbol), trigger="manual")
+                    held = await self._convene(result.signal, symbol, trigger="manual")
                 else:
-                    meeting = await self._meeting.no_signal_round(symbol, self._context(symbol), result)
-            await self._after_meeting(meeting)
-            return meeting
+                    held = await self._meeting.no_signal_round(symbol, self._context(symbol), result)
+            if held is None:
+                raise OperatorActionError("the meeting was abandoned because the kill switch was engaged")
+            await self._after_meeting(held)
+            return held
 
     # ====================================================================================== state
 
     def _reconcile_items(self) -> list[dict[str, Any]]:
+        """What the operator must check in UniTrader. Each item carries the question and the meaning of its
+        two answers, so the dashboard never has to guess what "filled" means for it."""
         items: list[dict[str, Any]] = []
         for row in self._store.intents_with_status(*_RECONCILE_STATUSES):
             if row.intent.id in self._in_flight:
                 continue
             it = row.intent
+            what = f"{it.side.value if it.side else ''} {it.lots} {it.symbol}".strip()
+            if it.purpose == "open":
+                question = f"Did this {what} order open a position in UniTrader?"
+                options = _options("Yes, a position opened", "No, nothing opened")
+            elif it.purpose == "close":
+                question = f"Did this close ({what}) go through in UniTrader?"
+                options = _options("Yes, it is closed", "No, it is still open")
+            else:
+                question = "Did close-all go through in UniTrader (no desk positions left open)?"
+                options = _options("Yes, everything closed", "No, positions are still open")
             items.append(
                 {
                     "id": it.id,
@@ -829,11 +1075,14 @@ class DeskEngine:
                     "message": row.report.message
                     if row.report
                     else "the desk restarted while this order was in flight",
+                    "question": question,
+                    "options": options,
                 }
             )
         linked = {item["id"] for item in items}
         for pos in self._book.active():
             if pos.status is PositionStatus.RECONCILE and pos.close_intent_id not in linked:
+                note = pos.reconcile_note or "the desk can't tell whether it is still open"
                 items.append(
                     {
                         "id": pos.id,
@@ -844,7 +1093,11 @@ class DeskEngine:
                         "lots": str(pos.lots),
                         "status": pos.status.value,
                         "created_at": pos.opened_at.isoformat(),
-                        "message": "is this position still open in UniTrader?",
+                        "message": note,
+                        "question": f"Is this {pos.side.value} {pos.lots} {pos.symbol} position still open in "
+                        "UniTrader?",
+                        # For a position, "filled" = its close happened (it is closed); "not_filled" = still open.
+                        "options": _options("No, it is closed", "Yes, it is still open"),
                     }
                 )
         return items
@@ -944,3 +1197,10 @@ class DeskEngine:
             await self._notifier.notify(title, message, priority=priority, dedup_key=dedup_key)
         except Exception:  # notifiers must not raise, but never let an alert break trading
             log.exception("notifier failed")
+
+
+def _options(filled_label: str, not_filled_label: str) -> list[dict[str, Any]]:
+    return [
+        {"outcome": "filled", "label": filled_label, "needs_price": True},
+        {"outcome": "not_filled", "label": not_filled_label, "needs_price": False},
+    ]

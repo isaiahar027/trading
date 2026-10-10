@@ -878,9 +878,13 @@ class _Wizard:
             wants_fields = True
         else:
             wants_fields = self._yes_no(
-                f"Does the {symbol} panel have stop-loss and take-profit input fields you want to record "
-                "(only used with protective_orders: panel_fields)?"
+                f"Does the {symbol} panel have stop-loss and take-profit input fields? Record them if it does: an "
+                "order carries whatever they hold, so with protective_orders: none the desk empties them first"
             )
+            if not wants_fields:
+                self._say(
+                    "  Then the desk cannot check them: if the panel does have SL/TP fields, keep them EMPTY yourself."
+                )
         if wants_fields:
             sl = self._point(f"the {symbol} stop-loss field", f"the stop-loss (SL) input field of the {symbol} panel")
             tp = self._point(

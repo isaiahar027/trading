@@ -87,7 +87,33 @@ def test_simultaneous_signals_respect_max_open_positions(tmp_path: Path) -> None
         series.append(follow(series, last, last + 0.0001, last - 0.0001, last, symbol=series[-1].symbol))
     report = run_backtest(c, {"EURUSD": a, "GBPUSD": b})
     assert report.signals == 2 and report.count == 1
-    assert report.skipped["Red Skeptic: max_open_positions (pending entry)"] == 1
+    # The pending EURUSD entry counts as a trade already taken, as it would be live.
+    assert sum(n for k, n in report.skipped.items() if k.startswith("Red Skeptic")) == 1
+
+
+@pytest.mark.parametrize(
+    ("risk", "reason"),
+    [
+        ({"max_open_positions": 2, "min_minutes_between_trades": 15}, "min_minutes_between_trades"),
+        ({"max_open_positions": 2, "min_minutes_between_trades": 0, "max_trades_per_day": 1}, "max_trades_per_day"),
+    ],
+)
+def test_pending_entries_count_toward_trade_limits(tmp_path: Path, risk: dict[str, Any], reason: str) -> None:
+    raw = {
+        "data_dir": str(tmp_path / "d"),
+        "instruments": [eurusd(), eurusd(symbol="GBPUSD", feed_symbol="GBP/USD")],
+        "strategy": {**SMALL_STRATEGY, "min_stop_spread_multiple": 2.0},
+        "risk": {"starting_equity": 10_000, "max_lots_per_order": "0.50", "max_positions_per_symbol": 1, **risk},
+        "secrets": Secrets(),
+    }
+    a = breakout_series(1)
+    b = breakout_series(1, symbol="GBPUSD")
+    for series in (a, b):
+        last = series[-1].close
+        series.append(follow(series, last, last + 0.0001, last - 0.0001, last, symbol=series[-1].symbol))
+    report = run_backtest(DeskConfig.model_validate(raw), {"EURUSD": a, "GBPUSD": b})
+    assert report.count == 1
+    assert any(reason in k for k in report.skipped), report.skipped
 
 
 def test_disabled_symbols_and_empty_input(tmp_path: Path) -> None:

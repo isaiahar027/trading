@@ -137,7 +137,7 @@
     <form method="dialog" id="token-form">
       <h2>Dashboard token</h2>
       <p>Paste the token printed when the desk started (or <code>DESK_DASHBOARD_TOKEN</code>). It is kept on this device only.</p>
-      <input id="token-input" type="password" autocomplete="off" required minlength="8" aria-label="Dashboard token">
+      <input id="token-input" type="password" autocomplete="off" required minlength="16" aria-label="Dashboard token">
       <p class="error" id="token-error"></p>
       <button class="btn" type="submit">Unlock</button>
     </form>
@@ -149,8 +149,9 @@
       <p id="confirm-text"></p>
       <label id="confirm-input-wrap" hidden><span id="confirm-input-label"></span><input id="confirm-input" autocomplete="off"></label>
       <div class="control-row">
-        <button class="btn" value="cancel" type="submit">Cancel</button>
-        <button class="btn warn" value="ok" type="submit" id="confirm-ok">OK</button>
+        <!-- OK must stay the form's only submit button: Enter submits through the first one -->
+        <button class="btn" type="button" id="confirm-cancel">Cancel</button>
+        <button class="btn warn" type="submit" id="confirm-ok">OK</button>
       </div>
     </form>
   </dialog>

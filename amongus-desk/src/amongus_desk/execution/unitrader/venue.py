@@ -73,6 +73,9 @@ GRID_MAX_POINTS = 32
 WRITE_AHEAD_TIMEOUT_SECONDS = 10.0
 #: Real seconds added to ``max_order_seconds`` before the event loop gives up on a stuck worker.
 HARD_TIMEOUT_GRACE_SECONDS = 5.0
+#: Typed into an SL/TP field the desk must empty, and read back, before it is deleted again: an empty field copies
+#: nothing, exactly like a field whose copy does not work, so the probe proves the field takes keys and copies.
+CLEAR_PROBE = "0"
 
 _VENUE = "unitrader"
 
@@ -146,8 +149,12 @@ class _Check:
 class _FieldEntry:
     name: str  # "lots", "stop_loss", "take_profit"
     point: Point
-    text: str
-    expected: Decimal
+    text: str  # what is typed ("" for a field that must be emptied)
+    expected: Decimal | None  # the value it must read back as; None: it must read back empty
+
+    @property
+    def stage(self) -> str:
+        return "lot_entry" if self.name == "lots" else "protective_fields"
 
 
 @dataclass(frozen=True, slots=True)
@@ -194,7 +201,6 @@ class _Flow:
         self.input_used = False
         self.clicked_at: datetime | None = None
         self.operator_abort = False
-        self.clipboard_original: str | None = None
         self.clipboard_touched = False
         self.images: dict[str, Image.Image] = {}
 
@@ -227,6 +233,15 @@ class _Flow:
 def _safe_component(text: str) -> str:
     """One safe path component (no separators, no dots) for the evidence folder of an intent."""
     return re.sub(r"[^A-Za-z0-9_-]", "_", text)[:100] or "intent"
+
+
+def _geometry(win: WindowInfo) -> tuple[int, int, int, int, int]:
+    return win.client_left, win.client_top, win.client_width, win.client_height, win.dpi
+
+
+def _describe(text: str) -> str:
+    """Read-back text for messages: numbers only. Anything else may be the operator's data and is never echoed."""
+    return repr(text[:32]) if parse_lots(text) is not None else f"{len(text)} characters, not shown"
 
 
 def _window_data(win: WindowInfo) -> dict[str, Any]:
@@ -300,7 +315,7 @@ class UniTraderVenue:
 
     @property
     def dry_run(self) -> bool:
-        """True when every check runs but nothing is ever typed or clicked."""
+        """True when every pre-click check that needs no typing runs, but nothing is ever typed or clicked."""
         return self._dry_run
 
     # ================================================================== public API (event loop)
@@ -422,8 +437,14 @@ class UniTraderVenue:
             raise _Abort("validate", f"cannot type {lots} lots: {exc}") from exc
         return _FieldEntry("lots", panel.lot_input, text, lots)
 
+    def _require_verifiable_entry(self) -> None:
+        problem = self._cfg.field_entry_problem()  # rejected by the config validator; re-checked for safety
+        if problem is not None:
+            raise _Abort("validate", problem)
+
     def _open_order(self, intent: OrderIntent) -> _PanelOrder:
         self._validate_common(intent, "open")
+        self._require_verifiable_entry()
         if intent.side is None or intent.lots is None:
             raise _Abort("validate", "an opening order needs a side and a lot size")
         inst, panel = self._instrument_and_panel(intent.symbol)
@@ -432,6 +453,8 @@ class UniTraderVenue:
         fields = [self._lot_field(inst, panel, intent.lots)]
         if self._cfg.protective_orders == "panel_fields":
             fields.extend(self._protective_fields(intent, inst, panel, intent.side))
+        else:
+            fields.extend(self._emptied_fields(panel))
         return _PanelOrder(intent.symbol, intent.side, panel, tuple(fields), check_halt=True)
 
     def _closing_order(self, position: Position) -> _PanelOrder:
@@ -447,9 +470,20 @@ class UniTraderVenue:
                 "an opposite order would be sent with whatever the panel's SL/TP fields still contain and the "
                 "desk cannot verify they are empty: close the position manually (or use exit_method: close_all)",
             )
+        self._require_verifiable_entry()
         inst, panel = self._instrument_and_panel(position.symbol)
-        fields = (self._lot_field(inst, panel, position.lots),)
+        fields = (self._lot_field(inst, panel, position.lots), *self._emptied_fields(panel))
         return _PanelOrder(position.symbol, position.side.opposite, panel, fields, check_halt=False)
+
+    @staticmethod
+    def _emptied_fields(panel: PanelLayout) -> list[_FieldEntry]:
+        """protective_orders: none: an order carries whatever the panel's SL/TP fields still hold (a manual test
+        trade, an earlier panel_fields run), so every calibrated SL/TP input is emptied and verified empty."""
+        return [
+            _FieldEntry(name, point, "", None)
+            for name, point in (("stop_loss", panel.sl_input), ("take_profit", panel.tp_input))
+            if point is not None
+        ]
 
     def _protective_fields(
         self, intent: OrderIntent, inst: InstrumentConfig, panel: PanelLayout, side: Side
@@ -658,7 +692,8 @@ class UniTraderVenue:
             if plan is None:
                 outcome = _Outcome(
                     IntentStatus.DRY_RUN,
-                    "dry run: every pre-click check passed; nothing was typed or clicked",
+                    "dry run: every pre-click check passed, including the re-verification right before the click; "
+                    "nothing was typed or clicked (so the lot read-back was not exercised)",
                     "dry_run",
                 )
             else:
@@ -788,14 +823,6 @@ class UniTraderVenue:
         flow.check("verify_panel_label", self._check_label(win, order.symbol, order.panel))
         # 7. baseline of the positions indicator
         baseline = self._baseline(flow, win)
-        # 8. dry run stops here: nothing typed, nothing clicked
-        if self._dry_run:
-            flow.record("dry_run", True, "dry run: stopping before typing")
-            return None
-        # 9. lot (and SL/TP) entry with clipboard read-back
-        for entry in order.fields:
-            self._enter_value(flow, win, entry)
-            self._checkpoint(flow)
         button = order.panel.buy_button if order.side is Side.BUY else order.panel.sell_button
         plan = _ClickPlan(
             point=button,
@@ -810,6 +837,19 @@ class UniTraderVenue:
             "side": order.side.value,
             "fields": {e.name: e.text for e in order.fields},
         }
+        # 8. before the first click into the panel: no dialog left open, nothing on top of any field
+        self._guard_input(flow, win, order, order.fields, "pre_input_verify")
+        flow.record("pre_input_verify", True, "window, focus, dialogs, fields and panel label verified before input")
+        if self._dry_run:
+            # The same read-only re-verification a real order runs right before its click; then stop.
+            self._final_verify(flow, win, plan)
+            flow.record("dry_run", True, "dry run: stopping before typing")
+            return None
+        # 9. lot (and SL/TP) entry with clipboard read-back, then a read-back of what the terminal committed
+        for entry in order.fields:
+            self._enter_value(flow, win, order, entry)
+            self._checkpoint(flow)
+        self._verify_committed(flow, win, order)
         # 10. re-verify right before the click
         self._final_verify(flow, win, plan)
         return plan
@@ -817,9 +857,6 @@ class UniTraderVenue:
     def _prepare_close_all(self, flow: _Flow) -> _ClickPlan | None:
         win = self._precheck(flow, check_halt=False, one_click=False)
         baseline = self._baseline(flow, win)
-        if self._dry_run:
-            flow.record("dry_run", True, "dry run: stopping before the close-all click")
-            return None
         point = self._layout.layout.close_all_button
         if point is None:  # validated before dispatch; kept for type narrowing
             flow.fail("validate", "no close-all button is calibrated: close the position(s) manually")
@@ -832,32 +869,115 @@ class UniTraderVenue:
             label=None,
         )
         self._final_verify(flow, win, plan)
+        if self._dry_run:
+            flow.record("dry_run", True, "dry run: stopping before the close-all click")
+            return None
         return plan
 
-    # ------------------------------------------------------------------ step 9
-    def _enter_value(self, flow: _Flow, win: WindowInfo, entry: _FieldEntry) -> None:
+    # ------------------------------------------------------------------ steps 8-9
+    def _guard_input(
+        self, flow: _Flow, win: WindowInfo, order: _PanelOrder, entries: Sequence[_FieldEntry], stage: str
+    ) -> None:
+        """Right before any click or key press into the panel: is the input going where the desk thinks it goes?
+
+        A dialog that is already open, or any window on top of a field, would take the input: a confirmation's
+        button may sit right over a field (the click would execute an earlier order) and a key goes to whatever
+        has the focus (Enter to a dialog's default button). So the window must be where it was, in front, with no
+        calibrated dialog or error showing, nothing covering the field(s) and the panel label still matching.
+        """
+        self._require_same_window(flow, win, stage)
+        foreground = self._backend.foreground_window()
+        if foreground != win.handle:
+            flow.fail(
+                stage,
+                f"the UniTrader window lost the foreground before typing into the {order.symbol} panel "
+                f"(foreground: {foreground})",
+            )
+        for name, ref in self._popup_templates():
+            if self._template_matches(win, ref):
+                flow.fail(
+                    stage,
+                    f"{name} is already showing before typing into the {order.symbol} panel: deal with it in "
+                    "UniTrader yourself, then retry",
+                )
+        for entry in entries:
+            sx, sy = self._screen(win, entry.point)
+            owner = self._backend.root_window_at(sx, sy)
+            if owner != win.handle:
+                flow.fail(
+                    stage,
+                    f"something else is on top of the {entry.name} field of the {order.symbol} panel (window "
+                    f"{owner} at {sx},{sy}); close it and retry",
+                )
+        label = self._check_label(win, order.symbol, order.panel)
+        if not label.ok:
+            flow.fail(stage, label.detail, **label.data)
+
+    def _enter_value(self, flow: _Flow, win: WindowInfo, order: _PanelOrder, entry: _FieldEntry) -> None:
+        """Type one value (or empty an SL/TP field), read it back, then commit it with ``commit_key``."""
+        self._guard_input(flow, win, order, (entry,), entry.stage)
         sx, sy = self._screen(win, entry.point)
         flow.input_used = True
         self._backend.click(sx, sy)
         self._delay()
         self._backend.hotkey("ctrl", "a")
         self._delay()
-        self._backend.type_text(entry.text)
-        self._delay()
-        flow.record(f"{entry.name}_typed", True, f"typed {entry.text!r} into the {entry.name} field")
-        if self._cfg.lot_readback == "clipboard":
-            self._readback(flow, sx, sy, entry)
+        if entry.expected is None:
+            self._empty_field(flow, win, order, entry)
         else:
-            flow.record(f"{entry.name}_readback", True, "read-back disabled (lot_readback: none)")
-        if self._cfg.commit_key != "none":
-            self._backend.press(self._cfg.commit_key)
+            self._backend.type_text(entry.text)
             self._delay()
+            flow.record(f"{entry.name}_typed", True, f"typed {entry.text!r} into the {entry.name} field")
+            if self._cfg.lot_readback == "clipboard":
+                self._expect_value(flow, entry, self._copy_field(flow, win, order, entry), committed=False)
+            else:
+                flow.record(f"{entry.name}_readback", True, "read-back disabled (lot_readback: none)")
+        self._commit(flow, win, order, entry)
 
-    def _readback(self, flow: _Flow, sx: int, sy: int, entry: _FieldEntry) -> None:
-        if not flow.clipboard_touched:
-            flow.clipboard_original = self._backend.get_clipboard_text()
-            flow.clipboard_touched = True
+    def _empty_field(self, flow: _Flow, win: WindowInfo, order: _PanelOrder, entry: _FieldEntry) -> None:
+        """protective_orders: none: delete whatever an SL/TP field holds (its text is selected already)."""
+        if self._cfg.lot_readback != "clipboard":
+            self._press(flow, win, order, entry, "backspace")
+            flow.record(
+                f"{entry.name}_cleared", True, f"emptied the {entry.name} field (not verified: lot_readback: none)"
+            )
+            return
+        # Prove first that the field takes the keys and copies (an empty field copies nothing, just like a broken
+        # copy): type the probe over its text and read exactly the probe back...
+        self._backend.type_text(CLEAR_PROBE)
+        self._delay()
+        text = self._copy_field(flow, win, order, entry)
+        if text is None or parse_lots(text) != Decimal(CLEAR_PROBE):
+            flow.fail(
+                entry.stage,
+                f"the {entry.name} field could not be emptied safely: the probe {CLEAR_PROBE!r} typed into it reads "
+                f"back as {'nothing' if text is None else _describe(text)}, so the desk cannot prove the field is "
+                "empty. Empty the panel's SL/TP fields in UniTrader yourself and check that ctrl+a/ctrl+c work in them",
+            )
+        # ...then delete it (the read-back left all of it selected): now copying nothing means "empty".
+        self._press(flow, win, order, entry, "backspace")
+        self._expect_empty(flow, entry, self._copy_field(flow, win, order, entry), committed=False)
+
+    def _commit(self, flow: _Flow, win: WindowInfo, order: _PanelOrder, entry: _FieldEntry) -> None:
+        if self._cfg.commit_key != "none":
+            self._press(flow, win, order, entry, self._cfg.commit_key)
+
+    def _press(self, flow: _Flow, win: WindowInfo, order: _PanelOrder, entry: _FieldEntry, key: str) -> None:
+        """A key goes wherever the keyboard focus is: guarded like a click."""
+        self._guard_input(flow, win, order, (entry,), entry.stage)
+        self._backend.press(key)
+        self._delay()
+
+    def _copy_field(self, flow: _Flow, win: WindowInfo, order: _PanelOrder, entry: _FieldEntry) -> str | None:
+        """Read a field through the clipboard: a fresh sentinel, then click, ctrl+a, ctrl+c.
+
+        Returns the copied text (stripped), or None when nothing was copied (the sentinel is still there). The
+        operator's clipboard is never read or restored: the sentinel replaces it and :meth:`_finish` empties it.
+        """
+        self._guard_input(flow, win, order, (entry,), entry.stage)
+        sx, sy = self._screen(win, entry.point)
         sentinel = f"amongus-desk-readback-{uuid.uuid4().hex}"
+        flow.clipboard_touched = True
         self._backend.set_clipboard_text(sentinel)
         self._backend.click(sx, sy)
         self._delay()
@@ -866,51 +986,96 @@ class UniTraderVenue:
         self._backend.hotkey("ctrl", "c")
         self._delay()
         got = self._backend.get_clipboard_text()
-        stage = "lot_entry" if entry.name == "lots" else "protective_fields"
-        if got is None or got.strip() == sentinel:
+        if got is None:
             flow.fail(
-                stage,
-                f"{entry.name} read-back failed: the clipboard still holds the sentinel, so the field could not be "
-                "selected/copied (ctrl+a/ctrl+c had no effect)",
+                entry.stage,
+                f"{entry.name} read-back failed: the clipboard holds no text after the copy (another program may be "
+                "using the clipboard)",
             )
-        value = parse_lots(got)
+        text = got.strip()
+        return None if text == sentinel else text
+
+    def _expect_value(self, flow: _Flow, entry: _FieldEntry, text: str | None, *, committed: bool) -> None:
+        when = f" after {self._cfg.commit_key} committed it" if committed else ""
+        if text is None:
+            flow.fail(
+                entry.stage,
+                f"{entry.name} read-back failed{when}: the clipboard still holds the sentinel, so the field could not "
+                "be selected/copied (ctrl+a/ctrl+c had no effect)",
+            )
+        value = parse_lots(text)
         if value is None:
             # Never echo non-numeric clipboard text into reports, logs or alerts: if anything else wrote to the
             # clipboard in between, it could be the operator's own data (e.g. a password copied for the login).
             flow.fail(
-                stage,
-                f"{entry.name} read-back mismatch: typed {entry.text!r} but the field does not read back as a "
-                f"number ({len(got.strip())} characters, not shown)",
+                entry.stage,
+                f"{entry.name} read-back mismatch{when}: typed {entry.text!r} but the field does not read back as a "
+                f"number ({_describe(text)})",
             )
-        shown = got.strip()[:32]
+        shown = text[:32]
         if value != entry.expected:
+            hint = ""
+            if committed:
+                hint = (
+                    ": the terminal changed the value when it committed it (it rounds, clamps or reads numbers in "
+                    "another format). Check "
+                    + ("lot_step, min_lot and max_lot" if entry.name == "lots" else "price_decimals, protective_units")
+                    + " and decimal_separator against UniTrader"
+                )
             flow.fail(
-                stage,
-                f"{entry.name} read-back mismatch: typed {entry.text!r} but the field shows {shown!r}",
+                entry.stage,
+                f"{entry.name} read-back mismatch{when}: typed {entry.text!r} but the field shows {shown!r}{hint}",
                 readback=shown,
             )
-        flow.record(f"{entry.name}_readback", True, f"field reads back {shown!r}", readback=shown)
+        step = f"{entry.name}_committed" if committed else f"{entry.name}_readback"
+        flow.record(step, True, f"field reads back {shown!r}{when}", readback=shown)
+
+    def _expect_empty(self, flow: _Flow, entry: _FieldEntry, text: str | None, *, committed: bool) -> None:
+        when = f" after {self._cfg.commit_key} committed it" if committed else ""
+        if text:
+            flow.fail(
+                entry.stage,
+                f"the {entry.name} field is not empty{when}: it reads back as {_describe(text)}. With "
+                "protective_orders: none an order is only sent while the panel's SL/TP fields are empty: empty them "
+                "in UniTrader yourself, then retry",
+            )
+        step = f"{entry.name}_committed" if committed else f"{entry.name}_cleared"
+        flow.record(step, True, f"the {entry.name} field is empty{when}")
+
+    def _verify_committed(self, flow: _Flow, win: WindowInfo, order: _PanelOrder) -> None:
+        """9b. Read every field back once more, after the terminal committed it (still before the click).
+
+        The first read-back only proves that the keystrokes arrived. A terminal may round, clamp or re-parse a value
+        when the edit is committed, and the order goes out with the committed value.
+        """
+        if self._cfg.lot_readback != "clipboard":
+            return
+        for entry in order.fields:
+            text = self._copy_field(flow, win, order, entry)
+            if entry.expected is None:
+                self._expect_empty(flow, entry, text, committed=True)
+            else:
+                self._expect_value(flow, entry, text, committed=True)
+            # Leave every field as the configured flow does; committing the value it just showed changes nothing.
+            self._commit(flow, win, order, entry)
+            self._checkpoint(flow)
 
     # ------------------------------------------------------------------ step 10
-    def _final_verify(self, flow: _Flow, win: WindowInfo, plan: _ClickPlan) -> None:
-        flow.check("pre_click_verify", self._check_desktop())
+    def _require_same_window(self, flow: _Flow, win: WindowInfo, stage: str) -> None:
         current = self._backend.get_window(win.handle)
         if current is None:
-            flow.fail("pre_click_verify", "the UniTrader window disappeared")
-        geometry_now = (
-            current.client_left,
-            current.client_top,
-            current.client_width,
-            current.client_height,
-            current.dpi,
-        )
-        geometry_then = (win.client_left, win.client_top, win.client_width, win.client_height, win.dpi)
-        if current.minimized or geometry_now != geometry_then:
+            flow.fail(stage, "the UniTrader window disappeared")
+        if current.minimized or _geometry(current) != _geometry(win):
             flow.fail(
-                "pre_click_verify",
-                "the UniTrader window moved, resized or minimized since the checks "
-                f"({geometry_then} -> {geometry_now})",
+                stage,
+                f"the UniTrader window moved, resized or minimized since the checks ({_geometry(win)} -> "
+                f"{_geometry(current)})",
             )
+
+    def _final_verify(self, flow: _Flow, win: WindowInfo, plan: _ClickPlan) -> None:
+        """Step 10, read-only (a dry run runs it too): nothing changed and nothing covers the button."""
+        flow.check("pre_click_verify", self._check_desktop())
+        self._require_same_window(flow, win, "pre_click_verify")
         foreground = self._backend.foreground_window()
         if foreground != win.handle:
             flow.fail("pre_click_verify", f"the UniTrader window lost the foreground (foreground: {foreground})")
@@ -1203,7 +1368,7 @@ class UniTraderVenue:
 
     # ------------------------------------------------------------------ step 14
     def _finish(self, flow: _Flow, outcome: _Outcome) -> None:
-        """Park the mouse, restore the clipboard and save evidence. Never raises."""
+        """Park the mouse, empty the clipboard (if the read-back used it) and save evidence. Never raises."""
         win = flow.win
         if win is not None and (flow.input_used or flow.clicked):
             try:
@@ -1225,11 +1390,16 @@ class UniTraderVenue:
             except Exception as exc:  # noqa: BLE001 - parking is best effort
                 log.warning("intent %s: could not park the mouse: %s", flow.intent.id, exc)
                 flow.record("park_mouse", False, f"could not park the mouse: {exc}")
-        if flow.clipboard_touched and flow.clipboard_original is not None:
+        if flow.clipboard_touched:
+            # The read-back replaced the clipboard with a sentinel and the fields' text. What was there before is
+            # never read or put back: it may be a password the operator pasted into the login, and writing it back
+            # would keep it around and drop a password manager's "not in clipboard history" marks. Leave it empty.
             try:
-                self._backend.set_clipboard_text(flow.clipboard_original)
+                self._backend.set_clipboard_text("")
+                flow.record("clipboard", True, "clipboard emptied")
             except Exception as exc:  # noqa: BLE001 - best effort
-                log.warning("intent %s: could not restore the clipboard: %s", flow.intent.id, exc)
+                log.warning("intent %s: could not empty the clipboard: %s", flow.intent.id, exc)
+                flow.record("clipboard", False, f"could not empty the clipboard: {exc}")
         if self._cfg.save_evidence:
             self._save_evidence(flow)
 
@@ -1333,17 +1503,39 @@ class UniTraderVenue:
                         f"{symbol} is enabled but has no calibrated panel: re-run desk calibrate for it or disable it",
                     )
                 )
-            elif cfg.protective_orders == "panel_fields" and (panel.sl_input is None or panel.tp_input is None):
+            elif cfg.protective_orders == "panel_fields":
+                if panel.sl_input is None or panel.tp_input is None:
+                    out.append(
+                        _Check(
+                            f"instrument:{symbol}",
+                            False,
+                            f"protective_orders: panel_fields but the {symbol} panel has no calibrated SL/TP inputs: "
+                            "re-run desk calibrate",
+                        )
+                    )
+                else:
+                    out.append(_Check(f"instrument:{symbol}", True, "panel calibrated"))
+            elif panel.sl_input is None or panel.tp_input is None:
                 out.append(
                     _Check(
                         f"instrument:{symbol}",
-                        False,
-                        f"protective_orders: panel_fields but the {symbol} panel has no calibrated SL/TP inputs: "
-                        "re-run desk calibrate",
+                        True,
+                        f"panel calibrated. WARNING: its SL/TP inputs are not calibrated, so the desk cannot empty "
+                        f"them. If the {symbol} panel has stop-loss/take-profit fields, keep them EMPTY in UniTrader "
+                        "(with protective_orders: none every order carries whatever they hold), or re-run desk "
+                        "calibrate and record them",
+                        {"warning": True},
                     )
                 )
             else:
-                out.append(_Check(f"instrument:{symbol}", True, "panel calibrated"))
+                out.append(
+                    _Check(
+                        f"instrument:{symbol}",
+                        True,
+                        "panel calibrated; its SL/TP fields are emptied and verified empty before every order "
+                        "(protective_orders: none)",
+                    )
+                )
         if cfg.exit_method == "close_all":
             if lay.close_all_button is None:
                 out.append(
@@ -1372,6 +1564,20 @@ class UniTraderVenue:
         else:
             note = "" if lay.close_all_button else "; no close-all button: PANIC can only engage the kill switch"
             out.append(_Check("exit_method", True, f"opposite-order exits on a netting account{note}"))
+        problem = cfg.field_entry_problem()
+        if problem is not None:
+            out.append(_Check("field_entry", False, problem))
+        elif cfg.lot_readback == "clipboard":
+            out.append(
+                _Check(
+                    "field_entry",
+                    True,
+                    f"every field is read back through the clipboard after typing and again after {cfg.commit_key} "
+                    "committed it (the clipboard is emptied afterwards, never restored)",
+                )
+            )
+        else:
+            out.append(_Check("field_entry", True, "lot_readback: none: typed values are not verified"))
         has_dialog = lay.order_dialog is not None or lay.close_all_dialog is not None
         needed = cfg.fill_timeout_seconds + (cfg.dialog_timeout_seconds if has_dialog else 0.0)
         if cfg.max_order_seconds <= needed:
@@ -1389,7 +1595,14 @@ class UniTraderVenue:
                 _Check("timing", True, f"{cfg.max_order_seconds - needed:g}s of max_order_seconds for pre-click checks")
             )
         if self._dry_run:
-            out.append(_Check("dry_run", True, "dry run: every check runs but nothing is typed or clicked"))
+            out.append(
+                _Check(
+                    "dry_run",
+                    True,
+                    "dry run: every pre-click check runs, up to the re-verification right before the click, but "
+                    "nothing is typed or clicked (so the lot read-back is not exercised)",
+                )
+            )
         return out
 
     # ================================================================== individual checks (worker thread)

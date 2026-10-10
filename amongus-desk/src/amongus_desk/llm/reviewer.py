@@ -7,18 +7,22 @@ Design rules:
 * Fail closed by default: any API error, refusal, truncation or malformed answer becomes the configured
   ``failure_policy`` (``veto`` = no trade, ``abstain`` = let the deterministic crew decide).
 * Cost control: Claude is called only when every deterministic crewmate already voted PROCEED (the meeting
-  enforces that), and at most ``max_calls_per_day`` times per UTC day.
+  enforces that), and at most ``max_calls_per_day`` times per UTC day. With a ``state`` store the count
+  survives restarts.
+* Bounded: one review takes at most ``timeout_seconds`` in total, SDK retries included, because the desk
+  holds its trading lock while it waits.
 * Untrusted input never reaches the prompt: the user message is numeric JSON built by the desk.
 * Current Claude models do not accept sampling parameters such as ``temperature``; none are sent.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
 from datetime import date
-from typing import Any
+from typing import Any, Protocol
 
 import anthropic
 from pydantic import ValidationError
@@ -30,6 +34,7 @@ from .base import ReviewContext, ReviewOutcome, ReviewVerdict
 
 log = logging.getLogger(__name__)
 
+USAGE_KV = "llm_usage"
 SERVER_FALLBACK_BETA = "server-side-fallback-2026-07-01"
 MAX_CONCERNS = 5
 MAX_CONCERN_CHARS = 200
@@ -72,13 +77,29 @@ schema: verdict (APPROVE or VETO), confidence between 0 and 1, at most five shor
 one-sentence summary."""
 
 
+class UsageState(Protocol):
+    """Where the daily counters are kept between restarts (the desk's Store)."""
+
+    def get_kv(self, key: str) -> Any | None: ...
+
+    def set_kv(self, key: str, value: Any) -> None: ...
+
+
 class ClaudeReviewer:
     name = "claude"
 
-    def __init__(self, cfg: LlmConfig, clock: Clock, client: anthropic.AsyncAnthropic | None = None) -> None:
+    def __init__(
+        self,
+        cfg: LlmConfig,
+        clock: Clock,
+        client: anthropic.AsyncAnthropic | None = None,
+        *,
+        state: UsageState | None = None,
+    ) -> None:
         self._cfg = cfg
         self._clock = clock
         self._client = client or anthropic.AsyncAnthropic(timeout=cfg.timeout_seconds, max_retries=cfg.max_retries)
+        self._state = state
         self._day: date | None = None
         self._calls = 0
         self._failures = 0
@@ -109,9 +130,15 @@ class ClaudeReviewer:
         if self._calls >= self._cfg.max_calls_per_day:
             return self._fail(f"daily Claude review cap reached ({self._cfg.max_calls_per_day} calls)", count=False)
         self._calls += 1
+        self._save()
         started = time.monotonic()
         try:
-            response = await self._create(self._user_message(signal, plan, context))
+            async with asyncio.timeout(self._cfg.timeout_seconds):
+                response = await self._create(self._user_message(signal, plan, context))
+        except TimeoutError:
+            return self._fail(
+                f"Claude review took longer than {self._cfg.timeout_seconds:g}s (retries included)", started
+            )
         except anthropic.AuthenticationError:
             return self._fail("Claude API key rejected (check ANTHROPIC_API_KEY)", started)
         except anthropic.PermissionDeniedError:
@@ -128,6 +155,9 @@ class ClaudeReviewer:
             return self._fail(f"Claude API timed out after {self._cfg.timeout_seconds:g}s", started)
         except anthropic.APIConnectionError:
             return self._fail("cannot reach the Claude API (network)", started)
+        except Exception as exc:  # noqa: BLE001 - e.g. no credentials (TypeError) or an undecodable body
+            # CancelledError is not an Exception, so the desk can still abandon a review.
+            return self._fail(f"Claude review error: {type(exc).__name__}: {str(exc)[:200]}", started)
 
         latency_ms = int((time.monotonic() - started) * 1000)
         usage = getattr(response, "usage", None)
@@ -135,6 +165,7 @@ class ClaudeReviewer:
         output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
         self._input_tokens += input_tokens
         self._output_tokens += output_tokens
+        self._save()
         request_id = getattr(response, "_request_id", None)
         meta: dict[str, Any] = {
             "model": getattr(response, "model", self._cfg.model),
@@ -150,7 +181,10 @@ class ClaudeReviewer:
         if stop_reason == "max_tokens":
             return self._fail("Claude's answer was cut off (max_tokens); raise llm.max_tokens", meta=meta)
 
-        text = next((b.text for b in getattr(response, "content", []) if getattr(b, "type", None) == "text"), None)
+        blocks = getattr(response, "content", None) or []
+        text = next((getattr(b, "text", None) for b in blocks if getattr(b, "type", None) == "text"), None)
+        if text is not None and not isinstance(text, str):
+            text = None
         if text is None:
             return self._fail("Claude returned no text block", meta=meta)
         try:
@@ -162,6 +196,7 @@ class ClaudeReviewer:
         if vote is Vote.EJECT:
             self._vetoes += 1
         self._last_error = None
+        self._save()
         log.info(
             "Claude review %s %s: %s (confidence %.2f, request %s, %d ms, %d/%d tokens)",
             signal.symbol,
@@ -216,6 +251,45 @@ class ClaudeReviewer:
             self._day = today
             self._calls = self._failures = self._vetoes = 0
             self._input_tokens = self._output_tokens = 0
+            self._load(today)
+
+    def _load(self, today: date) -> None:
+        """Seed today's counters from the store (a restart must not hand out a fresh daily allowance)."""
+        if self._state is None:
+            return
+        try:
+            saved = self._state.get_kv(USAGE_KV)
+        except Exception:  # usage bookkeeping must never break a review
+            log.exception("could not read Claude usage counters")
+            return
+        if not isinstance(saved, dict) or saved.get("day") != today.isoformat():
+            return
+        try:
+            self._calls = int(saved.get("calls", 0))
+            self._failures = int(saved.get("failures", 0))
+            self._vetoes = int(saved.get("vetoes", 0))
+            self._input_tokens = int(saved.get("input_tokens", 0))
+            self._output_tokens = int(saved.get("output_tokens", 0))
+        except (TypeError, ValueError):
+            log.error("ignoring malformed Claude usage counters: %r", saved)
+
+    def _save(self) -> None:
+        if self._state is None or self._day is None:
+            return
+        try:
+            self._state.set_kv(
+                USAGE_KV,
+                {
+                    "day": self._day.isoformat(),
+                    "calls": self._calls,
+                    "failures": self._failures,
+                    "vetoes": self._vetoes,
+                    "input_tokens": self._input_tokens,
+                    "output_tokens": self._output_tokens,
+                },
+            )
+        except Exception:
+            log.exception("could not persist Claude usage counters")
 
     def _fail(
         self,
@@ -227,6 +301,7 @@ class ClaudeReviewer:
     ) -> ReviewOutcome:
         if count:
             self._failures += 1
+            self._save()
         self._last_error = message
         vote = Vote.EJECT if self._cfg.failure_policy == "veto" else Vote.HOLD
         log.warning("Claude review failed (%s): %s", self._cfg.failure_policy, message)

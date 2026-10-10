@@ -148,6 +148,7 @@ class Rig:
         cfg: DeskConfig | None = None,
         venue: Callable[[ManualClock], Any] | None = None,
         live: Sequence[Bar] = (),
+        reviewer: Any | None = None,
     ) -> None:
         self.cfg = cfg or desk_cfg(tmp_path)
         self.clock = ManualClock(T0)
@@ -173,7 +174,7 @@ class Rig:
             self.cfg,
             feed=self.feed,
             venue=self.venue,
-            reviewer=DisabledReviewer(),
+            reviewer=reviewer or DisabledReviewer(),
             store=self.store,
             audit=self.audit,
             notifier=self.notifier,

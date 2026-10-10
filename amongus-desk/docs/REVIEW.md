@@ -73,8 +73,9 @@ retry could double the position.
 
 **Execution latency.** The prototype doesn't measure latency anywhere, so slippage can't be checked
 after the fact. The real chain is: bar closes → data feed delivers it (polled a few seconds after the
-close) → local checks (milliseconds) → optional Claude review (typically a few seconds; bounded by
-`llm.timeout_seconds`) → GUI sequence (focus, verify, type lot, read back, click: roughly 1-3 s at the
+close) → local checks (milliseconds) → optional Claude review (typically a few seconds; at most
+`llm.timeout_seconds` in total, SDK retries included, and the plan is dropped if the next bar has
+closed meanwhile) → GUI sequence (focus, verify, type lot, read back, click: roughly 1-3 s at the
 default delays) → fill detection. For a 5-minute breakout strategy, a few seconds is acceptable *if it
 is measured*. A latency that is never measured turns into hidden slippage. The rebuild timestamps every
 stage. `ExecutionReport.started_at` / `clicked_at` / `finished_at` are recorded against the bar close in

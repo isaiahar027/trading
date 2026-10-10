@@ -23,8 +23,6 @@ dependencies = [
 [project.optional-dependencies]
 # GUI automation backend. Only installable/usable on the Windows VPS that runs UniTrader.
 windows = ["pyautogui>=0.9.54; sys_platform == 'win32'"]
-# Optional OCR of on-screen prices (pre-trade broker price check). Needs the Tesseract binary too.
-ocr = ["pytesseract>=0.3.10"]
 dev = ["pytest>=8.2", "ruff>=0.6", "mypy>=1.11", "types-PyYAML>=6.0"]
 
 [project.scripts]
@@ -69,5 +67,5 @@ packages = ["amongus_desk"]
 plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
-module = ["pyautogui", "pyautogui.*", "pytesseract"]
+module = ["pyautogui", "pyautogui.*"]
 ignore_missing_imports = true

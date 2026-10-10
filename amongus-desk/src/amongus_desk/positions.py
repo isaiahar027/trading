@@ -130,6 +130,40 @@ class PositionBook:
         log.info("position opened %s %s %s lots @ %s", pos.symbol, pos.side.value, pos.lots, pos.entry_price)
         return pos
 
+    def add_unmanaged(self, intent: OrderIntent, report: ExecutionReport, *, at: datetime, note: str) -> Position:
+        """Record a broker position the desk must not manage itself (a test order, or a fill the desk only
+        learned about from the operator or after a crash). It is kept in RECONCILE status so it counts
+        toward exposure and blocks new entries until the operator says it is closed."""
+        if intent.side is None or intent.lots is None:
+            raise ValueError("add_unmanaged needs an intent with side and lots")
+        if report.intent_id != intent.id:
+            raise ValueError("report does not belong to this intent")
+        source: PriceSource
+        if report.fill_price is not None:
+            entry, source = report.fill_price, report.fill_price_source
+        elif intent.entry_ref is not None:
+            entry, source = intent.entry_ref, "feed_estimate"
+        else:
+            raise ValueError("no entry price: neither a fill price nor a reference price")
+        pos = Position(
+            intent_id=intent.id,
+            symbol=intent.symbol,
+            side=intent.side,
+            lots=intent.lots,
+            entry_price=entry,
+            entry_price_source=source,
+            stop_price=intent.stop_price if intent.stop_price is not None else entry,
+            target_price=intent.target_price if intent.target_price is not None else entry,
+            opened_at=ensure_utc(at),
+            status=PositionStatus.RECONCILE,
+            time_stop_bars=self._cfg.strategy.time_stop_bars,
+            last_price=entry,
+            reconcile_note=note,
+        )
+        self._active[pos.id] = pos
+        log.warning("unmanaged position recorded %s %s %s lots: %s", pos.symbol, pos.side.value, pos.lots, note)
+        return pos
+
     def mark_bar(self, bar: Bar) -> list[ExitDue]:
         """Mark open positions of ``bar.symbol`` to the bar; return the exits it triggers.
 
@@ -140,10 +174,14 @@ class PositionBook:
         for pos_id, pos in list(self._active.items()):
             if pos.symbol != bar.symbol or bar.end <= pos.opened_at:
                 continue
+            if pos.last_marked_bar_end is not None and bar.end <= pos.last_marked_bar_end:
+                continue  # already applied (e.g. a bar replayed after a restart)
             if pos.status is not PositionStatus.OPEN:
-                self._active[pos_id] = pos.model_copy(update={"last_price": bar.close})
+                self._active[pos_id] = pos.model_copy(update={"last_price": bar.close, "last_marked_bar_end": bar.end})
                 continue
-            updated = pos.model_copy(update={"last_price": bar.close, "bars_held": pos.bars_held + 1})
+            updated = pos.model_copy(
+                update={"last_price": bar.close, "bars_held": pos.bars_held + 1, "last_marked_bar_end": bar.end}
+            )
             self._active[pos_id] = updated
             exit_due = self._exit_for(updated, bar)
             if exit_due is not None:
@@ -168,13 +206,31 @@ class PositionBook:
             return ExitDue(pos, ExitReason.TIME, bar.close)
         return None
 
-    def set_status(self, position_id: str, status: PositionStatus, *, close_intent_id: str | None = None) -> Position:
+    def set_status(
+        self,
+        position_id: str,
+        status: PositionStatus,
+        *,
+        close_intent_id: str | None = None,
+        note: str | None = None,
+        suggested_exit: ExitDue | None = None,
+    ) -> Position:
+        """Change the status. Moving to RECONCILE records ``note`` (why the operator is asked) and the exit the
+        feed suggested, if any; moving back to OPEN clears them."""
         if status is PositionStatus.CLOSED:
             raise ValueError("use close() to close a position")
         pos = self._require(position_id)
         update: dict[str, object] = {"status": status}
         if close_intent_id is not None:
             update["close_intent_id"] = close_intent_id
+        if status is PositionStatus.RECONCILE:
+            if note is not None:
+                update["reconcile_note"] = note
+            if suggested_exit is not None:
+                update["suggested_exit_reason"] = suggested_exit.reason
+                update["suggested_exit_price"] = suggested_exit.price
+        elif status is PositionStatus.OPEN:
+            update |= {"reconcile_note": None, "suggested_exit_reason": None, "suggested_exit_price": None}
         updated = pos.model_copy(update=update)
         self._active[position_id] = updated
         return updated
@@ -202,6 +258,13 @@ class PositionBook:
         self._history.sort(key=lambda p: p.closed_at or p.opened_at)
         log.info("position closed %s %s (%s) pnl est %.2f", closed.symbol, closed.side.value, reason.value, pnl)
         return closed
+
+    def restore(self, position: Position) -> None:
+        """Put back an earlier snapshot of an active position (undo a status change that did not happen)."""
+        self._require(position.id)
+        if position.status is PositionStatus.CLOSED:
+            raise ValueError("cannot restore a closed position")
+        self._active[position.id] = position
 
     def remove(self, position_id: str) -> Position:
         """Forget a position the operator confirmed never filled."""

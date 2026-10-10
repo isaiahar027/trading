@@ -140,3 +140,20 @@ def test_unwritable_directory_latches_in_memory(tmp_path: Path, monkeypatch: pyt
     monkeypatch.undo()
     k.release(by="op")
     assert not k.engaged()
+
+
+@pytest.mark.parametrize("name", ["KILL.txt", "kill", "Kill.TXT", "KILL.json"])
+def test_hand_made_variants_count_as_engaged(tmp_path: Path, name: str) -> None:
+    k = ks(tmp_path)
+    (tmp_path / name).write_text("stop please\n", encoding="utf-8")
+    assert k.engaged()
+    assert k.reason() == "stop please"
+    k.release(by="op")
+    assert not k.engaged() and not (tmp_path / name).exists()
+
+
+def test_unrelated_files_do_not_engage(tmp_path: Path) -> None:
+    k = ks(tmp_path)
+    for name in ("KILLER", "skill.txt", ".KILL.abc.tmp", "desk.db"):
+        (tmp_path / name).write_text("x", encoding="utf-8")
+    assert not k.engaged()
