@@ -21,6 +21,7 @@ Finally every template is re-captured and its similarity score reported.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 import secrets
@@ -52,6 +53,10 @@ TEMPLATES_DIR = "templates"
 MIN_TEMPLATE_SIDE = 4  # pixels; a smaller reference image can not identify anything reliably
 _MIN_POINT_DISTANCE = 3  # pixels; two targets closer than this are treated as the same spot
 _PARK_MARGIN = 5  # pixels; the mouse rest spot must stay this far away from every reference area
+# Same probe grid as the venue's ``_region_unobstructed``: both ends plus points at most this far apart.
+_GRID_STEP_PX = 20
+_GRID_MAX_POINTS = 32
+_PARK_LABEL = "the mouse rest spot"
 _MAX_INVALID_ANSWERS = 5
 _MAX_ERROR_TEMPLATES = 10
 _QUIT_WORDS = ("q", "quit")
@@ -81,11 +86,21 @@ class TemplateCheck:
     name: str
     score: float
     threshold: float
-    required: bool  # False for dialogs / error messages, which are normally not on screen
+    # True for always-visible areas (badge, labels, one-click indicator), which must match now. False for
+    # dialogs / error messages: the operator closed them, so they must NOT match now. A dialog template
+    # that matches the normal screen would make the venue click its confirm point after every order, and
+    # an error template that does would turn orders into false REJECTED reports.
+    required: bool
+
+    @property
+    def matched(self) -> bool:
+        """The fresh capture matched the saved image at or above the threshold."""
+        return self.score >= self.threshold
 
     @property
     def passed(self) -> bool:
-        return self.score >= self.threshold
+        """Always-visible templates must match the fresh capture; dialog/error templates must not."""
+        return self.matched if self.required else not self.matched
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,12 +114,12 @@ class CalibrationResult:
 
     @property
     def failed(self) -> list[TemplateCheck]:
-        """Required templates that did not match their fresh capture."""
-        return [c for c in self.checks if c.required and not c.passed]
+        """Checks that did not pass (see :attr:`TemplateCheck.passed`)."""
+        return [c for c in self.checks if not c.passed]
 
     @property
     def ok(self) -> bool:
-        """True when every always-visible template re-verified above its threshold."""
+        """True when every always-visible template matched and no dialog/error template matched."""
         return not self.failed
 
     def __bool__(self) -> bool:
@@ -131,6 +146,10 @@ def run_calibration(  # noqa: PLR0917 - positional signature fixed by docs/ARCHI
     new layout replaces the previous one completely. ``prompt``/``say`` default to ``input``/``print``
     and are injectable for tests; ``countdown`` is the number of seconds (slept through ``backend``)
     before each mouse position is recorded.
+
+    The returned :class:`CalibrationResult` is falsy when the layout was saved but re-verification
+    failed: an always-visible template did not match its fresh capture, or a dialog/error template
+    still matched the screen after the operator closed it.
 
     Raises :class:`CalibrationAborted` when the operator quits or declines and
     :class:`CalibrationError` when calibration can not be completed. In both cases nothing is
@@ -251,6 +270,14 @@ def _overlaps(a: Region, b: Region) -> bool:
     return a.x < b.x + b.w and b.x < a.x + a.w and a.y < b.y + b.h and b.y < a.y + a.h
 
 
+def _grid(start: int, length: int) -> list[int]:
+    """Probe coordinates along one axis: both ends plus points at most ``_GRID_STEP_PX`` apart."""
+    if length <= 1:
+        return [start]
+    count = min(_GRID_MAX_POINTS, max(2, math.ceil((length - 1) / _GRID_STEP_PX) + 1))
+    return sorted({start + round(i * (length - 1) / (count - 1)) for i in range(count)})
+
+
 class _Wizard:
     """State of one calibration run. Single-threaded; one instance per run."""
 
@@ -291,6 +318,7 @@ class _Wizard:
         self._handle = 0
         self._geometry: tuple[int, int, int] = (0, 0, 0)  # client width, client height, dpi
         self._park: Point | None = None
+        self._positions: Region | None = None
         self._targets: list[tuple[str, Point]] = []  # recorded click targets (+ park point)
         self._areas: list[tuple[str, Region, Image.Image]] = []  # recorded always-visible templates
         self._images: dict[str, Image.Image] = {}  # layout-relative image path -> image
@@ -333,7 +361,7 @@ class _Wizard:
         self._say("")
         self._say("Step 1: a rest spot for the mouse.")
         park = self._point(
-            "the mouse rest spot",
+            _PARK_LABEL,
             "a neutral spot inside the terminal where the mouse can rest: not a button, field, menu or "
             "anything else that reacts when the mouse is over it",
         )
@@ -362,6 +390,7 @@ class _Wizard:
         self._say("")
         self._say("Step 3: the positions indicator.")
         positions = self._positions_indicator()
+        self._positions = positions
 
         panels: dict[str, PanelLayout] = {}
         for number, symbol in enumerate(self._symbols, start=1):
@@ -441,7 +470,8 @@ class _Wizard:
     def _number(self, question: str, low: int, high: int) -> int:
         for _ in range(_MAX_INVALID_ANSWERS):
             answer = self._ask(question)
-            if answer.isdigit() and low <= int(answer) <= high:
+            # ASCII digits only: str.isdigit() also accepts e.g. "²", which int() rejects.
+            if re.fullmatch(r"[0-9]+", answer) and low <= int(answer) <= high:
                 return int(answer)
             self._say(f"  Please type a number from {low} to {high} (or q to quit).")
         raise CalibrationAborted("No valid answer. Calibration aborted; nothing was saved.")
@@ -630,12 +660,15 @@ class _Wizard:
         raise AssertionError("unreachable")
 
     def _point(self, label: str, what: str, *, own_window: bool = True, distinct: bool = True) -> Point:
+        """Record a click target / spot. ``distinct=False`` is for dialog buttons, which sit over the terminal."""
+
         def step() -> Point:
             point = self._hover(what, own_window=own_window)
             if distinct:
                 for other_label, other in self._targets:
                     if _near(point, other):
                         raise _Retry(f"that is the same spot as {other_label} ({other.x}, {other.y})")
+            self._check_target(point, reference_areas=distinct)
             return point
 
         point = self._with_retries(label, step)
@@ -650,7 +683,29 @@ class _Wizard:
             and region.y - margin <= point.y < region.y + region.h + margin
         )
 
-    def _region(self, what: str, *, own_window: bool) -> Region:
+    def _check_target(self, point: Point, *, reference_areas: bool) -> None:
+        """A spot the desk clicks, types into or rests the mouse on must not change a watched area.
+
+        The positions indicator is compared against a baseline taken *before* the lot is typed and the
+        button clicked, so a field, button or hover spot inside it would make the venue count its own
+        typing/click as a fill. A target inside an always-visible reference area (badge, label, ...) would
+        change that area and make every later check fail.
+        """
+        positions = self._positions
+        if positions is not None and self._inside(point, positions, _PARK_MARGIN):
+            raise _Retry(
+                "that spot is inside (or right next to) the positions indicator area; clicking, typing or "
+                "hovering there would change it and the desk would mistake that for a fill"
+            )
+        if reference_areas:
+            for area_label, region, _image in self._areas:
+                if self._inside(point, region):
+                    raise _Retry(
+                        f"that spot is inside the {area_label} area; clicking or typing there would change it and "
+                        "the desk would then refuse to trade"
+                    )
+
+    def _region(self, what: str, *, own_window: bool, target_margin: int = 0) -> Region:
         top_left = self._hover(f"the TOP-LEFT corner of {what}", own_window=own_window)
         bottom_right = self._hover(f"the BOTTOM-RIGHT corner of {what}", own_window=own_window)
         width = bottom_right.x - top_left.x + 1
@@ -661,19 +716,26 @@ class _Wizard:
                 f"least {MIN_TEMPLATE_SIDE} pixels to the right of and below the top-left corner"
             )
         region = Region(x=top_left.x, y=top_left.y, w=width, h=height)
-        if own_window:
-            # Same rule as the venue: the centre and all four corners must belong to the terminal window.
-            info = self._window()
-            x0, y0 = info.client_left + region.x, info.client_top + region.y
-            x1, y1 = x0 + region.w - 1, y0 + region.h - 1
-            probes = ((x0 + region.w // 2, y0 + region.h // 2), (x0, y0), (x1, y0), (x0, y1), (x1, y1))
-            if any(self._backend.root_window_at(x, y) != self._handle for x, y in probes):
-                raise _Retry("part of the marked area is covered by another window (move this console away)")
-        if own_window and self._park is not None and self._inside(self._park, region, _PARK_MARGIN):
+        if not own_window:
+            return region
+        # Same probe as the venue: a grid over the area (corners included, points <= 20 px apart) must
+        # belong to the terminal's own top-level window.
+        info = self._window()
+        xs = _grid(info.client_left + region.x, region.w)
+        ys = _grid(info.client_top + region.y, region.h)
+        if any(self._backend.root_window_at(x, y) != self._handle for y in ys for x in xs):
+            raise _Retry("part of the marked area is covered by another window (move this console away)")
+        if self._park is not None and self._inside(self._park, region, _PARK_MARGIN):
             raise _Retry(
                 "the mouse rest spot is inside (or right next to) this area, so the mouse would sit on it; mark "
                 "the area again, or quit and pick another rest spot"
             )
+        for target_label, target in self._targets:
+            if target_label != _PARK_LABEL and self._inside(target, region, target_margin):
+                raise _Retry(
+                    f"{target_label} ({target.x}, {target.y}) is inside this area, so clicking or typing there would "
+                    "change it; mark an area that leaves it out"
+                )
         return region
 
     def _park_mouse(self) -> None:
@@ -729,7 +791,9 @@ class _Wizard:
             return region, first
 
         region, image = self._with_retries(label, step)
-        rel = f"{TEMPLATES_DIR}/{self._stamp}-{_slug(slug)}.png"
+        # The sequence number keeps names unique even when two slugs collapse to the same text (e.g. the
+        # symbols "XX" and "XX_"), so one template can never overwrite another.
+        rel = f"{TEMPLATES_DIR}/{self._stamp}-{len(self._images) + 1:02d}-{_slug(slug)}.png"
         self._images[rel] = image
         if not transient:
             self._areas.append((label, region, image))
@@ -766,7 +830,7 @@ class _Wizard:
         )
 
         def step() -> Region:
-            region = self._region(what, own_window=True)
+            region = self._region(what, own_window=True, target_margin=_PARK_MARGIN)
             first, second = self._two_captures(region)
             fraction = changed_fraction(first, second)
             # The venue refuses to trade when ANY pixel of this area changes between its two baseline
@@ -838,7 +902,34 @@ class _Wizard:
             distinct=False,
         )
         self._ask(f"Now close {what} yourself WITHOUT confirming it. Press Enter when it is gone (q to quit):")
+        self._confirm_closed(what, template)
         return DialogLayout(template=template, confirm_button=confirm)
+
+    def _confirm_closed(self, what: str, ref: TemplateRef) -> None:
+        """The area of a dialog/message the operator just closed must no longer match its reference image.
+
+        Otherwise the venue would "see" the dialog on the normal screen: it would click the recorded
+        confirm point after every order, or take every order for rejected by an error message.
+        """
+        image = self._images[ref.image]
+        for attempt in range(1, self._max_attempts + 1):
+            self._park_mouse()
+            self._backend.sleep(self._settle)
+            score = similarity(image, self._grab(ref.region))
+            if score < self._threshold:
+                self._say(f"  {what} is gone (similarity {score:.3f}): the desk can tell it from the normal screen")
+                return
+            problem = (
+                f"the area marked for {what} still looks the same while it should be closed (similarity "
+                f"{score:.3f} >= {self._threshold:.2f})"
+            )
+            self._say(f"  Problem: {problem}. If it is still open, close it yourself without confirming it.")
+            if attempt == self._max_attempts:
+                raise CalibrationError(
+                    f"Could not record {what}: {problem}, so the desk would mistake the normal screen for it. "
+                    f"Run calibrate again and mark a part of {what} itself. Nothing was saved."
+                )
+            self._ask("  Press Enter to check again (or q to quit):")
 
     def _close_all(self) -> tuple[Point | None, DialogLayout | None]:
         needed = self._ut.exit_method == "close_all"
@@ -875,15 +966,15 @@ class _Wizard:
         )
         while len(refs) < _MAX_ERROR_TEMPLATES and self._yes_no(question):
             number = len(refs) + 1
-            refs.append(
-                self._template(
-                    f"error message {number}",
-                    f"error_{number}",
-                    f"error message {number}: a part of it that always looks the same",
-                    transient=True,
-                )
+            ref = self._template(
+                f"error message {number}",
+                f"error_{number}",
+                f"error message {number}: a part of it that always looks the same",
+                transient=True,
             )
             self._ask("Close the error message yourself, then press Enter (q to quit):")
+            self._confirm_closed(f"error message {number}", ref)
+            refs.append(ref)
             question = "Record another error message?"
         return refs
 
@@ -958,12 +1049,14 @@ class _Wizard:
                 _write_png_atomically(target, image)
                 written.append(target)
             LayoutFile(layout, base).save(self._out)
-        except OSError as exc:
+        except BaseException as exc:  # incl. Ctrl+C: never leave images behind that no layout refers to
             for path in written:
                 _unlink_quietly(path)
-            raise CalibrationError(
-                f"Could not write the layout ({exc}). The previous layout, if any, is unchanged."
-            ) from exc
+            if isinstance(exc, OSError):
+                raise CalibrationError(
+                    f"Could not write the layout ({exc}). The previous layout, if any, is unchanged."
+                ) from exc
+            raise
         current = {(base / rel).resolve() for rel in self._images}
         for stale in sorted(previous - current):
             _unlink_quietly(stale)
@@ -990,13 +1083,16 @@ class _Wizard:
                 name=name, score=similarity(reference, self._grab(ref.region)), threshold=threshold, required=required
             )
             checks.append(check)
-            if check.passed:
-                status = "ok"
-            elif required:
-                status = "FAILED"
+            if required:
+                status = "ok" if check.passed else "FAILED"
+                self._say(f"  {name:<28} similarity {check.score:6.3f} (needs >= {threshold:.2f})  {status}")
             else:
-                status = "not on screen (expected once the dialog/message is closed)"
-            self._say(f"  {name:<28} similarity {check.score:6.3f} (needs {threshold:.2f})  {status}")
+                status = (
+                    "ok (not on screen, as expected now that it is closed)"
+                    if check.passed
+                    else "FAILED: matches the screen although it should be closed"
+                )
+                self._say(f"  {name:<28} similarity {check.score:6.3f} (needs <  {threshold:.2f})  {status}")
         return checks
 
     def _conclude(self, result: CalibrationResult) -> None:
@@ -1007,8 +1103,9 @@ class _Wizard:
         else:
             names = ", ".join(c.name for c in result.failed)
             self._say(
-                f"WARNING: re-verification FAILED for {names}. The layout was saved, but the desk will refuse to "
-                "trade until `desk preflight` passes. Check that nothing covers the terminal and run calibrate again."
+                f"WARNING: re-verification FAILED for {names}. The layout was saved but must not be used: check "
+                "that nothing covers the terminal and that every dialog/error message is closed, then run "
+                "calibrate again (and `desk preflight`) before trading."
             )
             log.warning("calibration saved but re-verification failed for %s", names)
         for text in result.warnings:

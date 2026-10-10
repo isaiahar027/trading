@@ -66,6 +66,9 @@ STABILITY_INTERVAL_SECONDS = 0.3
 CONFIRM_SAMPLES = 2
 #: Largest mean-colour difference (0..255 per channel) a template match tolerates (see vision.mean_color_delta).
 MAX_TEMPLATE_COLOR_DELTA = 32.0
+#: Spacing / cap of the grid of points probed with ``root_window_at`` to prove nothing covers a region.
+GRID_STEP_PX = 20
+GRID_MAX_POINTS = 32
 #: Real seconds the worker waits for the write-ahead hook to run on the event loop.
 WRITE_AHEAD_TIMEOUT_SECONDS = 10.0
 #: Real seconds added to ``max_order_seconds`` before the event loop gives up on a stuck worker.
@@ -222,8 +225,8 @@ class _Flow:
 
 
 def _safe_component(text: str) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9_.-]", "_", text)[:100]
-    return cleaned if cleaned not in ("", ".", "..") else "intent"
+    """One safe path component (no separators, no dots) for the evidence folder of an intent."""
+    return re.sub(r"[^A-Za-z0-9_-]", "_", text)[:100] or "intent"
 
 
 def _window_data(win: WindowInfo) -> dict[str, Any]:
@@ -245,6 +248,14 @@ def _consume_future_result(fut: asyncio.Future[Any]) -> None:
 def _task_cancelling() -> bool:
     task = asyncio.current_task()
     return task is not None and task.cancelling() > 0
+
+
+def _grid(start: int, length: int) -> list[int]:
+    """Sample coordinates along one axis: both ends plus points at most ``GRID_STEP_PX`` apart."""
+    if length <= 1:
+        return [start]
+    count = min(GRID_MAX_POINTS, max(2, math.ceil((length - 1) / GRID_STEP_PX) + 1))
+    return sorted({start + round(i * (length - 1) / (count - 1)) for i in range(count)})
 
 
 class UniTraderVenue:
@@ -289,6 +300,7 @@ class UniTraderVenue:
 
     @property
     def dry_run(self) -> bool:
+        """True when every check runs but nothing is ever typed or clicked."""
         return self._dry_run
 
     # ================================================================== public API (event loop)
@@ -534,7 +546,14 @@ class UniTraderVenue:
 
         def run() -> ExecutionReport:
             with self._gui_lock:
-                return job(_Flow(self._clock, intent, ctl, deadline))
+                try:
+                    return job(_Flow(self._clock, intent, ctl, deadline))
+                except Exception as exc:  # last-resort net: a programming error must not hide a click
+                    log.exception("intent %s: GUI flow crashed", intent.id)
+                    status = IntentStatus.UNCONFIRMED if ctl.click_started else IntentStatus.ABORTED
+                    return self._quick_report(
+                        intent, status, f"internal error in the GUI flow: {type(exc).__name__}: {exc}", "error"
+                    )
 
         try:
             cfut: Future[ExecutionReport] = self._executor.submit(run)
@@ -1092,7 +1111,9 @@ class UniTraderVenue:
     def _indicator_change(self, win: WindowInfo, baseline: Image.Image) -> float | None:
         """Changed fraction of the positions indicator, or None when the sample can't be trusted."""
         region = self._layout.layout.positions_indicator
-        if not self._backend.input_desktop_available() or not self._region_unobstructed(win, region):
+        if not self._backend.input_desktop_available() or self._backend.foreground_window() != win.handle:
+            return None
+        if not self._region_unobstructed(win, region):
             return None
         shot = self._capture_region(win, region)
         if not self._backend.input_desktop_available():
@@ -1521,10 +1542,7 @@ class UniTraderVenue:
         return self._backend.capture(win.client_left, win.client_top, win.client_width, win.client_height)
 
     def _region_unobstructed(self, win: WindowInfo, region: Region) -> bool:
-        """The region's centre and corners all belong to our window (nothing on top of it)."""
-        x0 = win.client_left + region.x
-        y0 = win.client_top + region.y
-        x1 = x0 + region.w - 1
-        y1 = y0 + region.h - 1
-        points = ((x0 + region.w // 2, y0 + region.h // 2), (x0, y0), (x1, y0), (x0, y1), (x1, y1))
-        return all(self._backend.root_window_at(x, y) == win.handle for x, y in points)
+        """Every point of a grid over the region (~20 px apart, corners included) belongs to our window."""
+        xs = _grid(win.client_left + region.x, region.w)
+        ys = _grid(win.client_top + region.y, region.h)
+        return all(self._backend.root_window_at(x, y) == win.handle for y in ys for x in xs)

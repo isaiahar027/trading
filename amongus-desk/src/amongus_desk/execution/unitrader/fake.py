@@ -86,10 +86,12 @@ class Rect:
     h: int
 
     def contains(self, px: int, py: int) -> bool:
+        """True when the client point lies inside the rectangle."""
         return self.x <= px < self.x + self.w and self.y <= py < self.y + self.h
 
     @property
     def center(self) -> tuple[int, int]:
+        """Centre point (client coordinates)."""
         return self.x + self.w // 2, self.y + self.h // 2
 
     @property
@@ -98,15 +100,19 @@ class Rect:
         return self.x, self.y, self.x + self.w, self.y + self.h
 
     def region(self) -> Region:
+        """The rectangle as a layout :class:`Region`."""
         return Region(x=self.x, y=self.y, w=self.w, h=self.h)
 
     def point(self) -> Point:
+        """The rectangle's centre as a layout :class:`Point`."""
         cx, cy = self.center
         return Point(x=cx, y=cy)
 
 
 @dataclass(frozen=True, slots=True)
 class FakePanelGeometry:
+    """Where one simulated panel and its widgets are drawn (client coordinates)."""
+
     symbol: str
     frame: Rect
     label: Rect
@@ -132,6 +138,8 @@ class FakeOrder:
 
 @dataclass(slots=True)
 class FakePosition:
+    """An open position in the simulated terminal."""
+
     symbol: str
     side: str
     lots: Decimal
@@ -332,10 +340,12 @@ class FakeTerminal:
 
     # ------------------------------------------------------------------ test helpers
     def field_text(self, symbol: str, kind: FieldKind = "lot") -> str:
+        """Current text of a panel field."""
         with self._lock:
             return self._fields[(symbol, kind)]
 
     def set_field_text(self, symbol: str, kind: FieldKind, text: str) -> None:
+        """Overwrite a panel field (test setup)."""
         with self._lock:
             self._fields[(symbol, kind)] = text
             self._invalidate()
@@ -348,11 +358,13 @@ class FakeTerminal:
 
     @property
     def dialog(self) -> DialogKind | None:
+        """The dialog currently shown, if any."""
         with self._lock:
             return self._dialog.kind if self._dialog else None
 
     @property
     def focused_field(self) -> tuple[str, FieldKind] | None:
+        """The field that has keyboard focus, if any."""
         with self._lock:
             return self._focused
 
@@ -369,11 +381,13 @@ class FakeTerminal:
 
     # ------------------------------------------------------------------ windows
     def client_rect_screen(self) -> Rect:
+        """The client area in screen coordinates."""
         left, top = self.client_origin
         w, h = self.client_size
         return Rect(left, top, w, h)
 
     def windows(self) -> list[WindowInfo]:
+        """Top-level windows of the simulated desktop (terminal, duplicates, popup, an unrelated window)."""
         with self._lock:
             left, top = self.client_origin
             w, h = self.client_size
@@ -438,6 +452,7 @@ class FakeTerminal:
         return self.window_present and not self.minimized
 
     def root_window_at(self, x: int, y: int) -> int | None:
+        """Handle of the window on top at a screen point (popup over terminal over desktop)."""
         with self._lock:
             left, top = self.client_origin
             cx, cy = x - left, y - top
@@ -448,12 +463,14 @@ class FakeTerminal:
             return None
 
     def restore(self, handle: int) -> None:
+        """Un-minimize the terminal window."""
         with self._lock:
             if handle == HANDLE_TERMINAL:
                 self.minimized = False
                 self._invalidate()
 
     def activate(self, handle: int) -> bool:
+        """Try to make ``handle`` the foreground window; returns whether it now is."""
         with self._lock:
             if self.locked:
                 return False
@@ -475,6 +492,7 @@ class FakeTerminal:
                 raise OperatorAbortError("fail-safe triggered (simulation)")
 
     def after_input(self, name: str) -> None:
+        """Book-keeping after an input action: focus stealing and the :attr:`on_action` hook."""
         hook: Callable[[FakeTerminal, str], None] | None
         with self._lock:
             self.input_count += 1
@@ -487,6 +505,7 @@ class FakeTerminal:
             hook(self, name)
 
     def click_screen(self, x: int, y: int) -> None:
+        """A left click at a screen point, hit-tested against popup, dialog and widgets."""
         with self._lock:
             self.cursor = (x, y)
             if self.locked:
@@ -543,6 +562,7 @@ class FakeTerminal:
         return self._focused
 
     def type_text(self, text: str) -> None:
+        """Type into the focused field (replaces the selection, else appends)."""
         with self._lock:
             target = self._keyboard_target()
             if target is None:
@@ -573,6 +593,7 @@ class FakeTerminal:
             return None
 
     def press(self, key: str) -> None:
+        """Press one key: tab/enter commit, esc dismisses dialogs, backspace/delete edit."""
         with self._lock:
             key = key.lower()
             if self.locked:
@@ -866,7 +887,7 @@ class FakeGuiBackend:
         self._real_sleep = real_sleep
         self._lock = threading.Lock()
         self.actions: list[FakeAction] = []
-        self.capture_hook: Callable[[int, int, int, int], None] | None = None
+        self.capture_hook: Callable[[int, int, int, int], object] | None = None  # test hook, runs before a capture
 
     def _log(self, name: str, *args: Any) -> None:
         with self._lock:
@@ -878,15 +899,18 @@ class FakeGuiBackend:
             return [a for a in self.actions if a.name in INPUT_ACTIONS]
 
     def clicks(self) -> list[tuple[int, int]]:
+        """Screen points of every click made through this backend."""
         with self._lock:
             return [(int(a.args[0]), int(a.args[1])) for a in self.actions if a.name == "click"]
 
     # --- windows -------------------------------------------------------------------------------
     def list_windows(self) -> list[WindowInfo]:
+        """Visible top-level windows with a title."""
         self._log("list_windows")
         return [w for w in self.terminal.windows() if w.visible and w.title]
 
     def get_window(self, handle: int) -> WindowInfo | None:
+        """Current info for one window, or None if it is gone."""
         self._log("get_window", handle)
         for win in self.terminal.windows():
             if win.handle == handle:
@@ -894,27 +918,33 @@ class FakeGuiBackend:
         return None
 
     def restore_window(self, handle: int) -> None:
+        """Un-minimize a window (never resizes)."""
         self._log("restore_window", handle)
         self.terminal.restore(handle)
 
     def activate_window(self, handle: int) -> bool:
+        """Bring a window to the foreground; returns whether it is now the foreground."""
         self._log("activate_window", handle)
         return self.terminal.activate(handle)
 
     def foreground_window(self) -> int | None:
+        """Handle of the foreground window."""
         self._log("foreground_window")
         return self.terminal.foreground
 
     def root_window_at(self, x: int, y: int) -> int | None:
+        """Top-level window owning a screen point."""
         self._log("root_window_at", x, y)
         return self.terminal.root_window_at(x, y)
 
     def input_desktop_available(self) -> bool:
+        """False while the simulated session is locked."""
         self._log("input_desktop_available")
         return not self.terminal.locked
 
     # --- screen --------------------------------------------------------------------------------
     def capture(self, left: int, top: int, width: int, height: int) -> Image.Image:
+        """Screenshot of a screen rectangle, exactly ``width`` x ``height``."""
         if width <= 0 or height <= 0:
             raise BackendError(f"invalid capture size {width}x{height}")
         self._log("capture", left, top, width, height)
@@ -929,16 +959,19 @@ class FakeGuiBackend:
         self._log(name, *args)
 
     def move_mouse(self, x: int, y: int) -> None:
+        """Move the pointer (an input action: the fail-safe may fire)."""
         self._input("move_mouse", x, y)
         self.terminal.cursor = (x, y)
         self.terminal.after_input("move_mouse")
 
     def click(self, x: int, y: int) -> None:
+        """Left click at a screen point."""
         self._input("click", x, y)
         self.terminal.click_screen(x, y)
         self.terminal.after_input("click")
 
     def hotkey(self, *keys: str) -> None:
+        """Key chord, e.g. ``hotkey("ctrl", "a")``; ctrl+c fills the clipboard."""
         self._input("hotkey", *keys)
         copied = self.terminal.hotkey(keys)
         if copied is not None:
@@ -946,30 +979,36 @@ class FakeGuiBackend:
         self.terminal.after_input("hotkey")
 
     def press(self, key: str) -> None:
+        """Press one key."""
         self._input("press", key)
         self.terminal.press(key)
         self.terminal.after_input("press")
 
     def type_text(self, text: str) -> None:
+        """Type literal text into the focused field."""
         self._input("type_text", text)
         self.terminal.type_text(text)
         self.terminal.after_input("type_text")
 
     def cursor_position(self) -> tuple[int, int]:
+        """Last pointer position."""
         self._log("cursor_position")
         return self.terminal.cursor
 
     # --- clipboard -----------------------------------------------------------------------------
     def get_clipboard_text(self) -> str | None:
+        """Simulated clipboard text."""
         self._log("get_clipboard_text")
         return self.terminal.clipboard
 
     def set_clipboard_text(self, text: str) -> None:
+        """Replace the simulated clipboard text."""
         self._log("set_clipboard_text", text)
         self.terminal.clipboard = text
 
     # --- misc ----------------------------------------------------------------------------------
     def sleep(self, seconds: float) -> None:
+        """Virtual sleep: advances the terminal's time (and the optional clock)."""
         seconds = max(0.0, float(seconds))
         self._log("sleep", seconds)
         if self._real_sleep and seconds > 0:

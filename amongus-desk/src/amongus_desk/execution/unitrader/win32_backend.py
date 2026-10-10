@@ -78,6 +78,8 @@ E_ACCESSDENIED = -2147024891  # HRESULT 0x80070005 as a signed 32-bit value
 ERROR_ACCESS_DENIED = 5
 ERROR_INSUFFICIENT_BUFFER = 122
 
+_AWARENESS_NAMES = {0: "unaware", 1: "system", 2: "per-monitor"}  # DPI_AWARENESS enum values
+_PER_MONITOR_OUTCOMES = ("per-monitor-v2", "per-monitor")
 _MAX_CLIPBOARD_BYTES = 1 << 20  # never copy more than 1 MiB out of someone else's clipboard data
 _MAX_IMAGE_PATH_CHARS = 32_768  # longest extended-length path QueryFullProcessImageNameW can return
 _FOREGROUND_SETTLE_SECONDS = 0.25
@@ -139,6 +141,8 @@ class _Win32Functions:
     SetProcessDpiAwarenessContext: Callable[..., Any] | None  # user32, Windows 10 1703+
     SetProcessDpiAwareness: Callable[..., Any] | None  # shcore, Windows 8.1+
     SetProcessDPIAware: Callable[..., Any] | None  # user32, Vista+
+    GetThreadDpiAwarenessContext: Callable[..., Any] | None  # user32, Windows 10 1607+
+    GetAwarenessFromDpiAwarenessContext: Callable[..., Any] | None  # user32, Windows 10 1607+
     # kernel32
     OpenProcess: Callable[..., Any]
     QueryFullProcessImageNameW: Callable[..., Any]
@@ -241,6 +245,10 @@ def _bind_win32() -> _Win32Functions:
             SetProcessDpiAwarenessContext=bind_optional(user32, "SetProcessDpiAwarenessContext", boolean, handle),
             SetProcessDpiAwareness=bind_optional(shcore, "SetProcessDpiAwareness", ctypes.c_long, ctypes.c_int),
             SetProcessDPIAware=bind_optional(user32, "SetProcessDPIAware", boolean),
+            GetThreadDpiAwarenessContext=bind_optional(user32, "GetThreadDpiAwarenessContext", handle),
+            GetAwarenessFromDpiAwarenessContext=bind_optional(
+                user32, "GetAwarenessFromDpiAwarenessContext", ctypes.c_int, handle
+            ),
             OpenProcess=bind(kernel32, "OpenProcess", handle, dword, boolean, dword),
             QueryFullProcessImageNameW=bind(
                 kernel32, "QueryFullProcessImageNameW", boolean, handle, dword, wintypes.LPWSTR, lpdword
@@ -319,10 +327,21 @@ class _Win32Api:
             return "system"
         return "unaware"
 
+    def dpi_awareness_level(self) -> int | None:
+        """DPI_AWARENESS of the calling thread (0 unaware, 1 system, 2 per-monitor); ``None`` if unknown."""
+        f = self._f
+        if f.GetThreadDpiAwarenessContext is None or f.GetAwarenessFromDpiAwarenessContext is None:
+            return None
+        context = f.GetThreadDpiAwarenessContext()
+        if not context:
+            return None
+        level = int(f.GetAwarenessFromDpiAwarenessContext(context))
+        return level if level in _AWARENESS_NAMES else None
+
     # --- windows --------------------------------------------------------------------------------------
 
     def top_level_windows(self) -> list[int]:
-        """Handles of all top-level windows, in Z order (topmost first)."""
+        """Handles of all top-level windows, in the order EnumWindows reports them."""
         handles: list[int] = []
 
         def collect(hwnd: int | None, _lparam: int) -> bool:
@@ -576,8 +595,11 @@ class _Automation(Protocol):
 
     FAILSAFE: bool
     PAUSE: float
-    FailSafeException: type[Exception]
-    PyAutoGUIException: type[Exception]
+
+    @property
+    def FailSafeException(self) -> type[Exception]: ...
+    @property
+    def PyAutoGUIException(self) -> type[Exception]: ...
 
     def click(self, *, x: int, y: int) -> object: ...
     def moveTo(self, *, x: int, y: int) -> object: ...
@@ -608,6 +630,15 @@ def _import_grab() -> _Grab:
     return ImageGrab.grab
 
 
+def _describe_awareness(outcome: str, level: int | None) -> tuple[str, bool]:
+    """Combine what the DPI calls reported with the awareness the OS reports: ``(name, per_monitor)``."""
+    if level is None:
+        return outcome, outcome in _PER_MONITOR_OUTCOMES
+    if level == 2:
+        return (outcome if outcome in _PER_MONITOR_OUTCOMES else "per-monitor"), True
+    return _AWARENESS_NAMES[level], False
+
+
 class Win32Backend:
     """:class:`~.backend.GuiBackend` for a real, logged-in and unlocked Windows desktop session.
 
@@ -632,16 +663,17 @@ class Win32Backend:
         fns = _bind_win32()  # raises Win32UnavailableError when not on Windows
         api = _Win32Api(fns, clipboard_attempts=clipboard_attempts, clipboard_retry_seconds=clipboard_retry_seconds)
         preloaded = "pyautogui" in sys.modules
-        awareness = api.make_dpi_aware()
-        if awareness in ("already-set", "unaware") or preloaded:
-            log.warning(
-                "DPI awareness is %s%s; coordinates may be scaled. Construct Win32Backend before anything "
-                "imports pyautogui.",
-                awareness,
-                " (pyautogui was imported earlier)" if preloaded else "",
-            )
-        else:
+        awareness, per_monitor = _describe_awareness(api.make_dpi_aware(), api.dpi_awareness_level())
+        if per_monitor:
             log.info("process DPI awareness: %s", awareness)
+        else:
+            log.warning(
+                "process DPI awareness is %s, not per-monitor%s: on scaled displays Windows may virtualize "
+                "coordinates, and the desk will then refuse to act (DPI/template checks fail). Create "
+                "Win32Backend before anything imports pyautogui.",
+                awareness,
+                " (pyautogui was imported before the backend was created)" if preloaded else "",
+            )
         self._setup(
             api,
             _import_pyautogui(),
@@ -818,6 +850,7 @@ class Win32Backend:
             return ok
 
     def foreground_window(self) -> int | None:
+        """Handle of the current foreground window, ``None`` if there is none."""
         return self._api.foreground_window()
 
     def root_window_at(self, x: int, y: int) -> int | None:
@@ -825,6 +858,7 @@ class Win32Backend:
         return self._api.root_window_at(int(x), int(y))
 
     def input_desktop_available(self) -> bool:
+        """False when the session is locked or disconnected (OpenInputDesktop fails)."""
         return self._api.input_desktop_available()
 
     # --- screen ---------------------------------------------------------------------------------------
@@ -846,6 +880,7 @@ class Win32Backend:
     # --- input ----------------------------------------------------------------------------------------
 
     def move_mouse(self, x: int, y: int) -> None:
+        """Move the mouse to the screen point (no click)."""
         with self._lock:
             self._run("move_mouse", lambda: self._gui.moveTo(x=int(x), y=int(y)))
 
@@ -855,6 +890,7 @@ class Win32Backend:
             self._run("click", lambda: self._gui.click(x=int(x), y=int(y)))
 
     def hotkey(self, *keys: str) -> None:
+        """Press keys together (pyautogui key names), e.g. ``hotkey("ctrl", "a")``."""
         if not keys:
             raise BackendError("hotkey needs at least one key")
         names = [self._check_key(k) for k in keys]
@@ -862,6 +898,7 @@ class Win32Backend:
             self._run("hotkey", lambda: self._gui.hotkey(*names))
 
     def press(self, key: str) -> None:
+        """Press and release one key (pyautogui key name)."""
         name = self._check_key(key)
         with self._lock:
             self._run("press", lambda: self._gui.press(name))
@@ -875,22 +912,26 @@ class Win32Backend:
             self._run("type_text", lambda: self._gui.write(text, interval=0.0))
 
     def cursor_position(self) -> tuple[int, int]:
+        """Current mouse position in screen pixels."""
         pos = self._run("cursor_position", self._gui.position)
         return int(pos[0]), int(pos[1])
 
     # --- clipboard ------------------------------------------------------------------------------------
 
     def get_clipboard_text(self) -> str | None:
+        """Unicode text on the clipboard, ``None`` if it holds no text. Raises :class:`BackendError`."""
         with self._lock:
             return self._api.get_clipboard_text()
 
     def set_clipboard_text(self, text: str) -> None:
+        """Replace the clipboard text and verify it took. Raises :class:`BackendError` on any failure."""
         with self._lock:
             self._api.set_clipboard_text(text)
 
     # --- misc -----------------------------------------------------------------------------------------
 
     def sleep(self, seconds: float) -> None:
+        """Block the calling thread (negative values count as zero)."""
         self._sleep(max(0.0, seconds))
 
 

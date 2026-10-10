@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 import yaml
-from factories import T0
+from PIL import Image
 
 import amongus_desk.execution.unitrader.fake as fake_module
 from amongus_desk.clock import ManualClock
@@ -24,6 +24,7 @@ from amongus_desk.execution.unitrader.fake import (
 )
 from amongus_desk.execution.unitrader.layout import LayoutFile
 from amongus_desk.execution.unitrader.vision import changed_fraction, is_blank, similarity
+from factories import T0
 
 
 def rig(*symbols: str, **kwargs: object) -> tuple[FakeTerminal, FakeGuiBackend]:
@@ -46,7 +47,7 @@ def type_lot(be: FakeGuiBackend, term: FakeTerminal, symbol: str, text: str) -> 
     be.type_text(text)
 
 
-def capture_rect(be: FakeGuiBackend, term: FakeTerminal, r: Rect) -> object:
+def capture_rect(be: FakeGuiBackend, term: FakeTerminal, r: Rect) -> Image.Image:
     x, y = screen(term, r.x, r.y)
     return be.capture(x, y, r.w, r.h)
 
@@ -144,7 +145,7 @@ def test_popup_covers_part_of_the_client_area() -> None:
 
 
 def test_root_window_outside_the_terminal_is_none() -> None:
-    term, be = rig()
+    _, be = rig()
     assert be.root_window_at(0, 0) is None
 
 
@@ -266,7 +267,7 @@ def test_positions_indicator_changes_on_fill() -> None:
     before = capture_rect(be, term, ind)
     click_rect(be, term, term.geometry().panels["EURUSD"].sell_button)
     after = capture_rect(be, term, ind)
-    assert changed_fraction(before, after) > 0.05  # type: ignore[arg-type]
+    assert changed_fraction(before, after) > 0.05
 
 
 def test_fill_delay_uses_virtual_time_and_advances_the_clock() -> None:
@@ -304,22 +305,26 @@ def test_netting_and_hedging() -> None:
     assert len(term2.positions) == 2
 
 
+def current_dialog(term: FakeTerminal) -> str | None:
+    return term.dialog
+
+
 def test_confirmation_dialog_ok_cancel_and_esc() -> None:
     term, be = rig(order_confirm_dialog=True)
     geo = term.geometry()
     buy = geo.panels["EURUSD"].buy_button
     click_rect(be, term, buy)
-    assert term.dialog == "order_confirm" and term.positions == []
+    assert current_dialog(term) == "order_confirm" and term.positions == []
     click_rect(be, term, geo.panels["EURUSD"].sell_button)  # modal: ignored
     assert term.order_clicks == [("EURUSD", "BUY")]
     click_rect(be, term, geo.dialog_ok)
-    assert term.dialog is None and len(term.positions) == 1 and term.dialog_confirms == 1
+    assert current_dialog(term) is None and len(term.positions) == 1 and term.dialog_confirms == 1
     click_rect(be, term, buy)
     click_rect(be, term, geo.dialog_cancel)
-    assert term.dialog is None and term.positions[0].lots == Decimal("0.01")
+    assert current_dialog(term) is None and term.positions[0].lots == Decimal("0.01")
     click_rect(be, term, buy)
     be.press("esc")
-    assert term.dialog is None and term.positions[0].lots == Decimal("0.01")
+    assert current_dialog(term) is None and term.positions[0].lots == Decimal("0.01")
 
 
 def test_error_dialog() -> None:
@@ -361,9 +366,9 @@ def test_swapped_panels_move_the_labels() -> None:
     term, be = rig("EURUSD", "GBPUSD")
     label = term.geometry().panels["EURUSD"].label
     reference = term.render_for_calibration().crop(label.box)
-    assert similarity(capture_rect(be, term, label), reference) == pytest.approx(1.0)  # type: ignore[arg-type]
+    assert similarity(capture_rect(be, term, label), reference) == pytest.approx(1.0)
     term.swap_panels = True
-    assert similarity(capture_rect(be, term, label), reference) < 0.9  # type: ignore[arg-type]
+    assert similarity(capture_rect(be, term, label), reference) < 0.9
     # the BUY at EURUSD's calibrated spot now belongs to GBPUSD
     click_rect(be, term, term.geometry().panels["EURUSD"].buy_button)
     assert term.order_clicks == [("GBPUSD", "BUY")]
@@ -375,7 +380,7 @@ def test_indicator_flicker_changes_between_captures() -> None:
     ind = term.geometry().indicator
     a = capture_rect(be, term, ind)
     b = capture_rect(be, term, ind)
-    assert changed_fraction(a, b) > 0  # type: ignore[arg-type]
+    assert changed_fraction(a, b) > 0
 
 
 # ------------------------------------------------------------------------------------------ fail-safe + log
