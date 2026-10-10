@@ -55,7 +55,9 @@ def ensure_dashboard_token(cfg: DeskConfig) -> tuple[str, bool]:
             return token, False
     token = secrets.token_urlsafe(32)
     tmp = path.with_suffix(".tmp")
-    os.close(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600))
+    # a fresh file of our own: a stale or planted one (a link, or explicit ACL entries on Windows) is not reused
+    tmp.unlink(missing_ok=True)
+    os.close(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
     _restrict_to_owner(tmp)  # before the token is in it
     with tmp.open("w", encoding="utf-8") as fh:
         fh.write(token + "\n")

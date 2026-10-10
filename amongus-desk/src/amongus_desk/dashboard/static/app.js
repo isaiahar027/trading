@@ -385,7 +385,7 @@
                 class: "btn",
                 type: "button",
                 text: option.label,
-                onclick: () => reconcile(item.id, question, option, option.needs_price === true && priceInput ? priceInput.value : ""),
+                onclick: () => reconcile(item.id, question, option, option.needs_price === true ? priceInput : null),
               }),
             ),
           ),
@@ -631,10 +631,15 @@
     }
   }
 
-  async function reconcile(id, question, option, price) {
-    const fill = price === "" ? null : Number(price);
-    if (fill !== null && !(Number.isFinite(fill) && fill > 0)) return toast("Reconcile: the price must be a positive number.", true);
-    const text = `${question ? `${question} ` : ""}Your answer after checking UniTrader: "${option.label}".`;
+  // The confirm text repeats the price: a number field drops what it can't parse (typing "1,2345" can leave
+  // "12345", or nothing), so the operator sees what will actually be sent.
+  async function reconcile(id, question, option, priceInput) {
+    const raw = priceInput ? priceInput.value.trim() : "";
+    const fill = raw === "" ? null : Number(raw);
+    const unreadable = Boolean(priceInput && priceInput.validity && priceInput.validity.badInput);
+    if (unreadable || (fill !== null && !(Number.isFinite(fill) && fill > 0))) return toast("Reconcile: the price must be a positive number.", true);
+    const priceNote = !priceInput ? "" : fill === null ? " No price entered: the desk uses its own estimate." : ` Price: ${fill}.`;
+    const text = `${question ? `${question} ` : ""}Your answer after checking UniTrader: "${option.label}".${priceNote}`;
     const ok = await confirmDialog({ title: "Reconcile", text, okLabel: "Confirm" });
     if (!ok) return;
     await act("Reconcile", () => api("/api/reconcile", { method: "POST", body: { id, outcome: option.outcome, fill_price: fill } }));

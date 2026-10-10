@@ -846,10 +846,11 @@ class UniTraderVenue:
             flow.record("dry_run", True, "dry run: stopping before typing")
             return None
         # 9. lot (and SL/TP) entry with clipboard read-back, then a read-back of what the terminal committed
+        typed: dict[str, str | None] = {}
         for entry in order.fields:
-            self._enter_value(flow, win, order, entry)
+            typed[entry.name] = self._enter_value(flow, win, order, entry)
             self._checkpoint(flow)
-        self._verify_committed(flow, win, order)
+        self._verify_committed(flow, win, order, typed)
         # 10. re-verify right before the click
         self._final_verify(flow, win, plan)
         return plan
@@ -893,8 +894,11 @@ class UniTraderVenue:
                 f"the UniTrader window lost the foreground before typing into the {order.symbol} panel "
                 f"(foreground: {foreground})",
             )
-        for name, ref in self._popup_templates():
-            if self._template_matches(win, ref):
+        # ONE screenshot for the dialogs and the panel label: this guard runs before every input.
+        popups = self._popup_templates()
+        shots = self._capture_regions(win, [order.panel.label.region, *(ref.region for _, ref in popups)])
+        for (name, ref), shot in zip(popups, shots[1:], strict=True):
+            if self._image_matches(shot, ref):
                 flow.fail(
                     stage,
                     f"{name} is already showing before typing into the {order.symbol} panel: deal with it in "
@@ -909,12 +913,16 @@ class UniTraderVenue:
                     f"something else is on top of the {entry.name} field of the {order.symbol} panel (window "
                     f"{owner} at {sx},{sy}); close it and retry",
                 )
-        label = self._check_label(win, order.symbol, order.panel)
+        label = self._check_label(win, order.symbol, order.panel, shot=shots[0])
         if not label.ok:
             flow.fail(stage, label.detail, **label.data)
 
-    def _enter_value(self, flow: _Flow, win: WindowInfo, order: _PanelOrder, entry: _FieldEntry) -> None:
-        """Type one value (or empty an SL/TP field), read it back, then commit it with ``commit_key``."""
+    def _enter_value(self, flow: _Flow, win: WindowInfo, order: _PanelOrder, entry: _FieldEntry) -> str | None:
+        """Type one value (or empty an SL/TP field), read it back, then commit it with ``commit_key``.
+
+        Returns the text the field read back right before the commit (None or "": it copied nothing; None also
+        without a read-back).
+        """
         self._guard_input(flow, win, order, (entry,), entry.stage)
         sx, sy = self._screen(win, entry.point)
         flow.input_used = True
@@ -922,26 +930,32 @@ class UniTraderVenue:
         self._delay()
         self._backend.hotkey("ctrl", "a")
         self._delay()
+        readback: str | None = None
         if entry.expected is None:
-            self._empty_field(flow, win, order, entry)
+            readback = self._empty_field(flow, win, order, entry)
         else:
             self._backend.type_text(entry.text)
             self._delay()
             flow.record(f"{entry.name}_typed", True, f"typed {entry.text!r} into the {entry.name} field")
             if self._cfg.lot_readback == "clipboard":
-                self._expect_value(flow, entry, self._copy_field(flow, win, order, entry), committed=False)
+                readback = self._copy_field(flow, win, order, entry)
+                self._expect_value(flow, entry, readback, committed=False)
             else:
                 flow.record(f"{entry.name}_readback", True, "read-back disabled (lot_readback: none)")
         self._commit(flow, win, order, entry)
+        return readback
 
-    def _empty_field(self, flow: _Flow, win: WindowInfo, order: _PanelOrder, entry: _FieldEntry) -> None:
-        """protective_orders: none: delete whatever an SL/TP field holds (its text is selected already)."""
+    def _empty_field(self, flow: _Flow, win: WindowInfo, order: _PanelOrder, entry: _FieldEntry) -> str | None:
+        """protective_orders: none: delete whatever an SL/TP field holds (its text is selected already).
+
+        Returns what the emptied field copies (None or "": nothing), or None without a read-back.
+        """
         if self._cfg.lot_readback != "clipboard":
             self._press(flow, win, order, entry, "backspace")
             flow.record(
                 f"{entry.name}_cleared", True, f"emptied the {entry.name} field (not verified: lot_readback: none)"
             )
-            return
+            return None
         # Prove first that the field takes the keys and copies (an empty field copies nothing, just like a broken
         # copy): type the probe over its text and read exactly the probe back...
         self._backend.type_text(CLEAR_PROBE)
@@ -956,7 +970,9 @@ class UniTraderVenue:
             )
         # ...then delete it (the read-back left all of it selected): now copying nothing means "empty".
         self._press(flow, win, order, entry, "backspace")
-        self._expect_empty(flow, entry, self._copy_field(flow, win, order, entry), committed=False)
+        text = self._copy_field(flow, win, order, entry)
+        self._expect_empty(flow, entry, text, committed=False)
+        return text
 
     def _commit(self, flow: _Flow, win: WindowInfo, order: _PanelOrder, entry: _FieldEntry) -> None:
         if self._cfg.commit_key != "none":
@@ -1019,7 +1035,7 @@ class UniTraderVenue:
                 hint = (
                     ": the terminal changed the value when it committed it (it rounds, clamps or reads numbers in "
                     "another format). Check "
-                    + ("lot_step, min_lot and max_lot" if entry.name == "lots" else "price_decimals, protective_units")
+                    + ("lot_step/min_lot/max_lot" if entry.name == "lots" else "price_decimals/protective_units")
                     + " and decimal_separator against UniTrader"
                 )
             flow.fail(
@@ -1042,11 +1058,14 @@ class UniTraderVenue:
         step = f"{entry.name}_committed" if committed else f"{entry.name}_cleared"
         flow.record(step, True, f"the {entry.name} field is empty{when}")
 
-    def _verify_committed(self, flow: _Flow, win: WindowInfo, order: _PanelOrder) -> None:
+    def _verify_committed(
+        self, flow: _Flow, win: WindowInfo, order: _PanelOrder, typed: Mapping[str, str | None]
+    ) -> None:
         """9b. Read every field back once more, after the terminal committed it (still before the click).
 
         The first read-back only proves that the keystrokes arrived. A terminal may round, clamp or re-parse a value
-        when the edit is committed, and the order goes out with the committed value.
+        when the edit is committed, and the order goes out with the committed value. ``typed`` holds what each field
+        read back right before its commit.
         """
         if self._cfg.lot_readback != "clipboard":
             return
@@ -1056,8 +1075,22 @@ class UniTraderVenue:
                 self._expect_empty(flow, entry, text, committed=True)
             else:
                 self._expect_value(flow, entry, text, committed=True)
-            # Leave every field as the configured flow does; committing the value it just showed changes nothing.
+            # Leave every field as the configured flow does; committing the value it just showed changes nothing...
             self._commit(flow, win, order, entry)
+            before, shown = typed[entry.name] or "", text or ""
+            if shown != before:
+                # ...unless the commit changed the text: then the next commit (this one, or leaving the field for
+                # the click) parses the terminal's own display, which need not read back as the same number (shown
+                # as "0,10" but parsed with "." as the decimal point, 0.10 becomes 10). It must not change again.
+                again = self._copy_field(flow, win, order, entry)
+                if (again or "") != shown:
+                    flow.fail(
+                        entry.stage,
+                        f"{entry.name} changed again when {self._cfg.commit_key} committed it a second time: "
+                        f"{_describe(shown)} became {'nothing' if again is None else _describe(again)}. The "
+                        "terminal does not read back the numbers it shows: check decimal_separator against UniTrader",
+                    )
+                flow.record(f"{entry.name}_stable", True, f"field still reads back {_describe(shown)}")
             self._checkpoint(flow)
 
     # ------------------------------------------------------------------ step 10
@@ -1311,14 +1344,20 @@ class UniTraderVenue:
                 fill_price=price,
                 fill_price_source="feed_estimate" if price is not None else "none",
             )
-        if error_seen is not None:
+        if error_seen is not None and samples > 0:
             return _Outcome(
                 IntentStatus.REJECTED,
                 f"the terminal showed an error after the click ({error_seen}) and the positions indicator did not "
                 "change",
                 "rejected",
             )
-        if dialog_state == "pending":
+        if error_seen is not None:
+            # An error dialog alone proves nothing if the indicator was never readable afterwards.
+            detail = (
+                f"the terminal showed an error after the click ({error_seen}) but the positions indicator could "
+                "not be checked"
+            )
+        elif dialog_state == "pending":
             detail = "the confirmation dialog never appeared"
         elif samples == 0:
             detail = (
@@ -1758,7 +1797,9 @@ class UniTraderVenue:
 
         return self._check_template("one_click_indicator", ref, win, failed)
 
-    def _check_label(self, win: WindowInfo, symbol: str, panel: PanelLayout) -> _Check:
+    def _check_label(
+        self, win: WindowInfo, symbol: str, panel: PanelLayout, *, shot: Image.Image | None = None
+    ) -> _Check:
         def failed(score: float, threshold: float) -> str:
             return (
                 f"the {symbol} panel label does not match the calibration (score {score:.2f} < {threshold:.2f}): the "
@@ -1766,7 +1807,7 @@ class UniTraderVenue:
                 "calibrate), then retry."
             )
 
-        return self._check_template(f"panel:{symbol}", panel.label, win, failed)
+        return self._check_template(f"panel:{symbol}", panel.label, win, failed, shot=shot)
 
     def _check_template_file(self, name: str, ref: TemplateRef) -> _Check:
         try:
@@ -1782,12 +1823,19 @@ class UniTraderVenue:
         return _Check(name, True, f"reference image {ref.image} loaded")
 
     def _check_template(
-        self, name: str, ref: TemplateRef, win: WindowInfo, failed: Callable[[float, float], str]
+        self,
+        name: str,
+        ref: TemplateRef,
+        win: WindowInfo,
+        failed: Callable[[float, float], str],
+        *,
+        shot: Image.Image | None = None,
     ) -> _Check:
+        """Match ``ref`` against a fresh capture of its region (or ``shot``, a capture of exactly that region)."""
         file_check = self._check_template_file(name, ref)
         if not file_check.ok:
             return file_check
-        score, delta, threshold = self._match(win, ref)
+        score, delta, threshold = self._match(win, ref, shot)
         data = {"score": round(score, 4), "threshold": threshold, "color_delta": round(delta, 2)}
         if score >= threshold and delta <= MAX_TEMPLATE_COLOR_DELTA:
             return _Check(name, True, f"matches the calibration (score {score:.3f})", data)
@@ -1796,9 +1844,10 @@ class UniTraderVenue:
             return _Check(name, False, detail, data)
         return _Check(name, False, failed(score, threshold), data)
 
-    def _match(self, win: WindowInfo, ref: TemplateRef) -> tuple[float, float, float]:
+    def _match(self, win: WindowInfo, ref: TemplateRef, shot: Image.Image | None = None) -> tuple[float, float, float]:
         template = self._template(ref)
-        shot = self._capture_region(win, ref.region)
+        if shot is None:
+            shot = self._capture_region(win, ref.region)
         threshold = ref.threshold if ref.threshold is not None else self._cfg.template_threshold
         return vision.similarity(shot, template), vision.mean_color_delta(shot, template), threshold
 

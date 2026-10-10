@@ -976,10 +976,12 @@ class DeskEngine:
         affected = linked + [
             p for p in self._book.active() if p.id == intent.position_id and p.close_intent_id != intent.id
         ]
+        # An operator price only describes a single position; close-all exits are estimated per position.
+        operator_price = fill_price if intent.purpose == "close" and len(affected) == 1 else None
         closed_positions = []
         for pos in affected:
-            price = fill_price or pos.last_price or pos.entry_price
-            source: Literal["operator", "feed_estimate"] = "operator" if fill_price else "feed_estimate"
+            price = operator_price or pos.last_price or pos.entry_price
+            source: Literal["operator", "feed_estimate"] = "operator" if operator_price else "feed_estimate"
             closed_positions.append(
                 self._book.close(pos.id, price=price, source=source, reason=ExitReason.RECONCILED, at=now)
             )
@@ -1061,7 +1063,8 @@ class DeskEngine:
                 options = _options("Yes, it is closed", "No, it is still open")
             else:
                 question = "Did close-all go through in UniTrader (no desk positions left open)?"
-                options = _options("Yes, everything closed", "No, positions are still open")
+                # One price can't describe several positions: their exits are estimated from the feed.
+                options = _options("Yes, everything closed", "No, positions are still open", ask_price=False)
             items.append(
                 {
                     "id": it.id,
@@ -1199,8 +1202,8 @@ class DeskEngine:
             log.exception("notifier failed")
 
 
-def _options(filled_label: str, not_filled_label: str) -> list[dict[str, Any]]:
+def _options(filled_label: str, not_filled_label: str, *, ask_price: bool = True) -> list[dict[str, Any]]:
     return [
-        {"outcome": "filled", "label": filled_label, "needs_price": True},
+        {"outcome": "filled", "label": filled_label, "needs_price": ask_price},
         {"outcome": "not_filled", "label": not_filled_label, "needs_price": False},
     ]

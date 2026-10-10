@@ -30,7 +30,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.routing import APIRoute
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from ..config import DeskConfig
@@ -207,6 +207,14 @@ class _FiniteJsonRoute(APIRoute):
 
 class _Body(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+    @field_validator("*", mode="before")
+    @classmethod
+    def _no_booleans(cls, value: Any) -> Any:
+        # No body field is a boolean; lax mode would otherwise read true as 1.0 for a price.
+        if isinstance(value, bool):
+            raise ValueError("booleans are not accepted here")
+        return value
 
 
 class KillBody(_Body):

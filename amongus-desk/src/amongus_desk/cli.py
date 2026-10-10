@@ -147,7 +147,10 @@ def _config_warnings(cfg: DeskConfig) -> list[str]:
                     "UniTrader's symbol specification; the desk will not trade it until you do"
                 )
         if cfg.execution.dry_run:
-            warnings.append("execution.dry_run is true: every check runs, nothing is typed or clicked")
+            warnings.append(
+                "execution.dry_run is true: every pre-click check runs, nothing is typed or clicked (so the lot "
+                "read-back is not exercised; `desk test-order` does that)"
+            )
     has_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")
     if cfg.llm.enabled and not has_key:
         warnings.append(

@@ -576,3 +576,18 @@ async def test_equity_without_a_sync_includes_old_realized_pnl(tmp_path: Path) -
     await rig.boot_and_run()
     assert rig.engine.state()["equity"]["estimate"] == 8000.0
     rig.close()
+
+
+@pytest.mark.anyio
+async def test_close_all_reconcile_never_applies_one_price_to_every_position(tmp_path: Path) -> None:
+    rig = Rig(tmp_path, venue=scripted(False))
+    await rig.boot_and_run()
+    (pos,) = rig.engine.book.active()
+    rig.venue.status = IntentStatus.UNCONFIRMED
+    await rig.engine.panic(by="op")
+    (item,) = [i for i in rig.engine.state()["reconcile"] if i["purpose"] == "close_all"]
+    assert [o["needs_price"] for o in item["options"]] == [False, False]
+    await rig.engine.reconcile(item["id"], "filled", fill_price=1.5, by="op")
+    (closed,) = rig.store.closed_positions_since(T0)
+    assert closed.id == pos.id and closed.exit_price != 1.5 and closed.exit_price_source == "feed_estimate"
+    rig.close()

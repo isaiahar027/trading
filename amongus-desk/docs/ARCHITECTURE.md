@@ -328,8 +328,9 @@ dedicated worker thread (`ThreadPoolExecutor(max_workers=1)`) behind a `threadin
 7. Positions-indicator baseline captured twice ~0.3 s apart; if `stability_check` and they differ → ABORTED.
 8. Input guard, before the first click into the panel: same window geometry, still the foreground, no
    calibrated dialog or error template showing (a stale confirmation's button may sit right over a field),
-   `root_window_at(point)` is our window for every field point, and the panel label still matches. The same
-   guard runs again right before every click into a field and every key press (commit key, backspace).
+   `root_window_at(point)` is our window for every field point, and the panel label still matches (dialogs and
+   label from ONE screenshot). The same guard runs again right before every click into a field and every key
+   press (commit key, backspace).
    `dry_run` → run the read-only step 10 too (close-all flows as well), then DRY_RUN (nothing typed or
    clicked, so only the read-backs are not exercised).
 9. Lot entry: click field, ctrl+a, type `format_lots`, then readback through the clipboard. Put a sentinel
@@ -342,7 +343,10 @@ dedicated worker thread (`ThreadPoolExecutor(max_workers=1)`) behind a `threadin
    not calibrated cannot be emptied; preflight warns the operator to keep them empty.
    After every field was committed, read each one back once more (fresh sentinel) and ABORT on any difference:
    the terminal may round, clamp or re-parse a value when it commits the edit, and the order goes out with the
-   committed value. Then commit_key again. `lot_readback: clipboard` needs `commit_key: tab|enter`, and
+   committed value. Then commit_key again; when the first commit changed the text (the terminal re-formats it),
+   read it once more and require the very same text, because leaving the field for the click commits it yet
+   again (shown as "0,10" but parsed with "." as the decimal point, 0.10 would become 10 there).
+   `lot_readback: clipboard` needs `commit_key: tab|enter`, and
    `commit_key: enter` needs the readback (Enter goes to whatever has the focus): config validation, preflight
    (`field_entry`) and the venue refuse the other combinations.
    The desk never reads or restores the operator's clipboard (it may hold the password they pasted into the
@@ -567,6 +571,8 @@ class DeskEngine:
 * The token file `data_dir/dashboard_token` (`wiring.ensure_dashboard_token`) is readable by the desk's user
   only, also when it already exists: mode 0600 on POSIX; on Windows, where that mode does nothing, `icacls`
   removes the inherited ACL entries and grants only the current user. A failure there is logged as a warning.
+  A new token goes into a freshly created temporary file (a stale one is deleted, never reused), restricted
+  before the token is written, then renamed into place.
 * The Host header must be in `dashboard.allowed_hosts` (port stripped), else 400 (DNS-rebinding guard).
 * Security headers on every response: `Content-Security-Policy: default-src 'self'; img-src 'self' data:;
   style-src 'self'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none';
@@ -592,7 +598,8 @@ class DeskEngine:
   vs limit), the crew board (vote and summary per crewmate), the emergency-meeting chat transcript with an
   "EMERGENCY MEETING" banner animation on new meetings, the positions table, recent orders, reconcile cards
   (each shows the item's `question` and one button per entry of its `options`, with the price field only
-  when an option has `needs_price`; without them, a position card asks "still open?", never "filled?"),
+  when an option has `needs_price`; without them, a position card asks "still open?", never "filled?"; the
+  confirm repeats the chosen answer and the price that will be sent, and an unreadable price is refused),
   kill/resume, a **hold-to-confirm** PANIC button (2 s press), manual meeting
   (symbol picker; force side only in paper mode), and estimated values labelled "est." everywhere. Mark
   the DEMO/LIVE mode badge loudly (LIVE in red).
@@ -608,7 +615,7 @@ class DeskEngine:
 (argparse; `-c/--config` defaults to `config/desk.yaml`).
 * `run` builds every component from the config. It takes the single-instance lock, configures logging and
   ensures the dashboard token (`DESK_DASHBOARD_TOKEN`, or one generated and saved to
-  `data_dir/dashboard_token` with 0600 permissions; printed once). For demo/live it runs the **login
+  `data_dir/dashboard_token`, readable by the operator's account only (0600, or icacls on Windows); printed once). For demo/live it runs the **login
   gate**: run the preflight; if it fails, print the failing checks and the instruction "Open UniTrader and
   log in to your DEMO account yourself (this tool never handles your password)". It re-checks every 30 s
   on its own and sends one alert on the first failure, with or without a TTY (a restarted desk in a

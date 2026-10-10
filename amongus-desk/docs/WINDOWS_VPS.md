@@ -70,7 +70,8 @@ is the one check it cannot exercise. Run it like that for a day before letting i
 
 During an order the desk reads the lot field back through the clipboard: it overwrites whatever is on the
 VPS clipboard and leaves it empty afterwards (it never reads or restores it), so do not keep anything there
-you need. With `protective_orders: none` it also empties the panel's stop-loss/take-profit fields before
+you need (while you are connected with Remote Desktop clipboard sharing, that is your own computer's
+clipboard too). With `protective_orders: none` it also empties the panel's stop-loss/take-profit fields before
 every order if you recorded them in `desk calibrate`; if you did not, keep them empty yourself (preflight
 reminds you).
 

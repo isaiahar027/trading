@@ -326,6 +326,22 @@ def test_dashboard_token_file_is_private_on_posix(tmp_path: Path) -> None:
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privileges on Windows")
+def test_dashboard_token_is_written_to_a_fresh_file(tmp_path: Path) -> None:
+    # A stale or planted temp file is replaced, not reused: written through, a link would hand the token to its
+    # target, and on Windows a reused file keeps explicit ACL entries that icacls /inheritance:r leaves alone.
+    cfg = desk_cfg(tmp_path)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.write_text("", encoding="utf-8")
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / f"{wiring.TOKEN_FILE}.tmp").symlink_to(elsewhere)
+    token, generated = wiring.ensure_dashboard_token(cfg)
+    path = tmp_path / "data" / wiring.TOKEN_FILE
+    assert generated and not path.is_symlink() and path.read_text(encoding="utf-8").strip() == token
+    assert elsewhere.read_text(encoding="utf-8") == ""
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
 class FakeIcacls:
     def __init__(self, returncode: int = 0, error: Exception | None = None) -> None:
         self.returncode = returncode

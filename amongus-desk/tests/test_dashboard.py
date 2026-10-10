@@ -140,7 +140,7 @@ def test_validation_rejects_unknown_fields(client: TestClient) -> None:
     assert client.post("/api/meeting", headers=AUTH, json={"symbol": "eurusd lower"}).status_code == 422
 
 
-@pytest.mark.parametrize("number", ["1e400", "-1e400", "Infinity", "-Infinity", "NaN", "0", "-1", "1e300"])
+@pytest.mark.parametrize("number", ["1e400", "-1e400", "Infinity", "-Infinity", "NaN", "0", "-1", "1e300", "true"])
 def test_non_finite_or_absurd_numbers_are_422(client: TestClient, rig: Rig, number: str) -> None:
     pos_id = rig.engine.book.active()[0].id
     body = f'{{"id": "{pos_id}", "outcome": "filled", "fill_price": {number}}}'
@@ -450,9 +450,21 @@ if (input.scenario === "rejected") {
     await advance(10);
     return text;
   };
-  out.confirmText = await answer(cards[0], input.answers[0], "1.2345");
-  await answer(cards[0], input.answers[1], "1.2345");
-  await answer(cards[2], input.answers[2], "");
+  // a number field holding something the browser can't parse reads as "" with validity.badInput
+  const field = cards[0].findAll((n) => n.tagName === "INPUT")[0];
+  const filledButton = buttons(cards[0]).find((b) => b.textContent === input.answers[0]);
+  if (field && filledButton) {
+    field.validity = { badInput: true };
+    filledButton.click();
+    await advance(10);
+    out.badInput = { open: byId("confirm-dialog").open, toast: byId("toast").textContent, posts: posts().length };
+    field.validity = { badInput: false };
+  }
+  out.confirmTexts = [
+    await answer(cards[0], input.answers[0], "1.2345"),
+    await answer(cards[0], input.answers[1], "1.2345"),
+    await answer(cards[2], input.answers[2], ""),
+  ];
   out.posts = posts();
 } else if (input.scenario === "dialogs") {
   respond = healthy;
@@ -581,7 +593,13 @@ def test_reconcile_cards_show_the_servers_question_and_options(tmp_path: Path, c
     assert cards[2]["buttons"] == ["No, it is closed", "Yes, it is still open"]
     assert cards[2]["question"] == "Is this position still open in UniTrader?"
     assert cards[3]["buttons"] == ["It filled", "Nothing happened"] and cards[3]["inputs"] == 1
-    assert "No, it is closed" in out["confirmText"] and "still open in UniTrader?" in out["confirmText"]
+    assert out["badInput"]["open"] is False and out["badInput"]["posts"] == 0
+    assert "price must be a positive number" in out["badInput"]["toast"]
+    closed, still_open, no_price = out["confirmTexts"]
+    assert "No, it is closed" in closed and "still open in UniTrader?" in closed
+    assert "Price: 1.2345." in closed  # the confirm shows what will be sent
+    assert "rice" not in still_open  # no price for "still open"
+    assert "No price entered" in no_price
     assert out["posts"] == [
         {"path": "/api/reconcile", "body": {"id": "pos1", "outcome": "filled", "fill_price": 1.2345}},
         {"path": "/api/reconcile", "body": {"id": "pos1", "outcome": "not_filled", "fill_price": None}},

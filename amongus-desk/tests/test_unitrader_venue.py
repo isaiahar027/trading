@@ -787,6 +787,39 @@ async def test_value_changed_by_the_commit_aborts(
     assert rig.terminal.field_text("EURUSD") == shown
 
 
+def shows_comma_parses_dot(kind: str, text: str) -> str:
+    """A simulated lot field that shows its committed value with a decimal comma but parses ',' as a thousands
+    separator: '0.10' commits as '0,10', and committing that again gives '10,00'."""
+    if kind != "lot":
+        return text
+    return format(Decimal(text.replace(",", "")).quantize(Decimal("0.01")), "f").replace(".", ",")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("key", ["tab", "enter"])
+async def test_value_that_changes_again_on_the_next_commit_aborts(rigs: Callable[..., Rig], key: str) -> None:
+    # '0,10' reads back as 0.10, but leaving the field (the BUY click) commits it once more and the order would go
+    # out with 10 lots. A value only counts once committing it again leaves the very same text.
+    rig = rigs(cfg={"commit_key": key})
+    rig.terminal.commit_transform = shows_comma_parses_dot
+    wa = rig.write_ahead()
+    report = await rig.venue.submit(intent(), QUOTE, wa)
+    assert_aborted_without_click(rig, report, wa, "lot_entry")
+    assert f"lots changed again when {key} committed it a second time: '0,10' became '10,00'" in report.message
+    assert "decimal_separator" in report.message
+    assert "lots_committed" in step_names(report)  # '0,10' did read back as 0.10 after the first commit
+
+
+@pytest.mark.anyio
+async def test_value_the_commit_only_reformats_is_confirmed(rigs: Callable[..., Rig]) -> None:
+    rig = rigs()
+    rig.terminal.commit_transform = lambda kind, text: text.rstrip("0") if kind == "lot" else text  # '0.10' -> '0.1'
+    report = await rig.venue.submit(intent(), QUOTE, rig.write_ahead())
+    assert report.status is IntentStatus.CONFIRMED, report.message
+    assert "lots_stable" in step_names(report)  # committing '0.1' once more left it as it was
+    assert rig.terminal.orders[0].lots == Decimal("0.1")
+
+
 @pytest.mark.anyio
 async def test_protective_field_changed_by_the_commit_aborts(rigs: Callable[..., Rig]) -> None:
     rig = rigs(terminal={"protective_fields": True}, cfg={"protective_orders": "panel_fields"})
@@ -1283,6 +1316,17 @@ async def test_error_dialog_is_rejected(rigs: Callable[..., Rig]) -> None:
 
 
 @pytest.mark.anyio
+async def test_error_dialog_without_a_readable_indicator_is_unconfirmed(rigs: Callable[..., Rig]) -> None:
+    # REJECTED promises "nothing happened"; an error dialog alone can't promise that if the positions
+    # indicator was never readable after the click.
+    rig = rigs(backend_cls=BlackAfterOrderClick)
+    rig.terminal.order_error = True
+    report = await rig.venue.submit(intent(), QUOTE, rig.write_ahead())
+    assert report.status is IntentStatus.UNCONFIRMED, report.message
+    assert report.evidence["fill_check"]["samples"] == 0 and "could not be checked" in report.message
+
+
+@pytest.mark.anyio
 async def test_error_dialog_plus_indicator_change_is_unconfirmed(rigs: Callable[..., Rig]) -> None:
     rig = rigs()
     rig.terminal.order_error = True
@@ -1519,6 +1563,19 @@ async def test_no_click_without_enough_time_left_to_confirm(rigs: Callable[..., 
     report = await rig.venue.submit(intent(), QUOTE, wa)
     assert_aborted_without_click(rig, report, wa, "deadline")
     assert "left" in report.message
+
+
+@pytest.mark.anyio
+async def test_a_full_order_fits_the_default_budget_with_slow_screenshots(rigs: Callable[..., Rig]) -> None:
+    # Lot + two emptied SL/TP fields, two dialogs and an error template: the input guard runs before every click
+    # and key, so it must take one screenshot, not one per template.
+    rig = rigs(
+        cfg={"fill_timeout_seconds": 8.0, "dialog_timeout_seconds": 3.0},
+        terminal={"protective_fields": True, "order_confirm_dialog": True, "close_all_confirm_dialog": True},
+    )
+    rig.backend.capture_hook = lambda *_: rig.clock.advance(0.15)
+    report = await rig.venue.submit(intent(), QUOTE, rig.write_ahead())
+    assert report.status is IntentStatus.CONFIRMED, report.message
 
 
 @pytest.mark.anyio

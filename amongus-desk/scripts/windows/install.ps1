@@ -33,6 +33,15 @@ if (-not (Test-Path ".env")) {
     Write-Host "Created .env from .env.example; fill in the keys you use." -ForegroundColor Yellow
 }
 
+# .env holds API keys; data\ holds the dashboard token, the database and screenshots of your terminal.
+# Make both readable by your Windows account only (other accounts on a shared VPS could read them).
+$account = "$env:USERDOMAIN\$env:USERNAME"
+New-Item -ItemType Directory -Force -Path "data" | Out-Null
+foreach ($item in @(@{ Path = ".env"; Grant = "${account}:F" }, @{ Path = "data"; Grant = "${account}:(OI)(CI)F" })) {
+    & icacls $item.Path /inheritance:r /grant:r $item.Grant | Out-Null
+    if ($LASTEXITCODE -ne 0) { Write-Warning "could not restrict $($item.Path) to $account; other accounts may read it" }
+}
+
 Write-Host ""
 Write-Host "Next steps:" -ForegroundColor Cyan
 Write-Host "  1. Open UniTrader and log in to your DEMO account yourself (the desk never handles your password)."
