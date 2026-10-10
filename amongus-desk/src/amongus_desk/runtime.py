@@ -16,6 +16,9 @@ from pathlib import Path
 from types import TracebackType
 
 _DESK_HANDLER_ATTR = "_amongus_desk_handler"
+# Windows byte-range locks are mandatory: lock one byte far past the PID text so other processes can
+# still read the PID (msvcrt.locking may lock beyond the end of the file).
+_WIN_LOCK_OFFSET = 1 << 20
 
 
 class AlreadyRunningError(RuntimeError):
@@ -63,7 +66,7 @@ class SingleInstanceLock:
         if sys.platform == "win32":
             import msvcrt  # noqa: PLC0415 - platform-specific
 
-            os.lseek(fd, 0, os.SEEK_SET)
+            os.lseek(fd, _WIN_LOCK_OFFSET, os.SEEK_SET)
             msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
         else:
             import fcntl  # noqa: PLC0415 - platform-specific
@@ -75,7 +78,7 @@ class SingleInstanceLock:
         if sys.platform == "win32":
             import msvcrt  # noqa: PLC0415
 
-            os.lseek(fd, 0, os.SEEK_SET)
+            os.lseek(fd, _WIN_LOCK_OFFSET, os.SEEK_SET)
             msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
         else:
             import fcntl  # noqa: PLC0415

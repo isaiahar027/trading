@@ -72,7 +72,7 @@ def test_no_partial_file_ever_visible(tmp_path: Path) -> None:
         while not stop.is_set():
             try:
                 raw = (tmp_path / "KILL").read_bytes()
-            except FileNotFoundError:
+            except (FileNotFoundError, PermissionError):  # Windows: sharing violation while being replaced
                 continue
             if raw:
                 try:

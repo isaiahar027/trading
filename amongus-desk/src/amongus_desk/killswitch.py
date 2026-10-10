@@ -28,7 +28,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from .clock import Clock, SystemClock
 from .domain import ensure_utc
@@ -47,6 +47,7 @@ _TMP_SUFFIX = ".tmp"
 # Windows refuses to replace/remove a file another process has open for a moment (e.g. a reader).
 _WINDOWS_RETRIES = 5
 _WINDOWS_RETRY_DELAY_SECONDS = 0.02
+_T = TypeVar("_T")
 
 
 class KillSwitchError(Exception):
@@ -131,7 +132,7 @@ class KillSwitch:
                 return _KillInfo(True, latched[0], latched[1], latched[2], "file")
             return _KillInfo(True, f"{KILL_FILE_NAME} entry present (not a regular file)", None, None, "file")
         try:
-            raw = _read_regular_file(self._path)
+            raw = _retry_on_windows(lambda: _read_regular_file(self._path))
         except OSError as exc:
             return _KillInfo(True, f"kill file present but unreadable ({exc.strerror or exc})", None, None, "file")
         parsed_reason, parsed_by, parsed_at = _parse_kill_file(raw)
@@ -309,14 +310,15 @@ def _clean(value: object, limit: int) -> str:
     return collapsed
 
 
-def _retry_on_windows(action: Callable[[], object]) -> None:
-    """Run ``action``; on Windows retry briefly on ``PermissionError`` (file momentarily held open)."""
+def _retry_on_windows(action: Callable[[], _T]) -> _T:
+    """Run ``action``; on Windows retry briefly on ``PermissionError`` (file momentarily held open or being
+    replaced by another writer)."""
     attempts = _WINDOWS_RETRIES if sys.platform == "win32" else 1
     for attempt in range(attempts):
         try:
-            action()
-            return
+            return action()
         except PermissionError:
             if attempt == attempts - 1:
                 raise
             time.sleep(_WINDOWS_RETRY_DELAY_SECONDS)
+    raise AssertionError("unreachable")
