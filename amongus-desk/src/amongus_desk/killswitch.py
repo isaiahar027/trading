@@ -226,18 +226,17 @@ class KillSwitch:
 
     def _fsync_dir(self) -> None:
         """Persist the rename/unlink itself (POSIX only; best effort)."""
-        if sys.platform == "win32":
-            return
-        try:
-            fd = os.open(self._dir, os.O_RDONLY)
-        except OSError:
-            return
-        try:
-            os.fsync(fd)
-        except OSError as exc:
-            log.debug("fsync of %s failed: %s", self._dir, exc)
-        finally:
-            os.close(fd)
+        if sys.platform != "win32":  # Windows cannot open a directory for fsync
+            try:
+                fd = os.open(self._dir, os.O_RDONLY)
+            except OSError:
+                return
+            try:
+                os.fsync(fd)
+            except OSError as exc:
+                log.debug("fsync of %s failed: %s", self._dir, exc)
+            finally:
+                os.close(fd)
 
     def _note_error(self, message: str) -> None:
         if message != self._last_error:

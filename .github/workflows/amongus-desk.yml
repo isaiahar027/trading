@@ -37,8 +37,8 @@ jobs:
           ruff format --check src tests
       - name: Mypy
         run: mypy
-      - name: Mypy (Windows platform view of the GUI backend)
+      - name: Mypy (Windows platform view)
         if: runner.os == 'Linux'
-        run: mypy --platform win32 src/amongus_desk/execution/unitrader/win32_backend.py
+        run: mypy --platform win32
       - name: Pytest
         run: pytest -q
