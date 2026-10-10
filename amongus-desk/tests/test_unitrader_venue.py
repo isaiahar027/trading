@@ -111,6 +111,45 @@ class ExplodingClick(FakeGuiBackend):
         super().click(x, y)
 
 
+class SwallowedClick(FakeGuiBackend):
+    """A click at ``target`` is logged but never reaches the terminal (e.g. a dialog button that ignores it)."""
+
+    target: tuple[int, int] | None = None
+
+    def click(self, x: int, y: int) -> None:
+        if (x, y) == self.target:
+            self._input("click", x, y)
+            self.terminal.after_input("click")
+            return
+        super().click(x, y)
+
+
+class BlackAfterOrderClick(FakeGuiBackend):
+    """Screenshots turn black once an order was clicked while the input desktop still reports available
+    (what a minimized remote-desktop session can look like)."""
+
+    def capture(self, left: int, top: int, width: int, height: int) -> Image.Image:
+        img = super().capture(left, top, width, height)
+        return Image.new("RGB", (width, height), (0, 0, 0)) if self.terminal.order_clicks else img
+
+
+class GatedHalt(Halt):
+    """Kill-switch stub whose first check (step 1, on the GUI worker) blocks until ``gate`` is set."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.gate = threading.Event()
+
+    def __call__(self) -> bool:
+        self.gate.wait(5)
+        return super().__call__()
+
+
+async def wait_for_event(event: threading.Event) -> None:
+    """Wait (without blocking the event loop) until a worker-thread event is set; 5 s safety limit."""
+    assert await asyncio.to_thread(event.wait, 5), "the GUI worker never reached the expected point"
+
+
 @dataclass
 class Rig:
     terminal: FakeTerminal
@@ -662,6 +701,25 @@ async def test_lot_field_ignoring_select_all(rigs: Callable[..., Rig]) -> None:
     assert rig.terminal.field_text("EURUSD") == "0.010.10"  # garbage stayed in the field, never sent
 
 
+class ForeignClipboardWriter(FakeGuiBackend):
+    """Another program (password manager, clipboard history) replaces the clipboard right before we read it."""
+
+    def get_clipboard_text(self) -> str | None:
+        if any(a.name == "hotkey" and a.args == ("ctrl", "c") for a in self.actions):
+            self.terminal.clipboard = "hunter2-Secret!"
+        return super().get_clipboard_text()
+
+
+@pytest.mark.anyio
+async def test_foreign_clipboard_text_is_never_echoed(rigs: Callable[..., Rig]) -> None:
+    rig = rigs(backend_cls=ForeignClipboardWriter)
+    wa = rig.write_ahead()
+    report = await rig.venue.submit(intent(), QUOTE, wa)
+    assert_aborted_without_click(rig, report, wa, "lot_entry")
+    assert "not shown" in report.message
+    assert "hunter2" not in report.model_dump_json()  # not in the message, the steps or any evidence
+
+
 @pytest.mark.anyio
 async def test_clipboard_sentinel_unchanged(rigs: Callable[..., Rig]) -> None:
     rig = rigs()
@@ -746,6 +804,75 @@ async def test_panel_swapped_after_typing(rigs: Callable[..., Rig]) -> None:
     wa = rig.write_ahead()
     report = await rig.venue.submit(intent(), QUOTE, wa)
     assert_aborted_without_click(rig, report, wa, "pre_click_verify")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("stability_check", [True, False])
+async def test_indicator_change_between_baseline_and_click_aborts(
+    rigs: Callable[..., Rig], stability_check: bool
+) -> None:
+    # Something else (another position, a stop at the broker) changes the indicator while the lot is typed:
+    # a later "change" would prove nothing about our order, so the click must not happen.
+    rig = rigs(cfg={"stability_check": stability_check})
+    rig.terminal.fill_enabled = False  # our order would never fill: a click here could only be a false CONFIRMED
+
+    def hook(term: FakeTerminal, name: str) -> None:
+        if name == "press" and not term.positions:
+            term.open_position("EURUSD", "SELL", Decimal("0.05"))
+
+    rig.terminal.on_action = hook
+    wa = rig.write_ahead()
+    report = await rig.venue.submit(intent(), QUOTE, wa)
+    assert_aborted_without_click(rig, report, wa, "pre_click_verify")
+    assert "between its baseline and the click" in report.message
+
+
+@pytest.mark.anyio
+async def test_stale_confirmation_dialog_is_never_confirmed(rigs: Callable[..., Rig]) -> None:
+    # A confirmation left open by an earlier order would swallow our click, and confirming it would execute
+    # THAT order (here 0.01 lots) while we report ours (0.10) as CONFIRMED.
+    rig = rigs(terminal={"order_confirm_dialog": True}, cfg={"lot_readback": "none"})
+    rig.terminal.show_dialog("order_confirm", ("EURUSD", "BUY"))
+    wa = rig.write_ahead()
+    report = await rig.venue.submit(intent(), QUOTE, wa)
+    assert_aborted_without_click(rig, report, wa, "pre_click_verify")
+    assert "order confirmation dialog is already showing" in report.message
+    assert rig.terminal.dialog == "order_confirm" and rig.terminal.dialog_confirms == 0
+    buy = rig.screen(rig.layout.layout.panels["EURUSD"].buy_button)
+    assert buy not in rig.backend.clicks()
+
+
+@pytest.mark.anyio
+async def test_stale_error_message_aborts_before_the_click(rigs: Callable[..., Rig]) -> None:
+    # Otherwise the old error would be read as a rejection of the new order (a false REJECTED).
+    rig = rigs(cfg={"lot_readback": "none"})
+    rig.terminal.show_dialog("error")
+    wa = rig.write_ahead()
+    report = await rig.venue.submit(intent(), QUOTE, wa)
+    assert_aborted_without_click(rig, report, wa, "pre_click_verify")
+    assert "error message" in report.message
+    assert not any(a.name == "press" and a.args == ("esc",) for a in rig.backend.actions)  # never dismissed
+
+
+@pytest.mark.anyio
+async def test_stale_dialog_blocks_close_all_too(rigs: Callable[..., Rig]) -> None:
+    rig = rigs(terminal={"close_all_confirm_dialog": True})
+    rig.terminal.open_position("EURUSD", "BUY", Decimal("0.10"))
+    rig.terminal.show_dialog("close_all_confirm")
+    wa = rig.write_ahead()
+    report = await rig.venue.close_all(close_all_intent(), wa)
+    assert_aborted_without_click(rig, report, wa, "pre_click_verify")
+    assert len(rig.terminal.positions) == 1
+
+
+@pytest.mark.anyio
+async def test_slow_write_ahead_never_clicks_past_the_budget(rigs: Callable[..., Rig]) -> None:
+    rig = rigs(cfg={"max_order_seconds": 10.0, "fill_timeout_seconds": 2.0})
+    wa = rig.write_ahead(on_call=lambda: rig.clock.advance(9.0))  # e.g. a slow disk under the store
+    report = await rig.venue.submit(intent(), QUOTE, wa)
+    assert report.status is IntentStatus.ABORTED and report.stage == "deadline", report.message
+    assert "write-ahead took too long" in report.message
+    assert wa.calls == 1 and report.clicked_at is None and rig.no_trade_click()
 
 
 @pytest.mark.anyio
@@ -1049,6 +1176,48 @@ async def test_popup_over_the_indicator_after_the_click_never_confirms(rigs: Cal
 
 
 @pytest.mark.anyio
+async def test_black_capture_after_the_click_never_confirms(rigs: Callable[..., Rig]) -> None:
+    # A black screenshot differs from the baseline in every pixel; it must never read as "the order filled".
+    rig = rigs(backend_cls=BlackAfterOrderClick)
+    rig.terminal.fill_enabled = False
+    report = await rig.venue.submit(intent(), QUOTE, rig.write_ahead())
+    assert report.status is IntentStatus.UNCONFIRMED and report.stage == "fill", report.message
+    assert rig.terminal.orders == []
+    check = report.evidence["fill_check"]
+    assert check["changed"] is False and check["samples"] == 0 and check["skipped"] > 0
+    assert "could not be checked" in report.message
+
+
+@pytest.mark.anyio
+async def test_confirmation_dialog_still_showing_never_confirms(rigs: Callable[..., Rig]) -> None:
+    # The simulated dialog overlaps the positions indicator in a 960x400 window (~1.4% of its pixels). If the
+    # confirm click does not dismiss it, the dialog itself "changes" the indicator beyond a 1% threshold; that
+    # must not count as a fill.
+    rig = rigs(
+        terminal={"order_confirm_dialog": True, "client_size": (960, 400)},
+        cfg={"change_threshold": 0.01},
+        backend_cls=SwallowedClick,
+    )
+    dialog = rig.layout.layout.order_dialog
+    assert dialog is not None and isinstance(rig.backend, SwallowedClick)
+    geo = rig.terminal.geometry()
+    assert geo.dialog.overlaps(geo.indicator)  # the scenario needs the overlap
+    rig.backend.target = rig.screen(dialog.confirm_button)
+    report = await rig.venue.submit(intent(), QUOTE, rig.write_ahead())
+    assert report.status is IntentStatus.UNCONFIRMED, report.message
+    assert rig.terminal.orders == [] and rig.terminal.dialog == "order_confirm"
+    assert rig.backend.clicks().count(rig.screen(dialog.confirm_button)) == 1  # tried once, never again
+
+
+@pytest.mark.anyio
+async def test_confirmation_dialog_over_the_indicator_still_confirms_a_real_fill(rigs: Callable[..., Rig]) -> None:
+    rig = rigs(terminal={"order_confirm_dialog": True, "client_size": (960, 400)}, cfg={"change_threshold": 0.01})
+    report = await rig.venue.submit(intent(), QUOTE, rig.write_ahead())
+    assert report.status is IntentStatus.CONFIRMED, report.message
+    assert len(rig.terminal.orders) == 1 and rig.terminal.dialog_confirms == 1
+
+
+@pytest.mark.anyio
 async def test_after_click_reports_are_never_aborted(rigs: Callable[..., Rig]) -> None:
     scenarios: list[Callable[[FakeTerminal], None]] = [
         lambda t: setattr(t, "fill_enabled", False),
@@ -1144,12 +1313,17 @@ async def test_max_order_seconds_bounds_the_whole_flow(rigs: Callable[..., Rig])
 
 @pytest.mark.anyio
 async def test_queue_time_counts_against_max_order_seconds(rigs: Callable[..., Rig]) -> None:
-    rig = rigs(cfg={"max_order_seconds": 3.0, "fill_timeout_seconds": 1.0})
+    halt = GatedHalt()  # holds the worker until BOTH submits have taken their start time (no race on the clock)
+    rig = rigs(cfg={"max_order_seconds": 3.0, "fill_timeout_seconds": 1.0}, halt=halt)
     rig.terminal.fill_enabled = False
-    first, second = await asyncio.gather(
-        rig.venue.submit(intent(), QUOTE, rig.write_ahead()),
-        rig.venue.submit(intent(Side.SELL), QUOTE, rig.write_ahead()),
-    )
+    tasks = [
+        asyncio.create_task(rig.venue.submit(intent(), QUOTE, rig.write_ahead())),
+        asyncio.create_task(rig.venue.submit(intent(Side.SELL), QUOTE, rig.write_ahead())),
+    ]
+    await asyncio.sleep(0)  # both coroutines run up to their first await: deadlines = T0 + 3 s
+    assert rig.clock.monotonic() == 0.0
+    halt.gate.set()
+    first, second = await asyncio.gather(*tasks)
     assert first.status is IntentStatus.UNCONFIRMED
     assert second.status is IntentStatus.ABORTED and second.stage == "deadline"
     assert rig.terminal.order_clicks == [("EURUSD", "BUY")]
@@ -1171,14 +1345,51 @@ async def test_stuck_worker_before_the_click_is_aborted_and_never_clicks_later(r
 
 @pytest.mark.anyio
 async def test_stuck_worker_after_the_click_is_unconfirmed(rigs: Callable[..., Rig]) -> None:
-    rig = rigs(hard_timeout=0.1)  # the click itself happens ~10 ms after submit
-    gate = threading.Event()
-    rig.backend.capture_hook = lambda *_: gate.wait(5) if rig.terminal.order_clicks else None
-    report = await rig.venue.submit(intent(), QUOTE, rig.write_ahead())
-    assert report.status is IntentStatus.UNCONFIRMED and report.stage == "watchdog_timeout"
-    gate.set()
-    await rig.venue.health()
-    assert rig.terminal.order_clicks == [("EURUSD", "BUY")]  # exactly one click, no retry
+    # The real-time watchdog must fire AFTER the click (~25 ms after submit on an idle machine). On a loaded
+    # machine the click can be later; then the watchdog legitimately aborts first, so retry with more room.
+    for hard_timeout in (0.1, 0.4, 1.6):
+        rig = rigs(hard_timeout=hard_timeout)
+        gate = threading.Event()
+        rig.backend.capture_hook = lambda *_, r=rig, g=gate: g.wait(5) if r.terminal.order_clicks else None
+        report = await rig.venue.submit(intent(), QUOTE, rig.write_ahead())
+        gate.set()
+        rig.venue._hard_timeout = 30.0
+        await rig.venue.health()  # queued behind the stuck job: returns once the worker is done with it
+        if report.status is IntentStatus.ABORTED:  # the watchdog won the race: then it must never click
+            assert report.stage == "watchdog_timeout" and rig.no_trade_click()
+            continue
+        assert report.status is IntentStatus.UNCONFIRMED and report.stage == "watchdog_timeout"
+        assert rig.terminal.order_clicks == [("EURUSD", "BUY")]  # exactly one click, no retry
+        break
+    else:
+        pytest.fail("the order never reached the click before the watchdog")
+
+
+@pytest.mark.anyio
+async def test_no_input_after_the_watchdog_gave_up(rigs: Callable[..., Rig]) -> None:
+    # Once UNCONFIRMED was reported the operator may already be reconciling from the terminal: a late confirm
+    # click by the resumed worker would open a position nobody tracks.
+    for hard_timeout in (0.1, 0.4, 1.6):
+        rig = rigs(hard_timeout=hard_timeout, terminal={"order_confirm_dialog": True})
+        gate = threading.Event()
+        rig.backend.capture_hook = lambda *_, r=rig, g=gate: g.wait(5) if r.terminal.order_clicks else None
+        report = await rig.venue.submit(intent(), QUOTE, rig.write_ahead())
+        if report.status is IntentStatus.ABORTED:  # the watchdog fired before the click (slow machine): retry
+            gate.set()
+            continue
+        assert report.status is IntentStatus.UNCONFIRMED and report.stage == "watchdog_timeout"
+        assert rig.terminal.dialog == "order_confirm"
+        inputs_at_report = len(rig.backend.input_actions())
+        gate.set()
+        rig.venue._hard_timeout = 30.0
+        await rig.venue.health()  # queued behind the stuck job: returns once the worker is done with it
+        assert rig.terminal.dialog_confirms == 0 and rig.terminal.dialog == "order_confirm"
+        assert rig.terminal.orders == []
+        later = [a for a in rig.backend.input_actions()[inputs_at_report:] if a.name != "move_mouse"]
+        assert later == []  # only the harmless mouse park, no click / key press
+        break
+    else:
+        pytest.fail("the order never reached the click before the watchdog")
 
 
 @pytest.mark.anyio
@@ -1201,9 +1412,15 @@ async def test_cancelled_submit_never_clicks_later(rigs: Callable[..., Rig]) -> 
 async def test_shutdown_cancels_queued_orders_without_clicking(rigs: Callable[..., Rig]) -> None:
     rig = rigs()
     gate = threading.Event()
-    rig.backend.capture_hook = lambda *_: gate.wait(5)
+    busy = threading.Event()
+
+    def block(*_: int) -> None:
+        busy.set()
+        gate.wait(5)
+
+    rig.backend.capture_hook = block
     first = asyncio.create_task(rig.venue.submit(intent(), QUOTE, rig.write_ahead()))
-    await asyncio.sleep(0.01)
+    await wait_for_event(busy)  # the first order is running on the worker (not merely queued)
     queued_wa = rig.write_ahead()
     second = asyncio.create_task(rig.venue.submit(intent(Side.SELL), QUOTE, queued_wa))
     await asyncio.sleep(0)

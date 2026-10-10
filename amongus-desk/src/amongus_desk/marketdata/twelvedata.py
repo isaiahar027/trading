@@ -9,6 +9,12 @@ Only the publicly documented parts of the API are used:
   forex), plus ``meta.interval`` when present;
 * error objects ``{"code": int, "message": str, "status": "error"}``, which may arrive with HTTP 200.
 
+Closed bars: a bar is used only once it closed at least ``poll_delay_seconds`` before the request was
+*sent* (``end + poll_delay <= sent_at``). Judging by the time the response arrived instead would accept
+a bar that was still forming when the provider built the answer, and a bar that closed a moment ago may
+not be final yet; either would then be yielded once and never corrected. A bar held back this way is
+picked up by a later poll.
+
 Error policy: 401/403 (HTTP status or error code) raise :class:`FeedError` because nothing will work
 until the operator fixes the key or plan. 429 blocks every request until the next UTC minute. Anything
 else (5xx, network trouble, malformed JSON, an unknown symbol) is logged, shown in :meth:`status` and
@@ -26,7 +32,6 @@ starts the day's counter from zero.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import math
 import threading
@@ -183,11 +188,12 @@ class TwelveDataFeed:
     """Polling ``MarketDataFeed`` over Twelve Data's ``time_series`` endpoint.
 
     Requests use each instrument's ``feed_symbol`` (e.g. ``EUR/USD``); yielded bars carry the broker
-    ``symbol`` (e.g. ``EURUSD``). The still-forming bar (``start + timeframe > now``) is never returned,
-    and a bar is yielded at most once. Polls happen once per bar close plus ``feed.poll_delay_seconds``
-    (see :meth:`next_poll_at`), only for instruments whose just-closed bar starts inside one of their
-    sessions unless ``twelvedata.poll_outside_sessions`` is set. All waiting goes through ``clock``, so
-    a ``ManualClock`` drives the whole schedule without real sleeps. There is no bid/ask, so
+    ``symbol`` (e.g. ``EURUSD``). A bar is returned only once it closed ``feed.poll_delay_seconds``
+    before the request was sent (so the still-forming bar never is), and a bar is yielded at most once.
+    Polls happen once per bar close plus ``feed.poll_delay_seconds`` (see :meth:`next_poll_at`), only
+    for instruments whose just-closed bar starts inside one of their sessions unless
+    ``twelvedata.poll_outside_sessions`` is set. All waiting goes through ``clock``, so a
+    ``ManualClock`` drives the whole schedule without real sleeps. There is no bid/ask, so
     :meth:`latest_quote` returns ``None``.
     """
 
@@ -218,6 +224,9 @@ class TwelveDataFeed:
         self._tf = timedelta(minutes=timeframe_minutes)
         self._interval = interval
         self._delay = timedelta(seconds=cfg.poll_delay_seconds)
+        # Closed bars that can still be inside the poll delay when a request is sent (0 unless the delay
+        # is at least one timeframe); every outputsize leaves room for them.
+        self._unsettled = int(self._delay // self._tf)
         self._url = self._td.base_url.rstrip("/") + "/time_series"
         self._api_key = key
         self._clock = clock
@@ -270,7 +279,7 @@ class TwelveDataFeed:
         if bars < 0:
             raise ValueError("bars must be >= 0")
         out: dict[str, list[Bar]] = {}
-        for symbol in symbols:
+        for symbol in dict.fromkeys(symbols):  # a repeated symbol must not cost a second credit
             inst = self._by_symbol.get(symbol)
             if inst is None:
                 log.warning("Twelve Data feed has no instrument %s; returning no warmup bars", symbol)
@@ -279,12 +288,14 @@ class TwelveDataFeed:
             if bars == 0:
                 out[symbol] = []
                 continue
-            fetched = await self._fetch_budgeted(inst, min(_MAX_OUTPUTSIZE, bars + 2), deadline=None)
-            if fetched is None:
+            outputsize = min(_MAX_OUTPUTSIZE, bars + 2 + self._unsettled)
+            result = await self._fetch_budgeted(inst, outputsize, deadline=None)
+            if result is None:
                 out[symbol] = []
                 continue
+            fetched, sent_at = result
             now = ensure_utc(self._clock.now())
-            closed = [b for b in fetched if b.end <= now][-bars:]
+            closed = self._settled(fetched, sent_at)[-bars:]
             with self._lock:
                 state = self._symbols[symbol]
                 if closed and (state.last_bar is None or closed[-1].start > state.last_bar.start):
@@ -304,8 +315,12 @@ class TwelveDataFeed:
         try:
             with self._lock:
                 if self._handled is None:
-                    # Bars that closed before the stream started are warmup's job, not the stream's.
-                    self._handled = self._due_boundary(ensure_utc(self._clock.now()))
+                    # Bars that closed before the stream started are warmup's job, not the stream's,
+                    # unless a bar closed (and its poll fell due) after warmup asked for it: then poll
+                    # right away instead of delivering that bar a whole timeframe late.
+                    due = self._due_boundary(ensure_utc(self._clock.now()))
+                    behind = any(s.last_bar is not None and s.last_bar.end < due for s in self._symbols.values())
+                    self._handled = due - self._tf if behind else due
             while not self._is_closed():
                 wake = self.next_poll_at()
                 with self._lock:
@@ -315,11 +330,12 @@ class TwelveDataFeed:
                     return
                 poll_time = max(ensure_utc(self._clock.now()), wake)
                 due = self._due_boundary(poll_time)
+                next_cycle = due + self._tf + self._delay
                 with self._lock:
                     self._handled = due
                     self._last_poll_at = poll_time
+                    self._next_poll = next_cycle
                     order = list(self._order)
-                next_cycle = due + self._tf + self._delay
                 deadline = self._clock.monotonic() + max(0.0, (next_cycle - poll_time).total_seconds())
                 just_closed = due - self._tf
                 missed: list[str] = []
@@ -329,11 +345,16 @@ class TwelveDataFeed:
                         continue
                     if self._is_closed():
                         return
-                    fetched = await self._fetch_budgeted(inst, self._poll_outputsize(symbol, due), deadline=deadline)
-                    if fetched is None:
+                    with self._lock:
+                        last = self._symbols[symbol].last_bar
+                    if last is not None and last.end >= due:
+                        continue  # nothing newer can have settled yet; don't spend a credit
+                    result = await self._fetch_budgeted(inst, self._poll_outputsize(symbol, due), deadline=deadline)
+                    if result is None:
                         missed.append(symbol)
                         continue
-                    for bar in self._accept(symbol, fetched):
+                    fetched, sent_at = result
+                    for bar in self._accept(symbol, fetched, sent_at):
                         yield bar
                 if missed:
                     with self._lock:
@@ -402,15 +423,21 @@ class TwelveDataFeed:
     def _poll_outputsize(self, symbol: str, due: datetime) -> int:
         with self._lock:
             last = self._symbols[symbol].last_bar
+        minimum = _MIN_POLL_OUTPUTSIZE + self._unsettled
         if last is None:
-            return _MIN_POLL_OUTPUTSIZE
+            return minimum
         missing = int((due - last.end) / self._tf)  # closed bars we have not seen yet, beyond the last one
-        return max(_MIN_POLL_OUTPUTSIZE, min(_MAX_OUTPUTSIZE, missing + 2))
+        return max(minimum, min(_MAX_OUTPUTSIZE, missing + 2 + self._unsettled))
 
-    def _accept(self, symbol: str, fetched: list[Bar]) -> list[Bar]:
-        """Closed bars newer than the last one yielded (only the latest one if nothing was seen yet)."""
+    def _settled(self, bars: list[Bar], sent_at: datetime) -> list[Bar]:
+        """Bars that had closed at least ``poll_delay_seconds`` before the request was sent."""
+        cutoff = sent_at - self._delay
+        return [b for b in bars if b.end <= cutoff]
+
+    def _accept(self, symbol: str, fetched: list[Bar], sent_at: datetime) -> list[Bar]:
+        """Settled bars newer than the last one yielded (only the latest one if nothing was seen yet)."""
         now = ensure_utc(self._clock.now())
-        closed = [b for b in fetched if b.end <= now]
+        closed = self._settled(fetched, sent_at)
         with self._lock:
             state = self._symbols[symbol]
             if state.last_bar is None:
@@ -428,8 +455,9 @@ class TwelveDataFeed:
 
     async def _fetch_budgeted(
         self, inst: InstrumentConfig, outputsize: int, *, deadline: float | None
-    ) -> list[Bar] | None:
-        """One request within the credit budget; ``None`` when skipped or failed (already recorded).
+    ) -> tuple[list[Bar], datetime] | None:
+        """One request within the credit budget: ``(bars, sent_at)``, or ``None`` when skipped or failed
+        (already recorded). ``sent_at`` is when the request went out, which decides what has closed.
 
         ``deadline`` (monotonic) bounds how long we may wait for credits; ``None`` waits as needed.
         """
@@ -454,7 +482,8 @@ class TwelveDataFeed:
                 continue
             attempts += 1
             try:
-                return await self._request(inst, outputsize)
+                # ``now`` was read just before the request with no await in between: it is the send time.
+                return await self._request(inst, outputsize), now
             except _RateLimitedError as exc:
                 until = self._block_until_next_minute()
                 self._record_error(inst.symbol, f"rate limited (429): {exc}; pausing until {until:%H:%M:%S} UTC")
@@ -493,9 +522,10 @@ class TwelveDataFeed:
             payload = None
         code: int | None = None
         message = ""
-        if isinstance(payload, dict) and (
+        is_error = isinstance(payload, dict) and (
             payload.get("status") == "error" or ("code" in payload and "values" not in payload)
-        ):
+        )
+        if isinstance(payload, dict) and is_error:
             code = _as_int(payload.get("code"))
             message = self._clean(str(payload.get("message", "")))
         if not message and http_status >= 400:
@@ -512,7 +542,7 @@ class TwelveDataFeed:
             raise FeedError(text)
         if http_status == 429 or code == 429:
             raise _RateLimitedError(message or "too many requests")
-        if code is not None or http_status >= 400:
+        if is_error or http_status >= 400:
             raise _TransientError(f"{inst.feed_symbol}: Twelve Data error (HTTP {http_status}, code {code}): {message}")
         if not isinstance(payload, dict):
             raise _TransientError(f"{inst.feed_symbol}: malformed response (not a JSON object)")
@@ -626,9 +656,9 @@ class TwelveDataFeed:
             await asyncio.wait({sleeper, closer}, return_when=asyncio.FIRST_COMPLETED)
         finally:
             for task in (sleeper, closer):
-                if not task.done():
-                    task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await task
-        if sleeper.done() and not sleeper.cancelled():
+                task.cancel()
+            # gather() collects the helpers' own CancelledErrors but still raises one aimed at *this*
+            # task while they wind down (awaiting each under suppress(CancelledError) would swallow it).
+            await asyncio.gather(sleeper, closer, return_exceptions=True)
+        if not sleeper.cancelled():
             sleeper.result()  # surface clock errors instead of swallowing them

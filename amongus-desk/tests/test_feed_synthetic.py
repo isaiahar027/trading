@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import itertools
 import json
+import logging
 import math
 import os
 import random
@@ -329,6 +330,17 @@ def test_explicit_start_is_used_as_given() -> None:
     assert feed.start == start
 
 
+def test_naive_explicit_start_is_rejected() -> None:
+    with pytest.raises(ValueError, match="timezone-aware"):
+        make_feed(start=datetime(2026, 1, 2, 3, 4))  # deliberately naive
+
+
+def test_unknown_base_price_keys_are_reported(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.WARNING):
+        make_feed(base_prices={"EURUSD": 1.1, "EURUSDX": 1.1})
+    assert "EURUSDX" in caplog.text
+
+
 @pytest.mark.anyio
 async def test_base_price_from_config_is_the_price_at_the_start() -> None:
     feed = make_feed(base_prices={"EURUSD": 1.0850}, max_bars=1)
@@ -524,3 +536,18 @@ def test_invalid_arguments_are_rejected() -> None:
         SyntheticFeed(FeedConfig(), [make_instrument(), make_instrument()], 5, clock)
     with pytest.raises(ValueError, match="too small"):
         SyntheticFeed(feed_cfg(base_prices={"EURUSD": 0.0001}), [make_instrument()], 5, clock)
+
+
+@pytest.mark.anyio
+async def test_abandoning_the_stream_mid_step_loses_no_bars() -> None:
+    insts = [make_instrument(), gbpusd()]
+    feed = make_feed(instruments=insts, max_bars=3)
+    gen = feed.stream()
+    async with contextlib.aclosing(gen):
+        first = await gen.__anext__()  # EURUSD of step 0; GBPUSD of step 0 is still pending
+    assert first.symbol == "EURUSD"
+    assert feed.status()["exhausted"] is False
+    rest = await collect(feed)
+    reference = await collect(make_feed(instruments=insts, max_bars=3))
+    assert as_tuples([first, *rest]) == as_tuples(reference)
+    assert feed.status()["exhausted"] is True

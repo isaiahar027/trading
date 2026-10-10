@@ -874,13 +874,22 @@ class UniTraderVenue:
                 "selected/copied (ctrl+a/ctrl+c had no effect)",
             )
         value = parse_lots(got)
-        if value is None or value != entry.expected:
+        if value is None:
+            # Never echo non-numeric clipboard text into reports, logs or alerts: if anything else wrote to the
+            # clipboard in between, it could be the operator's own data (e.g. a password copied for the login).
             flow.fail(
                 stage,
-                f"{entry.name} read-back mismatch: typed {entry.text!r} but the field shows {got.strip()!r}",
-                readback=got.strip()[:64],
+                f"{entry.name} read-back mismatch: typed {entry.text!r} but the field does not read back as a "
+                f"number ({len(got.strip())} characters, not shown)",
             )
-        flow.record(f"{entry.name}_readback", True, f"field reads back {got.strip()!r}", readback=got.strip()[:64])
+        shown = got.strip()[:32]
+        if value != entry.expected:
+            flow.fail(
+                stage,
+                f"{entry.name} read-back mismatch: typed {entry.text!r} but the field shows {shown!r}",
+                readback=shown,
+            )
+        flow.record(f"{entry.name}_readback", True, f"field reads back {shown!r}", readback=shown)
 
     # ------------------------------------------------------------------ step 10
     def _final_verify(self, flow: _Flow, win: WindowInfo, plan: _ClickPlan) -> None:
@@ -908,6 +917,29 @@ class UniTraderVenue:
         if plan.label is not None:
             symbol, panel = plan.label
             flow.check("pre_click_verify", self._check_label(win, symbol, panel))
+        # A dialog that is already open would swallow our click, or be confirmed by the post-click logic as if
+        # our order had caused it (a stale confirmation would execute a *previous* order), and a stale error
+        # dialog would turn into a false REJECTED. The desk never handles a dialog it did not cause.
+        for name, ref in self._popup_templates():
+            if self._template_matches(win, ref):
+                flow.fail(
+                    "pre_click_verify",
+                    f"{name} is already showing before the click: deal with it in UniTrader yourself, then retry",
+                )
+        # The fill check compares against the step-7 baseline; if the indicator moved since then (another
+        # position opening/closing, or our own typing showing up in the region) a later change proves nothing.
+        region = self._layout.layout.positions_indicator
+        if not self._region_unobstructed(win, region):
+            flow.fail("pre_click_verify", "something covers the positions indicator; close it and retry")
+        drift = vision.changed_fraction(plan.baseline, self._capture_region(win, region))
+        moved = drift > 0.0 if self._cfg.stability_check else drift >= self._cfg.change_threshold
+        if moved:
+            flow.fail(
+                "pre_click_verify",
+                f"the positions indicator changed ({drift:.1%} of its pixels) between its baseline and the click: a "
+                "position may be opening/closing, or the calibrated region is not static; check the terminal",
+                changed=round(drift, 4),
+            )
         sx, sy = self._screen(win, plan.point)
         owner = self._backend.root_window_at(sx, sy)
         if owner != win.handle:
@@ -917,7 +949,9 @@ class UniTraderVenue:
             )
         if plan.check_halt and self._halted():
             flow.fail("halted", "kill switch engaged before the click")
-        flow.record("pre_click_verify", True, f"window, focus, label and {plan.what} verified")
+        flow.record(
+            "pre_click_verify", True, f"window, focus, label, dialogs, positions indicator and {plan.what} verified"
+        )
 
     # ------------------------------------------------------------------ step 11
     def _click(self, flow: _Flow, plan: _ClickPlan, on_before_click: BeforeClick) -> None:
@@ -944,6 +978,14 @@ class UniTraderVenue:
         flow.record("write_ahead", True, "write-ahead marker persisted")
         if plan.check_halt and self._halted():
             flow.fail("halted", "kill switch engaged right before the click")
+        # The hook may block (disk, database); never click past the budget that the check above granted.
+        remaining = flow.deadline - self._clock.monotonic()
+        if remaining < needed:
+            flow.fail(
+                "deadline",
+                f"the write-ahead took too long: only {remaining:.1f}s of max_order_seconds left but confirming the "
+                f"result needs up to {needed:.1f}s",
+            )
         if not flow.ctl.begin_click():
             flow.fail("abandoned", "the caller stopped waiting for this order")
         sx, sy = self._screen(win, plan.point)
@@ -1036,12 +1078,17 @@ class UniTraderVenue:
         streak = 0
         last_change = 0.0
         samples = 0
+        skipped = 0
         for _ in range(max_iterations):
+            if self._caller_gone(flow):
+                break
             # error dialogs (12)
             if error_seen is None:
                 for i, ref in enumerate(lay.error_templates):
                     if self._template_matches(win, ref):
                         error_seen = f"error_templates[{i}]"
+                        if self._caller_gone(flow):
+                            break
                         flow.record("error_dialog", False, f"{error_seen} matched after the click; pressing esc")
                         self._backend.press("esc")
                         self._delay()
@@ -1049,6 +1096,8 @@ class UniTraderVenue:
             # confirmation dialog (12)
             if dialog_state == "pending" and plan.dialog is not None and error_seen is None:
                 if self._template_matches(win, plan.dialog.template):
+                    if self._caller_gone(flow):
+                        break
                     cx, cy = self._screen(win, plan.dialog.confirm_button)
                     self._backend.click(cx, cy)
                     dialog_state = "confirmed"
@@ -1058,9 +1107,10 @@ class UniTraderVenue:
                     dialog_state = "absent"
                     flow.record("order_dialog", True, "no confirmation dialog appeared")
             # positions indicator (13)
-            change = self._indicator_change(win, plan.baseline)
+            change = self._indicator_change(win, plan)
             if change is None:
                 streak = 0
+                skipped += 1
             else:
                 samples += 1
                 last_change = change
@@ -1077,6 +1127,7 @@ class UniTraderVenue:
             "last_change": round(last_change, 4),
             "threshold": cfg.change_threshold,
             "samples": samples,
+            "skipped": skipped,
             "dialog": dialog_state,
             "error": error_seen,
         }
@@ -1104,21 +1155,51 @@ class UniTraderVenue:
             )
         if dialog_state == "pending":
             detail = "the confirmation dialog never appeared"
+        elif samples == 0:
+            detail = (
+                "the positions indicator could not be checked (terminal not in front, indicator covered, account "
+                "badge not visible or the confirmation dialog still showing)"
+            )
         else:
             detail = f"the positions indicator did not change within {cfg.fill_timeout_seconds:g}s"
         return _Outcome(IntentStatus.UNCONFIRMED, f"{detail}; check the terminal and reconcile", "fill")
 
-    def _indicator_change(self, win: WindowInfo, baseline: Image.Image) -> float | None:
-        """Changed fraction of the positions indicator, or None when the sample can't be trusted."""
-        region = self._layout.layout.positions_indicator
+    @staticmethod
+    def _caller_gone(flow: _Flow) -> bool:
+        """After the click: True (and recorded) once the caller gave up on this order.
+
+        The watchdog has then already reported UNCONFIRMED and the operator may be reconciling from the terminal;
+        a late confirm click would create a position nobody tracks, so the worker stops touching the terminal.
+        """
+        if not flow.ctl.abandoned:
+            return False
+        if not any(step["step"] == "abandoned" for step in flow.steps):
+            flow.record("abandoned", False, "the caller stopped waiting after the click; no further input")
+        return True
+
+    def _indicator_change(self, win: WindowInfo, plan: _ClickPlan) -> float | None:
+        """Changed fraction of the positions indicator, or None when the sample can't be trusted.
+
+        The indicator, the account badge and (if calibrated) the confirmation dialog come from ONE screenshot:
+        the sample only counts when that screenshot provably shows our terminal on the calibrated account (a
+        black/garbage capture, e.g. from a minimized remote-desktop session, would otherwise look like a big
+        change) and our confirmation dialog is no longer drawn over it.
+        """
+        lay = self._layout.layout
+        region = lay.positions_indicator
         if not self._backend.input_desktop_available() or self._backend.foreground_window() != win.handle:
             return None
         if not self._region_unobstructed(win, region):
             return None
-        shot = self._capture_region(win, region)
+        refs = [lay.account_badge] + ([plan.dialog.template] if plan.dialog is not None else [])
+        shots = self._capture_regions(win, [region, *(ref.region for ref in refs)])
         if not self._backend.input_desktop_available():
             return None
-        return vision.changed_fraction(baseline, shot)
+        if not self._image_matches(shots[1], lay.account_badge):
+            return None
+        if plan.dialog is not None and self._image_matches(shots[2], plan.dialog.template):
+            return None
+        return vision.changed_fraction(plan.baseline, shots[0])
 
     # ------------------------------------------------------------------ step 14
     def _finish(self, flow: _Flow, outcome: _Outcome) -> None:
@@ -1509,16 +1590,38 @@ class UniTraderVenue:
         return vision.similarity(shot, template), vision.mean_color_delta(shot, template), threshold
 
     def _template_matches(self, win: WindowInfo, ref: TemplateRef) -> bool:
-        """Strict boolean match used after the click (an unloadable/blank template never matches)."""
+        """Strict boolean match of a fresh capture (an unloadable/blank template never matches)."""
+        if self._usable_template(ref) is None:
+            return False
+        return self._image_matches(self._capture_region(win, ref.region), ref)
+
+    def _usable_template(self, ref: TemplateRef) -> Image.Image | None:
         try:
             template = self._template(ref)
         except (OSError, ValueError) as exc:
             log.warning("template %s unusable: %s", ref.image, exc)
+            return None
+        return None if vision.is_blank(template) else template
+
+    def _image_matches(self, shot: Image.Image, ref: TemplateRef) -> bool:
+        """Does an already captured image of ``ref.region`` match the reference (same rule as the checks)?"""
+        template = self._usable_template(ref)
+        if template is None or shot.size != template.size:
             return False
-        if vision.is_blank(template):
-            return False
-        score, delta, threshold = self._match(win, ref)
-        return score >= threshold and delta <= MAX_TEMPLATE_COLOR_DELTA
+        threshold = ref.threshold if ref.threshold is not None else self._cfg.template_threshold
+        score = vision.similarity(shot, template)
+        return score >= threshold and vision.mean_color_delta(shot, template) <= MAX_TEMPLATE_COLOR_DELTA
+
+    def _popup_templates(self) -> list[tuple[str, TemplateRef]]:
+        """Calibrated dialogs and error messages: none of them may be showing before a click."""
+        lay = self._layout.layout
+        out: list[tuple[str, TemplateRef]] = []
+        if lay.order_dialog is not None:
+            out.append(("the order confirmation dialog", lay.order_dialog.template))
+        if lay.close_all_dialog is not None:
+            out.append(("the close-all confirmation dialog", lay.close_all_dialog.template))
+        out.extend((f"an error message (error_templates[{i}])", ref) for i, ref in enumerate(lay.error_templates))
+        return out
 
     # ================================================================== helpers (worker thread)
     def _template(self, ref: TemplateRef) -> Image.Image:
@@ -1537,6 +1640,18 @@ class UniTraderVenue:
         if img.size != (region.w, region.h):
             raise BackendError(f"capture returned {img.size[0]}x{img.size[1]}, expected {region.w}x{region.h}")
         return img if img.mode == "RGB" else img.convert("RGB")
+
+    def _capture_regions(self, win: WindowInfo, regions: Sequence[Region]) -> list[Image.Image]:
+        """Crops of several client regions taken from ONE screenshot of their bounding box (atomic)."""
+        x0 = min(r.x for r in regions)
+        y0 = min(r.y for r in regions)
+        x1 = max(r.x + r.w for r in regions)
+        y1 = max(r.y + r.h for r in regions)
+        img = self._backend.capture(win.client_left + x0, win.client_top + y0, x1 - x0, y1 - y0)
+        if img.size != (x1 - x0, y1 - y0):
+            raise BackendError(f"capture returned {img.size[0]}x{img.size[1]}, expected {x1 - x0}x{y1 - y0}")
+        rgb = img if img.mode == "RGB" else img.convert("RGB")
+        return [rgb.crop((r.x - x0, r.y - y0, r.x - x0 + r.w, r.y - y0 + r.h)) for r in regions]
 
     def _capture_client(self, win: WindowInfo) -> Image.Image:
         return self._backend.capture(win.client_left, win.client_top, win.client_width, win.client_height)

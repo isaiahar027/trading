@@ -97,20 +97,22 @@ def _parse_number(path: Path, line: int, column: str, text: str, *, positive: bo
     return number
 
 
-def _header(path: Path, cells: list[str]) -> dict[str, int]:
+def _header(path: Path, line: int, cells: list[str]) -> dict[str, int]:
     names = [c.strip().lower() for c in cells]
     columns: dict[str, int] = {}
     for index, name in enumerate(names):
         if name in columns:
-            raise CsvFormatError(path, 1, f"column {name!r} appears twice in the header")
+            raise CsvFormatError(path, line, f"column {name!r} appears twice in the header")
         columns[name] = index
     expected = "symbol,start,open,high,low,close[,volume]"
     missing = [c for c in REQUIRED_COLUMNS if c not in columns]
     if missing:
-        raise CsvFormatError(path, 1, f"missing column(s) {', '.join(missing)} (expected {expected})")
+        raise CsvFormatError(path, line, f"missing column(s) {', '.join(missing)} (expected {expected})")
     unknown = [n for n in names if n not in REQUIRED_COLUMNS and n not in OPTIONAL_COLUMNS]
     if unknown:
-        raise CsvFormatError(path, 1, f"unexpected column(s) {', '.join(map(repr, unknown))} (expected {expected})")
+        raise CsvFormatError(
+            path, line, f"unexpected column(s) {', '.join(map(repr, unknown))} (expected {expected})"
+        )
     return columns
 
 
@@ -129,7 +131,7 @@ def _read_rows(path: Path) -> list[_Row]:
                 if not cells or all(not c.strip() for c in cells):
                     continue  # blank line
                 if columns is None:
-                    columns = _header(path, cells)
+                    columns = _header(path, line, cells)  # the first non-blank line, wherever it is
                     continue
                 if len(cells) != len(columns):
                     raise CsvFormatError(path, line, f"expected {len(columns)} fields, found {len(cells)}")
@@ -278,7 +280,9 @@ class CsvReplayFeed:
             raise RuntimeError("warmup() must be called before stream()")
         out: dict[str, list[Bar]] = {}
         with self._lock:
-            for symbol in symbols:
+            # A repeated symbol must not consume a second slice: those bars would be returned under the
+            # same key as the first slice (overwriting it), so neither warmup nor the stream would see them.
+            for symbol in dict.fromkeys(symbols):
                 series = self._bars.get(symbol)
                 if series is None:
                     out[symbol] = []

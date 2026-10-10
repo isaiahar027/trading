@@ -5,11 +5,15 @@ that drifts gently one way), then a short directional expansion, then ordinary n
 makes volatility breakouts actually happen, so the whole crew can be exercised without a data vendor.
 
 Nothing here models a real market, a real broker or the UniTrader terminal: every number is made up.
+Because the expansions are built to follow through, backtests on synthetic bars flatter a breakout
+strategy; they exercise the plumbing and say nothing about edge in real markets.
 
 Determinism: each symbol gets its own generators, seeded from ``synthetic.seed`` and ``zlib.crc32`` of
 the symbol (never ``hash()``, which is salted per process). Only ``random.Random.random()`` is used,
 because CPython guarantees that sequence across versions for a given integer seed. Same seed + symbol +
-start time gives the same bars on every run and every machine.
+start time gives the same bars on every run (and, since prices are rounded to the instrument's
+decimals, in practice on every machine; the platform's ``exp``/``log`` could in principle differ in the
+last bit).
 
 History (:meth:`SyntheticFeed.warmup`) is generated *backwards* from the start time with a separate
 generator, so it ends exactly at the start price, does not depend on how many bars were requested, and
@@ -19,13 +23,13 @@ never changes the bars that :meth:`SyntheticFeed.stream` produces afterwards.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import enum
 import logging
 import math
 import random
 import threading
 import zlib
+from collections import deque
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -269,6 +273,9 @@ class SyntheticFeed:
             self._start = ensure_utc(self._cfg.start)
         else:
             self._start = _floor_to_timeframe(ensure_utc(clock.now()), self._tf)
+        unknown = sorted(set(self._cfg.base_prices) - set(symbols))
+        if unknown:
+            log.warning("synthetic.base_prices has no instrument for %s (ignored)", ", ".join(unknown))
         self._series: dict[str, _SymbolSeries] = {}
         for inst in instruments:
             base = self._cfg.base_prices.get(inst.symbol, _DEFAULT_BASE_PIPS * inst.pip_size)
@@ -278,6 +285,7 @@ class SyntheticFeed:
         self._lock = threading.Lock()
         self._step = 0
         self._emitted = 0
+        self._pending: deque[Bar] = deque()  # bars of the current step not yet handed out
         self._last: dict[str, Bar] = {}
         self._streaming = False
         self._closed = False
@@ -317,22 +325,24 @@ class SyntheticFeed:
         try:
             first = True
             while not self._is_closed():
-                if self._max_bars is not None and self._step >= self._max_bars:
-                    return
-                if not first:
-                    await self._sleep(self._cfg.interval_seconds)
-                    if self._is_closed():
+                if not self._pending:
+                    if self._max_bars is not None and self._step >= self._max_bars:
                         return
-                first = False
-                start = self._start + self._step * self._tf
-                step_bars = [series.next_bar(start) for series in self._series.values()]
-                with self._lock:
-                    self._step += 1
-                for bar in step_bars:
+                    if not first:
+                        await self._sleep(self._cfg.interval_seconds)
+                        if self._is_closed():
+                            return
+                    start = self._start + self._step * self._tf
+                    step_bars = [series.next_bar(start) for series in self._series.values()]
                     with self._lock:
-                        self._last[bar.symbol] = bar
-                        self._emitted += 1
-                    yield bar
+                        self._pending.extend(step_bars)
+                        self._step += 1
+                first = False
+                with self._lock:
+                    bar = self._pending.popleft()
+                    self._last[bar.symbol] = bar
+                    self._emitted += 1
+                yield bar
         finally:
             self._streaming = False
 
@@ -372,7 +382,7 @@ class SyntheticFeed:
                 "steps": self._step,
                 "bars_emitted": self._emitted,
                 "max_bars": self._max_bars,
-                "exhausted": self._max_bars is not None and self._step >= self._max_bars,
+                "exhausted": self._max_bars is not None and self._step >= self._max_bars and not self._pending,
                 "closed": self._closed,
                 "symbols": symbols,
             }
@@ -397,9 +407,9 @@ class SyntheticFeed:
             await asyncio.wait({sleeper, closer}, return_when=asyncio.FIRST_COMPLETED)
         finally:
             for task in (sleeper, closer):
-                if not task.done():
-                    task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await task
-        if sleeper.done() and not sleeper.cancelled():
+                task.cancel()
+            # gather() collects the helpers' own CancelledErrors but still raises one aimed at *this*
+            # task while they wind down (awaiting each under suppress(CancelledError) would swallow it).
+            await asyncio.gather(sleeper, closer, return_exceptions=True)
+        if not sleeper.cancelled():
             sleeper.result()  # surface clock errors instead of swallowing them

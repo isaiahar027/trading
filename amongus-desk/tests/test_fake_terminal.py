@@ -77,6 +77,21 @@ def test_constructor_validation() -> None:
         FakeTerminal(("A1", "B1", "C1", "D1"), client_size=(600, 400))
 
 
+@pytest.mark.parametrize("size", [(500, 600), (700, 600)])
+def test_narrow_client_area_is_rejected_instead_of_overlapping_widgets(size: tuple[int, int]) -> None:
+    # 500 px: the positions indicator would stick out of the window; 700 px: the close-all button would sit
+    # on top of the positions indicator.
+    with pytest.raises(ValueError, match="too small"):
+        FakeTerminal(client_size=size)
+
+
+def test_rect_overlaps() -> None:
+    a = Rect(0, 0, 10, 10)
+    assert a.overlaps(Rect(9, 9, 5, 5)) and Rect(9, 9, 5, 5).overlaps(a)
+    assert not a.overlaps(Rect(10, 0, 5, 5))  # touching edges share no pixel
+    assert not a.overlaps(Rect(0, 10, 5, 5))
+
+
 def test_badge_alias() -> None:
     term = FakeTerminal(badge="LIVE")
     assert term.badge == term.badge_text == "LIVE"
@@ -307,6 +322,20 @@ def test_netting_and_hedging() -> None:
 
 def current_dialog(term: FakeTerminal) -> str | None:
     return term.dialog
+
+
+def test_show_dialog_opens_a_leftover_dialog() -> None:
+    term, be = rig(order_confirm_dialog=True)
+    with pytest.raises(ValueError, match="needs order"):
+        term.show_dialog("order_confirm")
+    term.show_dialog("order_confirm", ("EURUSD", "SELL"))
+    assert current_dialog(term) == "order_confirm"
+    click_rect(be, term, term.geometry().dialog_ok)  # confirming it executes THAT order
+    assert [(p.side, p.lots) for p in term.positions] == [("SELL", Decimal("0.01"))]
+    term.show_dialog("error")
+    assert current_dialog(term) == "error"
+    be.press("esc")
+    assert current_dialog(term) is None
 
 
 def test_confirmation_dialog_ok_cancel_and_esc() -> None:

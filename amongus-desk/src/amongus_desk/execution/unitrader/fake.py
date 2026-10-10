@@ -89,6 +89,15 @@ class Rect:
         """True when the client point lies inside the rectangle."""
         return self.x <= px < self.x + self.w and self.y <= py < self.y + self.h
 
+    def overlaps(self, other: Rect) -> bool:
+        """True when the two rectangles share at least one pixel."""
+        return (
+            self.x < other.x + other.w
+            and other.x < self.x + self.w
+            and self.y < other.y + other.h
+            and other.y < self.y + self.h
+        )
+
     @property
     def center(self) -> tuple[int, int]:
         """Centre point (client coordinates)."""
@@ -324,12 +333,20 @@ class FakeTerminal:
         lowest_panel = max(p.frame.y + p.frame.h for p in panels.values())
         if lowest_panel > indicator.y - 4 or _GAP + min(cols, len(order)) * (_PANEL_W + _GAP) > w:
             raise ValueError(f"client area {w}x{h} is too small for {len(order)} simulated panels")
+        badge = Rect(w - 140, 12, 120, 32)
+        one_click = Rect(w - 290, 12, 136, 32)
+        close_all = Rect(w - 196, h - 70, 176, 44)
+        for name, r in (("badge", badge), ("one-click indicator", one_click), ("positions indicator", indicator)):
+            if r.x < 0 or r.y < 0 or r.x + r.w > w or r.y + r.h > h:
+                raise ValueError(f"client area {w}x{h} is too small for the simulated {name}")
+        if indicator.overlaps(close_all):
+            raise ValueError(f"client area {w}x{h} is too small: simulated widgets would overlap")
         dialog = Rect(w // 2 - 180, h // 2 - 90, 360, 170)
         return _Geometry(
-            badge=Rect(w - 140, 12, 120, 32),
-            one_click=Rect(w - 290, 12, 136, 32),
+            badge=badge,
+            one_click=one_click,
             indicator=indicator,
-            close_all=Rect(w - 196, h - 70, 176, 44),
+            close_all=close_all,
             dialog=dialog,
             dialog_header=Rect(dialog.x, dialog.y, dialog.w, 40),
             dialog_ok=Rect(dialog.x + 210, dialog.y + 116, 120, 36),
@@ -354,6 +371,17 @@ class FakeTerminal:
         """Seed an existing position (e.g. before testing a close)."""
         with self._lock:
             self.positions.append(FakePosition(symbol, side, lots))
+            self._invalidate()
+
+    def show_dialog(self, kind: DialogKind, order: tuple[str, str] | None = None) -> None:
+        """Open a simulated dialog (test setup), e.g. one left over from an earlier order.
+
+        ``order`` is the ``(symbol, side)`` an ``order_confirm`` dialog executes when it is confirmed.
+        """
+        with self._lock:
+            if kind == "order_confirm" and order is None:
+                raise ValueError("an order confirmation dialog needs order=(symbol, side)")
+            self._dialog = _Dialog(kind, order)
             self._invalidate()
 
     @property
