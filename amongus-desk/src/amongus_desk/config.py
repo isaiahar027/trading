@@ -229,6 +229,11 @@ class SyntheticFeedConfig(_Model):
     start: datetime | None = None  # first bar time; defaults to "now" rounded down
     base_prices: dict[str, PositiveFloat] = Field(default_factory=dict)
 
+    @field_validator("start")
+    @classmethod
+    def _utc_start(cls, value: datetime | None) -> datetime | None:
+        return ensure_utc(value) if value is not None else None
+
 
 class CsvFeedConfig(_Model):
     path: Path | None = None  # CSV with columns: symbol,start,open,high,low,close[,volume]
@@ -278,6 +283,16 @@ class UniTraderConfig(_Model):
     save_evidence: bool = True
     max_order_seconds: float = Field(default=25.0, gt=1, le=300)
     health_interval_seconds: float = Field(default=30.0, ge=5, le=3600)
+
+    @model_validator(mode="after")
+    def _order_budget(self) -> Self:
+        needed = self.fill_timeout_seconds + self.dialog_timeout_seconds
+        if self.max_order_seconds <= needed:
+            raise ValueError(
+                f"max_order_seconds ({self.max_order_seconds:g}) must exceed fill_timeout_seconds + "
+                f"dialog_timeout_seconds ({needed:g}); otherwise the venue never has time to confirm a click"
+            )
+        return self
 
 
 class ExecutionConfig(_Model):
@@ -384,6 +399,11 @@ class DeskConfig(_Model):
         if self.execution.venue == "unitrader":
             if ut.exit_method == "close_all" and self.risk.max_open_positions != 1:
                 problems.append("exit_method 'close_all' can only target one position: set risk.max_open_positions: 1")
+            if ut.exit_method == "opposite_order" and ut.protective_orders == "panel_fields":
+                problems.append(
+                    "exit_method 'opposite_order' can't be combined with protective_orders 'panel_fields': the "
+                    "closing order would carry the panel's SL/TP fields, which the desk can't verify are empty"
+                )
             if ut.exit_method == "opposite_order" and not ut.netting_account_confirmed:
                 problems.append(
                     "exit_method 'opposite_order' only closes positions on a netting account (on a hedging "

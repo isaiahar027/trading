@@ -30,7 +30,7 @@ import random
 import threading
 import zlib
 from collections import deque
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncGenerator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -317,7 +317,7 @@ class SyntheticFeed:
         await asyncio.sleep(0)
         return out
 
-    async def stream(self) -> AsyncIterator[Bar]:
+    async def stream(self) -> AsyncGenerator[Bar, None]:
         """Yield the next step's bars (one per symbol), sleeping ``interval_seconds`` between steps."""
         if self._streaming:
             raise RuntimeError("stream() is already running for this feed")

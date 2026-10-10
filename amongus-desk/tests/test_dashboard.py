@@ -7,10 +7,10 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
-from rigs import Rig, desk_cfg
 
 from amongus_desk.dashboard.server import CSP, AuthGuard, create_app, sse_events
 from amongus_desk.domain import IntentStatus
+from rigs import Rig, desk_cfg
 
 TOKEN = "t" * 32
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
@@ -66,10 +66,10 @@ def test_lockout_after_failures(rig: Rig) -> None:
 def test_auth_guard_window_expires() -> None:
     now = [0.0]
     guard = AuthGuard(TOKEN, max_failures=2, window_seconds=60, now=lambda: now[0])
-    guard._failures["1.2.3.4"].extend([0.0, 1.0])  # noqa: SLF001
-    assert len(guard._prune("1.2.3.4")) == 2  # noqa: SLF001
+    guard._failures["1.2.3.4"].extend([0.0, 1.0])
+    assert len(guard._prune("1.2.3.4")) == 2
     now[0] = 62.0
-    assert len(guard._prune("1.2.3.4")) == 0  # noqa: SLF001
+    assert len(guard._prune("1.2.3.4")) == 0
     with pytest.raises(ValueError):
         AuthGuard("short", 1, 1)
 

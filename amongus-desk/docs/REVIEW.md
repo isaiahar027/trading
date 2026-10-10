@@ -125,6 +125,27 @@ default to the conservative choice.
 cTrader, FIX or REST). GUI automation is the most fragile link. The rebuild keeps execution behind an
 `ExecutionVenue` interface so an API venue can replace the GUI venue without touching the strategy.
 
+## 3b. Update: what UnitedPips' public website shows (checked 2026-10-10)
+
+I looked only at public pages; I did not log in to anything.
+
+- The old web trader (`webtrader.unitedpips.com`) now shows *"Legacy platform retired — This trading platform
+  has been deprecated. We've launched the new UnitedPips terminal."* The new terminal is a **web app** at
+  `terminal.unitedpips.com`, with Email/Password login and "Login as Guest". Guest login asks for an email
+  address, and the page runs a Cloudflare bot check. I stopped there.
+- The broker's home page calls the platform "Mega Trader" (web and desktop) plus a mobile app. It mentions no
+  MetaTrader and no API, and neither do the review sites I read. Those sites contradict each other on
+  platform versions and regulation (they say offshore: St Lucia / St Vincent).
+
+**What it means.** The handover's assumption — a desktop `.exe` with no web access — may be out of date. If you
+trade on the web terminal, driving the browser directly is the better execution venue. It finds buttons and
+fields by name, reads the lot value, the account label and open positions straight from the page, and needs
+no pixel calibration and no unlocked Remote Desktop session. Everything above the venue stays the same:
+crew, risk, journal, dashboard, kill switch. Building that venue needs one look at the logged-in trading
+page (screenshots plus a saved copy of the page), because I haven't seen it. You still log in yourself, in
+the bot's browser window. The desktop GUI venue in this repository remains the path if you use a desktop
+app.
+
 ## 4. What the rebuild does instead
 
 | Prototype | Rebuild (`amongus-desk/`) |

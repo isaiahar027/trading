@@ -8,6 +8,9 @@ its client size and DPI match what was calibrated.
 
 from __future__ import annotations
 
+import contextlib
+import os
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, Self
@@ -64,7 +67,7 @@ class DialogLayout(_Model):
 
 class Layout(_Model):
     schema_version: Literal[1] = 1
-    window_title_regex: str = Field(min_length=1)
+    window_title_regex: str = Field(min_length=1)  # matched with re.fullmatch against the whole window title
     process_name: str | None = None
     client_width: int = Field(gt=0)
     client_height: int = Field(gt=0)
@@ -135,8 +138,18 @@ class LayoutFile:
         path.parent.mkdir(parents=True, exist_ok=True)
         data = self.layout.model_dump(mode="json", exclude_none=True)
         tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+        with tmp.open("w", encoding="utf-8") as fh:
+            fh.write(yaml.safe_dump(data, sort_keys=False))
+            fh.flush()
+            os.fsync(fh.fileno())
         tmp.replace(path)
+        if sys.platform != "win32":  # persist the rename itself (best effort; not supported on Windows)
+            with contextlib.suppress(OSError):
+                fd = os.open(path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
 
     def template_path(self, ref: TemplateRef) -> Path:
         candidate = (self.base_dir / ref.image).resolve()

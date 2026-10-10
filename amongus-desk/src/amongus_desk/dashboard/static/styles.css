@@ -18,6 +18,15 @@
 
 * { box-sizing: border-box; }
 
+/* the hidden attribute must win over any display rule below */
+[hidden] { display: none !important; }
+
+/* grid children may shrink below their content width (wide tables scroll inside .table-wrap instead) */
+main > *, .cards > *, .crew > *, .control-row > * { min-width: 0; }
+select, input { max-width: 100%; }
+.select-wrap { flex: 1 1 220px; min-width: 0; display: flex; justify-content: flex-end; }
+.select-wrap select { width: 100%; max-width: 420px; }
+
 html, body {
   margin: 0;
   background: radial-gradient(1200px 700px at 70% -10%, #1b2550 0%, var(--bg) 55%) fixed, var(--bg);

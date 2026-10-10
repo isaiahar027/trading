@@ -68,6 +68,7 @@ class FakeTwelveData:
         self.requests: list[Seen] = []
         self.script: list[Handler] = []  # canned responses used (in order) before the simulation
         self.interval_echo: str | None = None
+        self.latency = 0.0  # seconds the reply takes: the body is built on arrival, the clock moves on
 
     def value(self, feed_symbol: str, start: datetime) -> dict[str, str]:
         i = int((start - at(0, 0)).total_seconds() // 60)
@@ -99,7 +100,9 @@ class FakeTwelveData:
         self.requests.append(Seen(self.clock.now(), self.clock.monotonic(), request))
         if self.script:
             return self.script.pop(0)(request)
-        return httpx2.Response(200, json=self.body(dict(request.url.params)))
+        response = httpx2.Response(200, json=self.body(dict(request.url.params)))
+        self.clock.advance(self.latency)
+        return response
 
     def times(self) -> list[datetime]:
         return [s.at for s in self.requests]
@@ -137,6 +140,12 @@ def make_feed(
 async def run_until(feed: TwelveDataFeed, clock: StopClock, stop_at: datetime) -> list[Bar]:
     clock.stop_at = stop_at
     return [bar async for bar in feed.stream()]
+
+
+async def run_until_timed(feed: TwelveDataFeed, clock: StopClock, stop_at: datetime) -> list[tuple[Bar, datetime]]:
+    """Like :func:`run_until`, also recording when each bar was handed out."""
+    clock.stop_at = stop_at
+    return [(bar, clock.now()) async for bar in feed.stream()]
 
 
 def starts(bars: Sequence[Bar], symbol: str | None = None) -> list[datetime]:
@@ -233,11 +242,60 @@ async def test_documented_fixture_is_parsed_and_the_forming_bar_dropped() -> Non
 
 
 @pytest.mark.anyio
-async def test_a_bar_that_ends_exactly_now_is_closed() -> None:
+@pytest.mark.parametrize(
+    ("now", "delay", "last_start"),
+    [
+        (at(8, 5), 0.0, at(8, 0)),  # no delay: a bar that ends exactly now is closed
+        (at(8, 5), 5.0, at(7, 55)),  # closed, but the provider may not have finalised it yet
+        (at(8, 5, 4), 5.0, at(7, 55)),
+        (at(8, 5, 5), 5.0, at(8, 0)),  # its poll time has come
+    ],
+)
+async def test_a_bar_is_used_once_the_poll_delay_after_its_close_has_passed(
+    now: datetime, delay: float, last_start: datetime
+) -> None:
     payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
-    feed = make_feed(respond(json=payload), StopClock(at(8, 5)))
+    feed = make_feed(respond(json=payload), StopClock(now), delay=delay)
     bars = (await feed.warmup(["EURUSD"], 50))["EURUSD"]
-    assert bars[-1].start == at(8, 0)
+    assert bars[-1].start == last_start
+
+
+@pytest.mark.anyio
+async def test_a_bar_still_forming_when_the_request_was_sent_is_dropped_even_if_the_reply_is_late() -> None:
+    clock, server, feed = setup(at(8, 4, 59))
+    server.latency = 7.0  # the reply arrives at 08:05:06, after the 08:00 bar's close + poll delay
+    bars = (await feed.warmup(["EURUSD"], 3))["EURUSD"]
+    assert clock.now() == at(8, 5, 6)
+    assert starts(bars) == [at(7, 45), at(7, 50), at(7, 55)]  # 08:00 was still forming when asked
+
+
+@pytest.mark.anyio
+async def test_a_retry_just_after_the_next_close_does_not_take_the_unsettled_bar() -> None:
+    """1-minute bars: a 429 retry at hh:mm:01 must not grab the bar that closed one second ago."""
+    clock, server, feed = setup(at(8, 4, 30), tf=1)
+    await feed.warmup(["EURUSD"], 3)
+    server.script = [error_json(429, "slow down")]
+    timed = await run_until_timed(feed, clock, at(8, 7, 30))
+    assert server.times()[1:] == [at(8, 5, 5), at(8, 6, 1), at(8, 6, 5), at(8, 7, 5)]
+    assert [(b.start, t) for b, t in timed] == [
+        (at(8, 4), at(8, 6, 1)),  # the retry yields the bar that was due
+        (at(8, 5), at(8, 6, 5)),  # not at 08:06:01: it closed at 08:06:00
+        (at(8, 6), at(8, 7, 5)),
+    ]
+    assert all(t >= b.end + timedelta(seconds=5) for b, t in timed)
+
+
+@pytest.mark.anyio
+async def test_poll_delay_longer_than_the_timeframe_loses_no_bars() -> None:
+    clock, server, feed = setup(at(8, 0, 30), tf=1, delay=120.0)
+    warm = (await feed.warmup(["EURUSD"], 5))["EURUSD"]
+    assert warm[-1].start == at(7, 57)  # 07:58 and 07:59 closed less than 120 s ago
+    timed = await run_until_timed(feed, clock, at(8, 10))
+    streamed = [b.start for b, _ in timed]
+    assert streamed == [at(7, 58) + timedelta(minutes=i) for i in range(len(streamed))]  # no gaps
+    assert streamed[-1] >= at(8, 5)
+    assert all(t >= b.end + timedelta(seconds=120) for b, t in timed)  # each one waited out the delay
+    assert {s.params["outputsize"] for s in server.requests[1:]} == {"5"}  # room for 2 unsettled bars
 
 
 @pytest.mark.anyio
@@ -259,6 +317,13 @@ async def test_warmup_edge_cases(caplog: pytest.LogCaptureFixture) -> None:
     assert server.requests == []
     with pytest.raises(ValueError, match="bars"):
         await feed.warmup(["EURUSD"], -1)
+
+
+@pytest.mark.anyio
+async def test_a_repeated_warmup_symbol_costs_one_credit() -> None:
+    _, server, feed = setup(at(8, 2, 30))
+    warm = await feed.warmup(["EURUSD", "EURUSD"], 3)
+    assert len(server.requests) == 1 and len(warm["EURUSD"]) == 3
 
 
 @pytest.mark.anyio
@@ -410,6 +475,26 @@ async def test_stream_started_mid_bar_after_warmup_does_not_repoll_immediately()
     bars = await run_until(feed, clock, at(8, 11))
     assert server.times()[1:] == [at(8, 10, 5)]
     assert starts(bars) == [at(8, 5)]
+
+
+@pytest.mark.anyio
+async def test_a_bar_that_closed_between_warmup_and_stream_start_is_polled_right_away() -> None:
+    clock, server, feed = setup(at(8, 4, 50), instruments=[make_instrument(), gbpusd()])
+    await feed.warmup(["EURUSD"], 5)  # ends with 07:55; the 08:00 bar is still forming
+    clock.set(at(8, 5, 30))  # e.g. the venue preflight took a while
+    await feed.warmup(["GBPUSD"], 5)  # ends with 08:00
+    timed = await run_until_timed(feed, clock, at(8, 11))
+    # EURUSD is polled at once (not at 08:10:05); GBPUSD already has 08:00, so no credit is spent on it.
+    assert [(s.at, s.params["symbol"]) for s in server.requests[2:]] == [
+        (at(8, 5, 30), "EUR/USD"),
+        (at(8, 10, 5), "EUR/USD"),
+        (at(8, 10, 5), "GBP/USD"),
+    ]
+    assert [(b.symbol, b.start, t) for b, t in timed] == [
+        ("EURUSD", at(8, 0), at(8, 5, 30)),
+        ("EURUSD", at(8, 5), at(8, 10, 5)),
+        ("GBPUSD", at(8, 5), at(8, 10, 5)),
+    ]
 
 
 @pytest.mark.anyio
@@ -609,7 +694,7 @@ async def test_poll_outside_sessions_keeps_polling() -> None:
 
 @pytest.mark.anyio
 async def test_session_opening_catches_up_from_the_last_bar() -> None:
-    clock, server, feed = setup(at(6, 40))
+    clock, server, feed = setup(at(6, 40, 30))
     await feed.warmup(["EURUSD"], 3)  # last closed bar 06:35
     bars = await run_until(feed, clock, at(7, 6))
     assert server.times()[1:] == [at(7, 5, 5)]  # 07:00 is the first in-session bar
@@ -699,6 +784,39 @@ async def test_aclose_wakes_a_sleeping_stream() -> None:
     assert requests == []
     assert feed.status()["closed"] is True and feed.status()["next_poll_at"] is None
     assert not client.is_closed  # an injected client belongs to the caller
+    await client.aclose()
+
+
+@pytest.mark.anyio
+async def test_cancelling_the_consumer_while_the_feed_wakes_up_is_not_swallowed() -> None:
+    """A cancel that lands while the feed winds down its sleep helpers must still cancel the consumer."""
+
+    class CancelOnInterruptClock(ManualClock):
+        target: asyncio.Task[list[Bar]] | None = None
+
+        async def sleep(self, seconds: float) -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                if self.target is not None:
+                    self.target.cancel()  # arrives while the feed awaits its cancelled helpers
+                raise
+
+    clock = CancelOnInterruptClock(T0)
+    client = httpx2.AsyncClient(transport=httpx2.MockTransport(lambda _r: httpx2.Response(500)))
+    feed = TwelveDataFeed(FeedConfig(kind="twelvedata"), [make_instrument()], 5, KEY, clock, client=client)
+
+    async def consume() -> list[Bar]:
+        return [bar async for bar in feed.stream()]
+
+    task = asyncio.create_task(consume())
+    clock.target = task
+    for _ in range(10):
+        await asyncio.sleep(0)
+    await feed.aclose()  # wakes the stream, which cancels the clock's sleep
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=1.0)
+    assert task.cancelled()
     await client.aclose()
 
 

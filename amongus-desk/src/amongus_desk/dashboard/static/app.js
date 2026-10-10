@@ -375,11 +375,9 @@
       chat.append(el("li", { text: "No emergency meetings yet. Cyan Scout calls one when a breakout closes." }));
       return;
     }
-    summary.append(
-      el("span", { class: `decision decision-${meeting.decision}`, text: meeting.decision.replace("_", " ") }),
-      meeting.lots ? el("span", { text: `${meeting.lots} lots` }) : null,
-      el("span", { class: "hint", text: `${meeting.trigger} · ${meeting.symbol}` }),
-    );
+    summary.append(el("span", { class: `decision decision-${meeting.decision}`, text: meeting.decision.replace("_", " ") }));
+    if (meeting.lots) summary.append(el("span", { text: `${meeting.lots} lots` }));
+    summary.append(el("span", { class: "hint", text: `${meeting.trigger} · ${meeting.symbol}` }));
     const colors = {};
     for (const member of (state.data && state.data.crew) || []) colors[member.name] = member.color;
     for (const line of meeting.transcript || []) {

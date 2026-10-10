@@ -232,7 +232,7 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     if args.csv:
         from .marketdata.csv_replay import load_csv_bars  # noqa: PLC0415
 
-        bars = load_csv_bars(Path(args.csv))
+        bars = load_csv_bars(Path(args.csv), timeframe_minutes=cfg.strategy.timeframe_minutes)
     else:
         bars = asyncio.run(_synthetic_bars(cfg, args.synthetic))
     if args.symbol:
@@ -288,26 +288,37 @@ def cmd_preflight(args: argparse.Namespace) -> int:
 
 
 def cmd_calibrate(args: argparse.Namespace) -> int:
-    from .execution.unitrader.calibrate import run_calibration  # noqa: PLC0415
+    from .execution.unitrader.calibrate import CalibrationError, run_calibration  # noqa: PLC0415
 
     cfg = _load(args)
     out = Path(args.out) if args.out else cfg.resolve_path(cfg.execution.unitrader.layout_path)
     symbols = (
-        [s.strip().upper() for s in args.symbols.split(",")]
+        [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
         if args.symbols
         else [i.symbol for i in cfg.enabled_instruments]
     )
     if args.simulate:
-        from .execution.unitrader.fake import FakeGuiBackend, FakeTerminal  # noqa: PLC0415
+        # The interactive wizard needs a real mouse over a real window; for the built-in fake terminal the
+        # layout is generated programmatically instead.
+        from .execution.unitrader.fake import FakeTerminal, calibrate_fake  # noqa: PLC0415
 
-        print("SIMULATION: calibrating the built-in fake terminal, not UniTrader.")
-        backend: Any = FakeGuiBackend(FakeTerminal(symbols, badge="DEMO"))
-    else:
-        from .execution.unitrader.win32_backend import Win32Backend  # noqa: PLC0415
+        layout = calibrate_fake(FakeTerminal(symbols, badge="DEMO"), out.parent / "simulated-layout")
+        print(f"SIMULATION: wrote a layout for the built-in FAKE terminal under {layout.base_dir}.")
+        print("It describes the simulator, not UniTrader; calibrate on the VPS for the real terminal.")
+        return EXIT_OK
+    from .execution.unitrader.win32_backend import Win32Backend, Win32UnavailableError  # noqa: PLC0415
 
+    try:
         backend = Win32Backend(pause_seconds=cfg.execution.unitrader.action_delay_seconds)
-    ok = run_calibration(cfg, backend, out, symbols, countdown=args.countdown)
-    return EXIT_OK if ok else EXIT_PREFLIGHT
+    except Win32UnavailableError as exc:
+        print(f"cannot calibrate here: {exc}")
+        return EXIT_PREFLIGHT
+    try:
+        result = run_calibration(cfg, backend, out, symbols, countdown=args.countdown)
+    except CalibrationError as exc:
+        print(f"calibration stopped: {exc}")
+        return EXIT_PREFLIGHT
+    return EXIT_OK if result else EXIT_PREFLIGHT
 
 
 def cmd_test_order(args: argparse.Namespace) -> int:
@@ -330,7 +341,12 @@ def cmd_test_order(args: argparse.Namespace) -> int:
         print(f"lots must be a multiple of {inst.lot_step} between {inst.min_lot} and {cap}")
         return EXIT_CONFIG
     side = Side(args.side.upper())
-    venue_name = "the paper venue" if cfg.mode is Mode.PAPER else f"UniTrader ({_account(cfg)} account)"
+    if cfg.mode is Mode.PAPER:
+        venue_name = "the paper venue"
+    elif cfg.execution.unitrader.backend == "fake":
+        venue_name = "the SIMULATED terminal (backend: fake), not UniTrader"
+    else:
+        venue_name = f"UniTrader ({_account(cfg)} account)"
     phrase = f"{side.value} {inst.symbol}"
     print(f"About to place ONE market {side.value} of {lots} {inst.symbol} on {venue_name}.")
     if not args.yes:

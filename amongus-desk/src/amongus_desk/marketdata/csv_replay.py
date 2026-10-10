@@ -23,7 +23,7 @@ import itertools
 import logging
 import math
 import threading
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncGenerator, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -110,9 +110,7 @@ def _header(path: Path, line: int, cells: list[str]) -> dict[str, int]:
         raise CsvFormatError(path, line, f"missing column(s) {', '.join(missing)} (expected {expected})")
     unknown = [n for n in names if n not in REQUIRED_COLUMNS and n not in OPTIONAL_COLUMNS]
     if unknown:
-        raise CsvFormatError(
-            path, line, f"unexpected column(s) {', '.join(map(repr, unknown))} (expected {expected})"
-        )
+        raise CsvFormatError(path, line, f"unexpected column(s) {', '.join(map(repr, unknown))} (expected {expected})")
     return columns
 
 
@@ -300,7 +298,7 @@ class CsvReplayFeed:
         await asyncio.sleep(0)
         return out
 
-    async def stream(self) -> AsyncIterator[Bar]:
+    async def stream(self) -> AsyncGenerator[Bar, None]:
         """Yield every remaining bar once, in global time order, then end."""
         if self._streaming:
             raise RuntimeError("stream() is already running for this feed")

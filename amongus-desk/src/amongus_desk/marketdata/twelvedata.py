@@ -36,7 +36,7 @@ import logging
 import math
 import threading
 from collections import deque
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncGenerator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
@@ -304,7 +304,7 @@ class TwelveDataFeed:
             out[symbol] = closed
         return out
 
-    async def stream(self) -> AsyncIterator[Bar]:
+    async def stream(self) -> AsyncGenerator[Bar, None]:
         """Poll at every bar close and yield newly closed bars, per symbol in time order, until closed.
 
         Raises :class:`FeedError` when Twelve Data rejects the credentials (401/403).

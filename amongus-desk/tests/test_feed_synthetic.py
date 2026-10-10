@@ -458,6 +458,40 @@ async def test_aclose_interrupts_a_long_sleep() -> None:
 
 
 @pytest.mark.anyio
+async def test_cancelling_the_consumer_while_the_feed_wakes_up_is_not_swallowed() -> None:
+    """A cancel that lands while the feed winds down its sleep helpers must still cancel the consumer."""
+
+    class CancelOnInterruptClock(ManualClock):
+        target: asyncio.Task[None] | None = None
+
+        async def sleep(self, seconds: float) -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                if self.target is not None:
+                    self.target.cancel()  # arrives while the feed awaits its cancelled helpers
+                raise
+
+    clock = CancelOnInterruptClock(T0)
+    feed = make_feed(clock=clock, interval_seconds=10.0, max_bars=None)
+    got: list[Bar] = []
+
+    async def consume() -> None:
+        async for bar in feed.stream():
+            got.append(bar)
+
+    task = asyncio.create_task(consume())
+    clock.target = task
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert len(got) == 1  # first step emitted, now sleeping
+    await feed.aclose()  # wakes the stream, which cancels the clock's sleep
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=1.0)
+    assert task.cancelled()
+
+
+@pytest.mark.anyio
 async def test_clock_errors_during_sleep_propagate() -> None:
     class BrokenClock(ManualClock):
         async def sleep(self, seconds: float) -> None:

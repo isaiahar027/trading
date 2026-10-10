@@ -275,7 +275,12 @@ def rigs(tmp_path: Path) -> Iterator[Callable[..., Rig]]:
         be = backend_cls(term, clock=clock)
         settings: dict[str, Any] = {"backend": "fake", "fill_timeout_seconds": 2.0, "dialog_timeout_seconds": 1.0}
         settings.update(cfg or {})
-        ut = UniTraderConfig(**settings)
+        try:
+            ut = UniTraderConfig(**settings)
+        except ValueError:
+            # Some tests deliberately use settings the config validator rejects (e.g. a time budget too small
+            # to confirm a fill) to prove the venue's own runtime checks still catch them.
+            ut = UniTraderConfig.model_construct(**{**UniTraderConfig().model_dump(), **settings})
         instruments = {s: make_instrument(symbol=s, feed_symbol=s) for s in symbols}
         the_probe = Probe(be) if probe else None
         h = halt or Halt()

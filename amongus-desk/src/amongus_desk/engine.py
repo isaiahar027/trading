@@ -297,7 +297,7 @@ class DeskEngine:
     # ====================================================================================== orders
 
     def _write_ahead(self, intent: OrderIntent) -> Callable[[], None]:
-        """Callback the venue runs (possibly on its GUI thread) right before the irreversible click."""
+        """Callback the venue runs right before the irreversible click (event-loop or worker thread)."""
 
         def before_click() -> None:
             self._store.set_intent_status(intent.id, IntentStatus.SUBMITTING)
@@ -591,12 +591,20 @@ class DeskEngine:
         if was_ok is not False:
             self._audit.append("health.failed", {"venue": health.venue, "failures": [c.name for c in health.failures]})
             self._hub.publish("health", {"ok": False})
-            if self._cfg.mode in (Mode.DEMO, Mode.LIVE):
+            needs_login = any(c.data.get("needs_login") for c in health.failures)
+            if self._cfg.mode in (Mode.DEMO, Mode.LIVE) and needs_login:
                 account = "DEMO" if self._cfg.mode is Mode.DEMO else "LIVE"
                 await self._alert(
                     "UniTrader needs you",
-                    f"Trading is paused. If UniTrader is closed or logged out, log in to your {account} account "
-                    f"yourself (the desk never handles your password). Details: {details}",
+                    f"Trading is paused. Open UniTrader and log in to your {account} account yourself (the desk "
+                    f"never handles your password). Details: {details}",
+                    "urgent",
+                    dedup_key="venue-health",
+                )
+            elif self._cfg.mode in (Mode.DEMO, Mode.LIVE):
+                await self._alert(
+                    "Terminal not ready",
+                    f"Trading is paused until every check passes. Details: {details}",
                     "urgent",
                     dedup_key="venue-health",
                 )

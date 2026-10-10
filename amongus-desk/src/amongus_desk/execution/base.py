@@ -8,7 +8,9 @@ Invariants every venue must uphold (the engine and the risk logic rely on them):
    prove no irreversible action (click / API call) happened.
 3. ``on_before_click`` is called exactly once, synchronously, immediately before the first
    irreversible action. The engine uses it to persist a write-ahead ``SUBMITTING`` marker so a crash
-   after the click is detected on restart. If it raises, the venue must abort without clicking.
+   after the click is detected on restart. If it raises, the venue must abort without clicking. Venues may
+   call it from the event-loop thread or from a worker thread (UniTraderVenue runs it on the event loop while
+   its GUI thread waits), so it must be thread-safe and must not await.
 4. After the irreversible action the venue reports ``CONFIRMED``, ``REJECTED`` or ``UNCONFIRMED`` —
    never ``ABORTED``. When in doubt: ``UNCONFIRMED``.
 5. ``is_halted`` (constructor argument) is checked at the start and again immediately before the click

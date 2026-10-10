@@ -107,6 +107,7 @@ class ScriptedVenue:
             name="window",
             ok=self.health_ok,
             detail="ok" if self.health_ok else "UniTrader window not found: log in to UniTrader yourself",
+            data={} if self.health_ok else {"needs_login": True},
         )
         return VenueHealth(venue=self.name, ok=self.health_ok, checked_at=self.clock.now(), checks=[check])
 

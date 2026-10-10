@@ -140,6 +140,22 @@ def test_live_requires_ack_and_protection() -> None:
         ({"feed": {"kind": "csv"}}, "feed.csv.path"),
         ({"dashboard": {"host": "0.0.0.0"}}, "DESK_DASHBOARD_TOKEN"),
         ({"risk": {"starting_equity": 1, "risk_per_trade_pct": 2.5}}, "less than or equal to 2"),
+        (
+            {
+                "mode": "demo",
+                "execution": {
+                    "venue": "unitrader",
+                    "unitrader": {
+                        "exit_method": "opposite_order",
+                        "netting_account_confirmed": True,
+                        "protective_orders": "panel_fields",
+                    },
+                },
+            },
+            "can't be combined",
+        ),
+        ({"execution": {"unitrader": {"max_order_seconds": 10, "fill_timeout_seconds": 8}}}, "max_order_seconds"),
+        ({"feed": {"synthetic": {"start": "2026-10-05T08:00:00"}}}, "timezone-aware"),
     ],
 )
 def test_unsafe_configs_rejected(over: dict[str, Any], message: str) -> None:

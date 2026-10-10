@@ -173,6 +173,11 @@ def test_missing_and_unknown_columns_are_rejected(tmp_path: Path) -> None:
     expect_error(twice, 1, "'close' appears twice")
 
 
+def test_header_errors_name_the_physical_header_line(tmp_path: Path) -> None:
+    path = write_csv(tmp_path, "EURUSD,2026-10-05T08:00:00Z,1.1,1.2,1.0\n", header="\n\nsymbol,start,open,high,low\n")
+    expect_error(path, 3, "missing column(s) close")
+
+
 def test_empty_file_and_header_only_are_rejected(tmp_path: Path) -> None:
     expect_error(write_csv(tmp_path, "", header=""), None, "empty")
     expect_error(write_csv(tmp_path, "", header=HEADER), None, "no bars")
@@ -306,6 +311,15 @@ async def test_warmup_edge_cases() -> None:
     assert await feed.warmup(["USDJPY"], 5) == {"USDJPY": []}
     with pytest.raises(ValueError, match="bars"):
         await feed.warmup(["EURUSD"], -1)
+
+
+@pytest.mark.anyio
+async def test_a_repeated_warmup_symbol_loses_no_bars() -> None:
+    feed = CsvReplayFeed(FIXTURE, 5)
+    warm = await feed.warmup(["EURUSD", "EURUSD"], 3)
+    assert [b.start for b in warm["EURUSD"]] == [T0 + timedelta(minutes=5 * i) for i in range(3)]
+    streamed = [b for b in await drain(feed) if b.symbol == "EURUSD"]
+    assert len(warm["EURUSD"]) + len(streamed) == 10  # every bar reaches warmup or the stream
 
 
 @pytest.mark.anyio

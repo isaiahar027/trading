@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -329,7 +330,8 @@ def _skip_key(record: MeetingRecord) -> str:
     for rep in record.reports:
         if rep.vote is Vote.EJECT:
             name = rep.crew_id.value.replace("_", " ").title()
-            reason = rep.summary.split(";")[0].split(":")[0].strip()
+            first = re.sub(r"\([^)]*\)", "", rep.summary.split(";")[0])  # drop "(Thu 2026-10-01 07:00 UTC)" etc.
+            reason = " ".join(first.split(":")[0].split())
             return f"{name}: {reason}"[:80]
     return "skipped"
 
